@@ -132,6 +132,15 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_user_account_resource_rm_op", None, false),
     TypeSpec::new("cls_user_account_resource_list_op", None, false),
     TypeSpec::new("cls_user_account_resource_list_ret", None, false),
+    TypeSpec::new("cls_queue_entry", None, false),
+    TypeSpec::new("cls_queue_marker", None, false),
+    TypeSpec::new("cls_queue_head", None, false),
+    TypeSpec::new("cls_queue_init_op", None, false),
+    TypeSpec::new("cls_queue_enqueue_op", None, false),
+    TypeSpec::new("cls_queue_list_op", None, false),
+    TypeSpec::new("cls_queue_list_ret", None, false),
+    TypeSpec::new("cls_queue_remove_op", None, false),
+    TypeSpec::new("cls_queue_get_capacity_ret", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

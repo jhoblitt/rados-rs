@@ -25,6 +25,11 @@ use rados::{
     Denc, EVersion, EntityAddr, HObject, ListWatchersReply, MonInfo, MonMap, PgNlsResponse,
     PoolSnapInfo, RadosError, UTime, UuidD, VersionedEncode, WatchItem,
 };
+use rados_cls::queue::{
+    Entry as QueueEntry, EnqueueOp as QueueEnqueueOp, GetCapacityRet as QueueGetCapacityRet,
+    Head as QueueHead, InitOp as QueueInitOp, ListOp as QueueListOp, ListRet as QueueListRet,
+    Marker as QueueMarker, RemoveOp as QueueRemoveOp,
+};
 use rados_cls::refcount::{
     GetOp as RefcountGetOp, ObjRefcount, PutOp as RefcountPutOp, ReadOp as RefcountReadOp,
     ReadRet as RefcountReadRet, SetOp as RefcountSetOp,
@@ -199,6 +204,15 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_user_account_resource_list_ret" => {
             Some(type_info_denc::<UserAccountResourceListRet>())
         }
+        "cls_queue_entry" => Some(type_info_denc::<QueueEntry>()),
+        "cls_queue_marker" => Some(type_info_denc::<QueueMarker>()),
+        "cls_queue_head" => Some(type_info_denc::<QueueHead>()),
+        "cls_queue_init_op" => Some(type_info_denc::<QueueInitOp>()),
+        "cls_queue_enqueue_op" => Some(type_info_denc::<QueueEnqueueOp>()),
+        "cls_queue_list_op" => Some(type_info_denc::<QueueListOp>()),
+        "cls_queue_list_ret" => Some(type_info_denc::<QueueListRet>()),
+        "cls_queue_remove_op" => Some(type_info_denc::<QueueRemoveOp>()),
+        "cls_queue_get_capacity_ret" => Some(type_info_denc::<QueueGetCapacityRet>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -260,6 +274,11 @@ fn list_types() {
     println!(
         "  cls_user_account_resource_{{add,get,rm,list}}_op / \
          cls_user_account_resource_{{get,list}}_ret [versioned]"
+    );
+    println!("  cls_queue_{{entry,marker,head}} [versioned]");
+    println!(
+        "  cls_queue_{{init,enqueue,list,remove}}_op / cls_queue_list_ret / \
+         cls_queue_get_capacity_ret [versioned]"
     );
     println!();
     println!("LEVEL 4: Top-level cluster structures");

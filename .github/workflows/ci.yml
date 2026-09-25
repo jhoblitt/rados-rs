@@ -63,7 +63,7 @@ jobs:
         # empty one) must be warning-free too. The lib only: the cluster
         # tests need every class.
         run: |
-          for features in "" refcount user version; do
+          for features in "" queue refcount user version; do
             cargo clippy -p rados-cls --no-default-features --features "$features" -- -D warnings -D clippy::uninlined_format_args
           done
 
