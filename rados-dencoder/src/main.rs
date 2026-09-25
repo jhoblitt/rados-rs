@@ -25,10 +25,23 @@ use rados::{
     Denc, EVersion, EntityAddr, HObject, ListWatchersReply, MonInfo, MonMap, PgNlsResponse,
     PoolSnapInfo, RadosError, UTime, UuidD, VersionedEncode, WatchItem,
 };
+use rados_cls::queue::{
+    EnqueueOp as QueueEnqueueOp, Entry as QueueEntry, GetCapacityRet as QueueGetCapacityRet,
+    Head as QueueHead, InitOp as QueueInitOp, ListOp as QueueListOp, ListRet as QueueListRet,
+    Marker as QueueMarker, RemoveOp as QueueRemoveOp,
+};
 use rados_cls::refcount::{
     GetOp as RefcountGetOp, ObjRefcount, PutOp as RefcountPutOp, ReadOp as RefcountReadOp,
     ReadRet as RefcountReadRet, SetOp as RefcountSetOp,
 };
+use rados_cls::rgw::gc::{
+    DeferEntryOp as RgwGcDeferEntryOp, ListOp as RgwGcListOp, ListRet as RgwGcListRet,
+    RemoveOp as RgwGcRemoveOp, SetEntryOp as RgwGcSetEntryOp,
+};
+use rados_cls::rgw::types::{
+    GcObjInfo, Obj as RgwObj, ObjChain as RgwObjChain, ObjKey as RgwObjKey,
+};
+use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
 use rados_cls::user::{
     AccountHeader as UserAccountHeader, AccountResource as UserAccountResource,
     AccountResourceAddOp as UserAccountResourceAddOp,
@@ -199,6 +212,26 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_user_account_resource_list_ret" => {
             Some(type_info_denc::<UserAccountResourceListRet>())
         }
+        "cls_queue_entry" => Some(type_info_denc::<QueueEntry>()),
+        "cls_queue_marker" => Some(type_info_denc::<QueueMarker>()),
+        "cls_queue_head" => Some(type_info_denc::<QueueHead>()),
+        "cls_queue_init_op" => Some(type_info_denc::<QueueInitOp>()),
+        "cls_queue_enqueue_op" => Some(type_info_denc::<QueueEnqueueOp>()),
+        "cls_queue_list_op" => Some(type_info_denc::<QueueListOp>()),
+        "cls_queue_list_ret" => Some(type_info_denc::<QueueListRet>()),
+        "cls_queue_remove_op" => Some(type_info_denc::<QueueRemoveOp>()),
+        "cls_queue_get_capacity_ret" => Some(type_info_denc::<QueueGetCapacityRet>()),
+        "cls_rgw_obj_key" => Some(type_info_denc::<RgwObjKey>()),
+        "cls_rgw_obj" => Some(type_info_denc::<RgwObj>()),
+        "cls_rgw_obj_chain" => Some(type_info_denc::<RgwObjChain>()),
+        "cls_rgw_gc_obj_info" => Some(type_info_denc::<GcObjInfo>()),
+        "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
+        "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
+        "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
+        "cls_rgw_gc_list_ret" => Some(type_info_denc::<RgwGcListRet>()),
+        "cls_rgw_gc_remove_op" => Some(type_info_denc::<RgwGcRemoveOp>()),
+        "cls_rgw_gc_urgent_data" => Some(type_info_denc::<RgwGcUrgentData>()),
+        "cls_rgw_gc_queue_init_op" => Some(type_info_denc::<RgwGcQueueInitOp>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -261,6 +294,16 @@ fn list_types() {
         "  cls_user_account_resource_{{add,get,rm,list}}_op / \
          cls_user_account_resource_{{get,list}}_ret [versioned]"
     );
+    println!("  cls_queue_{{entry,marker,head}} [versioned]");
+    println!(
+        "  cls_queue_{{init,enqueue,list,remove}}_op / cls_queue_list_ret / \
+         cls_queue_get_capacity_ret [versioned]"
+    );
+    println!("  cls_rgw_{{obj_key,obj,obj_chain,gc_obj_info}} [versioned]");
+    println!(
+        "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
+    );
+    println!("  cls_rgw_gc_urgent_data / cls_rgw_gc_queue_init_op [versioned]");
     println!();
     println!("LEVEL 4: Top-level cluster structures");
     println!("  Test these ONLY after all lower levels are validated");

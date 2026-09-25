@@ -29,17 +29,12 @@ pub const CLASS: &str = "refcount";
 /// `implicit_ref` is set: `cls_refcount.cc`'s `wildcard_tag`.
 pub const WILDCARD_TAG: &str = "";
 
-/// `dump_int("implicit_ref", (int)implicit_ref)`.
-fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> std::result::Result<S::Ok, S::Error> {
-    s.serialize_u8(u8::from(*b))
-}
-
 /// `cls_refcount_get_op`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
 #[denc(crate = "rados", version = 1, compat = 1)]
 pub struct GetOp {
     pub tag: String,
-    #[serde(serialize_with = "bool_as_int")]
+    #[serde(serialize_with = "crate::dump::bool_as_int")]
     pub implicit_ref: bool,
 }
 
@@ -48,7 +43,7 @@ pub struct GetOp {
 #[denc(crate = "rados", version = 1, compat = 1)]
 pub struct PutOp {
     pub tag: String,
-    #[serde(serialize_with = "bool_as_int")]
+    #[serde(serialize_with = "crate::dump::bool_as_int")]
     pub implicit_ref: bool,
 }
 
@@ -63,7 +58,7 @@ pub struct SetOp {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
 #[denc(crate = "rados", version = 1, compat = 1)]
 pub struct ReadOp {
-    #[serde(serialize_with = "bool_as_int")]
+    #[serde(serialize_with = "crate::dump::bool_as_int")]
     pub implicit_ref: bool,
 }
 

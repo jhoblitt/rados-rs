@@ -100,7 +100,7 @@ jobs:
 
       - name: Run rados-cls Integration Tests (CRC enabled)
         run: |
-          for test in cls_version_refcount cls_user; do
+          for test in cls_version_refcount cls_user cls_queue_gc; do
             cargo test -p rados-cls --test "$test" -- --ignored --nocapture
           done
         env:
@@ -120,7 +120,7 @@ jobs:
 
       - name: Run rados-cls Integration Tests (CRC disabled)
         run: |
-          for test in cls_version_refcount cls_user; do
+          for test in cls_version_refcount cls_user cls_queue_gc; do
             cargo test -p rados-cls --test "$test" -- --ignored --nocapture
           done
         env:
