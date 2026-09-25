@@ -27,7 +27,7 @@
 //! ```
 
 use crate::osdclient::error::Result;
-use crate::osdclient::omap::{OmapAssertion, OmapKey, OmapKeySet, OmapMap};
+use crate::osdclient::omap::{CmpOp, OmapAssertion, OmapKey, OmapKeySet, OmapMap};
 use crate::osdclient::types::{OSDOp, OsdOpFlags};
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -348,6 +348,23 @@ impl OpBuilder {
         Ok(self)
     }
 
+    /// Add a cmpxattr assertion on a byte-string attribute; the request
+    /// fails with `ECANCELED` when it does not hold. RGW guards every
+    /// overwrite with one on the object's id tag.
+    pub fn cmpxattr(mut self, name: impl Into<String>, op: CmpOp, value: Bytes) -> Result<Self> {
+        self.ops.push(OSDOp::cmpxattr(name, op, value)?);
+        self.flags |= OsdOpFlags::READ;
+        Ok(self)
+    }
+
+    /// Add a cmpxattr assertion on an integer attribute; see
+    /// [`OSDOp::cmpxattr_u64`] for how the OSD reads each side.
+    pub fn cmpxattr_u64(mut self, name: impl Into<String>, op: CmpOp, value: u64) -> Result<Self> {
+        self.ops.push(OSDOp::cmpxattr_u64(name, op, value)?);
+        self.flags |= OsdOpFlags::READ;
+        Ok(self)
+    }
+
     /// Add custom flags
     pub fn flags(mut self, flags: OsdOpFlags) -> Self {
         self.flags |= flags;
@@ -526,5 +543,19 @@ mod tests {
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::OmapSetVals);
         assert_eq!(ops[1].op, OpCode::OmapGetHeader);
+    }
+
+    #[test]
+    fn cmpxattr_builder_is_a_read() {
+        let built = OpBuilder::new()
+            .cmpxattr("user.tag", CmpOp::Eq, Bytes::from_static(b"t"))
+            .expect("cmp")
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_read());
+        assert!(built.is_write());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::CmpXattr);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
     }
 }

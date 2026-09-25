@@ -283,7 +283,11 @@ impl Denc for OSDOp {
                     start_epoch,
                 }
             }
-            OpCode::GetXattr | OpCode::SetXattr => {
+            OpCode::GetXattr
+            | OpCode::SetXattr
+            | OpCode::RemoveXattr
+            | OpCode::ListXattrs
+            | OpCode::CmpXattr => {
                 // Extended attribute operations
                 let name_len = buf.get_u32_le();
                 let value_len = buf.get_u32_le();
@@ -745,5 +749,33 @@ mod tests {
         let zero_nsec = zero.nsec;
         assert_eq!(zero_sec, 0);
         assert_eq!(zero_nsec, 0);
+    }
+
+    #[test]
+    fn cmpxattr_union_roundtrips() {
+        use crate::osdclient::omap::CmpOp;
+        use crate::osdclient::types::{OSDOp, OpCode, OpData};
+        use bytes::Bytes;
+
+        let op = OSDOp::cmpxattr("user.tag", CmpOp::Eq, Bytes::from_static(b"t1")).unwrap();
+        let mut buf = BytesMut::new();
+        op.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), CEPH_OSD_OP_SIZE);
+        assert_eq!(&buf[..6], &[0x03, 0x13, 0, 0, 0, 0]); // op 0x1303, flags 0
+        assert_eq!(&buf[6..16], &[8, 0, 0, 0, 2, 0, 0, 0, 1, 1]); // xattr union
+        assert!(buf[16..34].iter().all(|b| *b == 0)); // union padding
+        assert_eq!(&buf[34..], &[10, 0, 0, 0]); // payload_len
+
+        let decoded = OSDOp::decode(&mut buf, 0).unwrap();
+        assert_eq!(decoded.op, OpCode::CmpXattr);
+        assert!(matches!(
+            decoded.op_data,
+            OpData::Xattr {
+                name_len: 8,
+                value_len: 2,
+                cmp_op: 1,
+                cmp_mode: 1
+            }
+        ));
     }
 }

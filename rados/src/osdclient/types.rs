@@ -3,6 +3,8 @@
 use bytes::Bytes;
 use std::time::SystemTime;
 
+use crate::osdclient::omap::CmpOp;
+
 // ============= Operation State Machine =============
 
 /// Operation state machine matching Ceph Objecter's implicit states
@@ -464,6 +466,13 @@ const CEPH_OSD_OP_TYPE_ATTR: u16 = 0x0300; // Attribute operations
 const CEPH_OSD_OP_TYPE_EXEC: u16 = 0x0400; // Exec/CLS operations (object class methods)
 const CEPH_OSD_OP_TYPE_PG: u16 = 0x0500; // PG operations
 
+/// `CEPH_OSD_CMPXATTR_MODE_STRING`: the OSD compares the stored attribute
+/// and the supplied value as byte strings.
+const CEPH_OSD_CMPXATTR_MODE_STRING: u8 = 1;
+/// `CEPH_OSD_CMPXATTR_MODE_U64`: the OSD parses the stored attribute as
+/// decimal text and reads the supplied value as a little-endian u64.
+const CEPH_OSD_CMPXATTR_MODE_U64: u8 = 2;
+
 /// Helper macro to construct operation codes using Ceph's encoding scheme
 /// Matches __CEPH_OSD_OP(mode, type, nr) macro from rados.h
 macro_rules! osd_op {
@@ -528,6 +537,8 @@ pub enum OpCode {
     RemoveXattr = osd_op!(WR, ATTR, 4),
     /// Get all extended attributes: __CEPH_OSD_OP(RD, ATTR, 2) = GETXATTRS
     ListXattrs = osd_op!(RD, ATTR, 2),
+    /// Compare an extended attribute: __CEPH_OSD_OP(RD, ATTR, 3) = CMPXATTR
+    CmpXattr = osd_op!(RD, ATTR, 3),
     /// Call object class method: CEPH_OSD_OP_CALL = __CEPH_OSD_OP(RD, EXEC, 1)
     Call = osd_op!(RD, EXEC, 1),
     /// PG list operation (legacy): __CEPH_OSD_OP(RD, PG, 1) = PGLS
@@ -944,6 +955,8 @@ impl OSDOp {
         op: OpCode,
         name: String,
         value: Option<Bytes>,
+        cmp_op: u8,
+        cmp_mode: u8,
     ) -> Result<Self, crate::osdclient::error::OSDClientError> {
         use bytes::BytesMut;
 
@@ -962,8 +975,8 @@ impl OSDOp {
             op_data: OpData::Xattr {
                 name_len: name.len() as u32,
                 value_len,
-                cmp_op: 0,
-                cmp_mode: 0,
+                cmp_op,
+                cmp_mode,
             },
             indata: buf.freeze(),
         })
@@ -976,7 +989,7 @@ impl OSDOp {
     pub fn get_xattr(
         name: impl Into<String>,
     ) -> Result<Self, crate::osdclient::error::OSDClientError> {
-        Self::xattr_op(OpCode::GetXattr, name.into(), None)
+        Self::xattr_op(OpCode::GetXattr, name.into(), None, 0, 0)
     }
 
     /// Set an extended attribute
@@ -988,7 +1001,7 @@ impl OSDOp {
         name: impl Into<String>,
         value: Bytes,
     ) -> Result<Self, crate::osdclient::error::OSDClientError> {
-        Self::xattr_op(OpCode::SetXattr, name.into(), Some(value))
+        Self::xattr_op(OpCode::SetXattr, name.into(), Some(value), 0, 0)
     }
 
     /// Remove an extended attribute
@@ -998,7 +1011,54 @@ impl OSDOp {
     pub fn remove_xattr(
         name: impl Into<String>,
     ) -> Result<Self, crate::osdclient::error::OSDClientError> {
-        Self::xattr_op(OpCode::RemoveXattr, name.into(), None)
+        Self::xattr_op(OpCode::RemoveXattr, name.into(), None, 0, 0)
+    }
+
+    /// Compare an extended attribute with `value` as byte strings, as
+    /// `ObjectOperation::cmpxattr(name, op, bufferlist)` does.
+    ///
+    /// The OSD evaluates `value <op> current`: the supplied operand is the
+    /// left-hand side, so `CmpOp::Gt` holds when `value` exceeds the stored
+    /// attribute (`do_cmp_xattr` in `PrimaryLogPG.cc`). A missing attribute
+    /// compares as the empty string, so `CmpOp::Eq` with an empty `value`
+    /// asserts that the attribute is absent or empty. When the comparison
+    /// holds the op's return code is 1; when it does not, the whole request
+    /// fails with `ECANCELED` and none of its writes apply.
+    pub fn cmpxattr(
+        name: impl Into<String>,
+        op: CmpOp,
+        value: Bytes,
+    ) -> Result<Self, crate::osdclient::error::OSDClientError> {
+        Self::xattr_op(
+            OpCode::CmpXattr,
+            name.into(),
+            Some(value),
+            op as u8,
+            CEPH_OSD_CMPXATTR_MODE_STRING,
+        )
+    }
+
+    /// Compare an extended attribute with `value` as unsigned integers, as
+    /// `ObjectOperation::cmpxattr(name, op, uint64_t)` does.
+    ///
+    /// The OSD parses the stored attribute as decimal text (missing or
+    /// empty is 0; text that does not start with a decimal number, or that
+    /// overflows u64, fails the request with `EINVAL`) and receives `value`
+    /// as a little-endian u64. Operand order and result codes are those of
+    /// [`Self::cmpxattr`].
+    pub fn cmpxattr_u64(
+        name: impl Into<String>,
+        op: CmpOp,
+        value: u64,
+    ) -> Result<Self, crate::osdclient::error::OSDClientError> {
+        let value = crate::encode_with_capacity(&value, 0)?;
+        Self::xattr_op(
+            OpCode::CmpXattr,
+            name.into(),
+            Some(value),
+            op as u8,
+            CEPH_OSD_CMPXATTR_MODE_U64,
+        )
     }
 
     /// List all extended attributes
@@ -1609,5 +1669,43 @@ mod tests {
             }
             other => panic!("unexpected op_data {other:?}"),
         }
+    }
+
+    #[test]
+    fn cmpxattr_sets_cmp_fields_and_raw_indata() {
+        let op = OSDOp::cmpxattr("user.tag", CmpOp::Eq, Bytes::from_static(b"t1")).unwrap();
+        assert_eq!(op.op, OpCode::CmpXattr);
+        assert_eq!(&op.indata[..], b"user.tagt1");
+        assert!(matches!(
+            op.op_data,
+            OpData::Xattr {
+                name_len: 8,
+                value_len: 2,
+                cmp_op: 1,
+                cmp_mode: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn cmpxattr_u64_sends_a_little_endian_value() {
+        let op = OSDOp::cmpxattr_u64("user.ver", CmpOp::Gte, 5).unwrap();
+        assert_eq!(&op.indata[..], b"user.ver\x05\0\0\0\0\0\0\0");
+        assert!(matches!(
+            op.op_data,
+            OpData::Xattr {
+                name_len: 8,
+                value_len: 8,
+                cmp_op: 4,
+                cmp_mode: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn small_op_opcodes_match_rados_h() {
+        // __CEPH_OSD_OP(mode, type, nr) from ceph/src/include/rados.h:
+        // mode RD 0x1000 / WR 0x2000, type DATA 0x0200 / ATTR 0x0300.
+        assert_eq!(OpCode::CmpXattr as u16, 0x1303); // (RD, ATTR, 3)
     }
 }
