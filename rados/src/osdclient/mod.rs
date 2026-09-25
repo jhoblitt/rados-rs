@@ -29,6 +29,7 @@ pub mod snapshot;
 pub(crate) mod throttle;
 pub(crate) mod tracker;
 pub mod types;
+pub mod watchers;
 
 // Re-export commonly used types
 pub use client::{OSDClient, OSDClientConfig, default_client_inc};
@@ -48,6 +49,7 @@ pub use types::{
     OsdOpFlags, PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId,
     WriteResult,
 };
+pub use watchers::{ListWatchersReply, WatchItem};
 
 pub use messages::MOSDOp;
 

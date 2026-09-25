@@ -577,6 +577,8 @@ pub enum OpCode {
     Pgnls = osd_op!(RD, PG, 5),
     /// List object snapshots/clones: __CEPH_OSD_OP(RD, DATA, 10)
     ListSnaps = osd_op!(RD, DATA, 10),
+    /// List the object's watchers: __CEPH_OSD_OP(RD, DATA, 9) = LIST_WATCHERS
+    ListWatchers = osd_op!(RD, DATA, 9),
     /// Roll back object HEAD to a prior snapshot: __CEPH_OSD_OP(WR, DATA, 14)
     Rollback = osd_op!(WR, DATA, 14),
     /// CEPH_OSD_OP_OMAPGETKEYS
@@ -1154,6 +1156,18 @@ impl OSDOp {
     pub fn list_snaps() -> Self {
         Self {
             op: OpCode::ListSnaps,
+            flags: 0,
+            op_data: OpData::None,
+            indata: Bytes::new(),
+        }
+    }
+
+    /// List the clients watching an object (LIST_WATCHERS): a bare op, as
+    /// Objecter's `add_op` builds it. Decode the reply with
+    /// [`crate::osdclient::watchers::decode_list_watchers`].
+    pub fn list_watchers() -> Self {
+        Self {
+            op: OpCode::ListWatchers,
             flags: 0,
             op_data: OpData::None,
             indata: Bytes::new(),
@@ -1815,5 +1829,6 @@ mod tests {
         assert_eq!(OpCode::CmpXattr as u16, 0x1303); // (RD, ATTR, 3)
         assert_eq!(OpCode::Zero as u16, 0x2204); // (WR, DATA, 4)
         assert_eq!(OpCode::SetAllocHint as u16, 0x2223); // (WR, DATA, 35)
+        assert_eq!(OpCode::ListWatchers as u16, 0x1209); // (RD, DATA, 9)
     }
 }

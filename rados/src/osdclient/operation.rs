@@ -276,6 +276,14 @@ impl OpBuilder {
         self
     }
 
+    /// Add a list_watchers operation; decode its reply with
+    /// [`crate::osdclient::watchers::decode_list_watchers`].
+    pub fn list_watchers(mut self) -> Self {
+        self.ops.push(OSDOp::list_watchers());
+        self.flags |= OsdOpFlags::READ;
+        self
+    }
+
     /// Add a rollback operation (roll object HEAD back to a prior snapshot)
     ///
     /// # Arguments
@@ -609,6 +617,14 @@ mod tests {
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::SetAllocHint);
         assert_eq!(ops[1].op, OpCode::WriteFull);
+    }
+
+    #[test]
+    fn list_watchers_builder_is_a_read() {
+        let built = OpBuilder::new().list_watchers().build();
+        assert!(built.is_read());
+        assert!(!built.is_write());
+        assert_eq!(built.into_ops()[0].op, OpCode::ListWatchers);
     }
 
     #[test]

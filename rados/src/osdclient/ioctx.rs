@@ -21,6 +21,7 @@ use crate::osdclient::types::{
     AllocHintFlags, OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult,
     WriteResult,
 };
+use crate::osdclient::watchers::{WatchItem, decode_list_watchers};
 
 /// Maximum entries per PGLS request for object listing pagination
 const MAX_ENTRIES_PER_REQUEST: usize = 100;
@@ -723,6 +724,20 @@ impl IoCtx {
     /// Attribute names in ascending order
     pub async fn list_xattrs(&self, oid: impl Into<String>) -> Result<Vec<String>> {
         Ok(self.get_xattrs(oid).await?.into_keys().collect())
+    }
+
+    /// List the clients watching an object, as `rados_list_watchers` does.
+    pub async fn list_watchers(&self, oid: impl Into<String>) -> Result<Vec<WatchItem>> {
+        let oid = oid.into();
+        debug!(
+            "Listing watchers of object '{}' in pool {}",
+            oid, self.pool_id
+        );
+
+        let op = OpBuilder::new().list_watchers().build();
+        let result = self.execute(&oid, op).await?;
+        OSDClient::check_op_result(&result, "list_watchers")?;
+        decode_list_watchers(result.first_reply()?)
     }
 
     /// List omap keys after `start_after`.
