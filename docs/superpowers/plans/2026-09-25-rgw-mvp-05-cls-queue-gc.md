@@ -302,7 +302,10 @@ mod tests {
     #[test]
     fn marker_encodes_gen_before_offset() {
         // Corpus cls_queue_marker/fe7a542e...: gen 0, offset 745307.
-        let m = Marker { offset: 745_307, gen: 0 };
+        let m = Marker {
+            offset: 745_307,
+            generation: 0,
+        };
         assert_eq!(
             bytes(&m),
             [1u8, 1, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5b, 0x5f, 0x0b, 0, 0, 0, 0, 0]
@@ -522,11 +525,13 @@ impl Serialize for Entry {
 
 /// `cls_queue_marker`: a position in the ring, printed as `gen/offset`.
 /// The wire order is `gen` then `offset`, the reverse of the declaration
-/// and of the dump.
+/// and of the dump. The field is `generation` here because `gen` is a
+/// keyword in edition 2024; the dump keeps `gen`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Marker {
     pub offset: u64,
-    pub gen: u64,
+    #[serde(rename = "gen")]
+    pub generation: u64,
 }
 
 impl VersionedEncode for Marker {
@@ -546,7 +551,7 @@ impl VersionedEncode for Marker {
         features: u64,
         _version: u8,
     ) -> std::result::Result<(), RadosError> {
-        self.gen.encode(buf, features)?;
+        self.generation.encode(buf, features)?;
         self.offset.encode(buf, features)
     }
 
@@ -556,9 +561,9 @@ impl VersionedEncode for Marker {
         _struct_v: u8,
         _compat_version: u8,
     ) -> std::result::Result<Self, RadosError> {
-        let gen = u64::decode(buf, features)?;
+        let generation = u64::decode(buf, features)?;
         let offset = u64::decode(buf, features)?;
-        Ok(Self { offset, gen })
+        Ok(Self { offset, generation })
     }
 
     fn encoded_size_content(&self, _features: u64, _version: u8) -> Option<usize> {
@@ -571,7 +576,7 @@ rados::impl_denc_for_versioned!(Marker);
 impl fmt::Display for Marker {
     /// `cls_queue_marker::to_str`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.gen, self.offset)
+        write!(f, "{}/{}", self.generation, self.offset)
     }
 }
 
@@ -593,7 +598,7 @@ impl Default for Head {
     fn default() -> Self {
         let start = Marker {
             offset: HEAD_SIZE_1K,
-            gen: 0,
+            generation: 0,
         };
         Self {
             max_head_size: HEAD_SIZE_1K,
@@ -613,9 +618,9 @@ impl Serialize for Head {
         state.serialize_field("queue_size", &self.queue_size)?;
         state.serialize_field("max_urgent_data_size", &self.max_urgent_data_size)?;
         state.serialize_field("front_offset", &self.front.offset)?;
-        state.serialize_field("front_gen", &self.front.gen)?;
+        state.serialize_field("front_gen", &self.front.generation)?;
         state.serialize_field("tail_offset", &self.tail.offset)?;
-        state.serialize_field("tail_gen", &self.tail.gen)?;
+        state.serialize_field("tail_gen", &self.tail.generation)?;
         state.end()
     }
 }
@@ -876,7 +881,7 @@ pub async fn remove_entries(ioctx: &IoCtx, oid: &str, end_marker: &str) -> Resul
 `Cargo.toml`: add `queue = []` and put it in `default`. `lib.rs`: add
 `#[cfg(feature = "queue")] pub mod queue;` (alphabetical, after
 `dump`/before `refcount`) and `feature = "queue"` to the `mod call` gate.
-`ci.yml`: `for features in "" queue refcount version; do`.
+`ci.yml`: `for features in "" queue refcount user version; do`.
 
 `rados-dencoder/src/main.rs`: import `rados_cls::queue::{Entry as
 QueueEntry, EnqueueOp as QueueEnqueueOp, GetCapacityRet as
@@ -1008,7 +1013,7 @@ mod tests {
         );
 
         // A version-1 writer sent only the three strings.
-        let v1 = b"\x01\x01\x17\x00\x00\x00\x01\x00\x00\x00p\x01\x00\x00\x00n\x01\x00\x00\x00l";
+        let v1 = b"\x01\x01\x0f\x00\x00\x00\x01\x00\x00\x00p\x01\x00\x00\x00n\x01\x00\x00\x00l";
         let o = Obj::decode(&mut &v1[..], 0).expect("decode");
         assert_eq!((o.pool.as_str(), o.key.name.as_str(), o.loc.as_str()), ("p", "n", "l"));
         assert!(o.key.instance.is_empty());
