@@ -773,17 +773,21 @@ impl OSDOp {
         method: impl Into<String>,
         indata: Bytes,
     ) -> Result<Self, crate::osdclient::error::OSDClientError> {
-        use crate::Denc;
         use bytes::BytesMut;
 
         let class = class.into();
         let method = method.into();
 
-        // Encode class and method into indata buffer (prepended to actual indata)
-        // 4-byte len prefix + content for each string
-        let mut buf = BytesMut::with_capacity(4 + class.len() + 4 + method.len());
-        class.encode(&mut buf, 0)?;
-        method.encode(&mut buf, 0)?;
+        // The CALL payload is class name bytes + method name bytes + method
+        // indata, all unprefixed and unterminated — the OSD slices them back
+        // out using class_len/method_len from the op header (below), not a
+        // length embedded in the payload. Matches Objecter.h's `call()`
+        // helpers and objclass.cc's `cls_call()`, which both
+        // `bufferlist::append(cname, class_len)` rather than encode a
+        // denc-style length-prefixed string.
+        let mut buf = BytesMut::with_capacity(class.len() + method.len() + indata.len());
+        buf.extend_from_slice(class.as_bytes());
+        buf.extend_from_slice(method.as_bytes());
         buf.extend_from_slice(&indata);
 
         Ok(Self {
@@ -1276,6 +1280,40 @@ mod tests {
         assert_eq!(OpCode::SetXattr as u16, 0x2301); // __CEPH_OSD_OP(WR, ATTR, 1)
         assert_eq!(OpCode::Pgnls as u16, 0x1505); // __CEPH_OSD_OP(RD, PG, 5)
         assert_eq!(OpCode::Call as u16, 0x1401); // __CEPH_OSD_OP(RD, EXEC, 1)
+    }
+
+    #[test]
+    fn test_osdop_call_encodes_raw_class_and_method_bytes() {
+        // The OSD slices class/method back out of indata using class_len and
+        // method_len from the op header, not a length embedded in the
+        // payload, so the payload must be raw bytes with no length prefix.
+        let op = OSDOp::call("hello", "say_hello", Bytes::new()).expect("call");
+        assert_eq!(op.indata, Bytes::from_static(b"hellosay_hello"));
+
+        match op.op_data {
+            OpData::Call {
+                class_len,
+                method_len,
+                indata_len,
+            } => {
+                assert_eq!(class_len, 5);
+                assert_eq!(method_len, 9);
+                assert_eq!(indata_len, 0);
+            }
+            _ => panic!("Expected OpData::Call"),
+        }
+    }
+
+    #[test]
+    fn test_osdop_call_appends_method_indata_after_class_and_method() {
+        let payload = Bytes::from_static(b"payload");
+        let op = OSDOp::call("cls", "m", payload.clone()).expect("call");
+        assert_eq!(op.indata, Bytes::from_static(b"clsmpayload"));
+
+        match op.op_data {
+            OpData::Call { indata_len, .. } => assert_eq!(indata_len, payload.len() as u32),
+            _ => panic!("Expected OpData::Call"),
+        }
     }
 
     #[test]
