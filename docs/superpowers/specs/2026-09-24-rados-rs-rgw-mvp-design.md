@@ -16,14 +16,22 @@ expressed against the fork.
 
 ## Non-goals
 
-- Multisite: no `cls_log`, `cls_timeindex`, `cls_fifo`, `cls_2pc_queue`,
-  `cls_cmpomap`, no bucket-index log (`bilog`) or `bi_*` repair ops, no
-  data or metadata log.
+- Multisite: no `cls_log`, `cls_timeindex`, `cls_fifo`, `cls_cmpomap`, no
+  bucket-index log (`bilog`) or `bi_*` repair ops, no data or metadata
+  log, no sync of any kind.
+- Persistent bucket notifications: no `cls_2pc_queue`. Topics and
+  endpoint delivery are RGW-level and out with it.
 - Resharding as an action: the reshard queue ops are out. The resharding
   guard and `get_bucket_resharding` are in, because C++ RGW attaches the
   guard to every bucket-index write and a compatible client must too.
 - `cls_otp` (MFA), `copy_from2` (the MVP copies by read and write),
   `rgw_s3select` usage data beyond what the usage-log types carry.
+- RGW features excluded from the MVP driver for the time being, listed
+  here so that nothing in this fork is sized or tested for them: the D4N
+  cache layer, the Swift API, the POSIX driver and Lua scripting. None of
+  them needs RADOS surface the packages below lack (D4N and POSIX are
+  other backends; Swift and Lua use the same objects and sysobj reads and
+  writes), so this is a driver-scope statement, not a transport one.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
 
@@ -136,8 +144,9 @@ land last.
   pending-info map, `rgw_usage_log_entry`, the GC chain types, the LC
   head and entry, the OLH entry and log entry). This branch is the base
   the remaining rgw branches stack on until it merges.
-- `cls-rgw-bucket-index`: prepare, complete, list, dir header, init and
-  init2, check and rebuild, suggest changes, remove obj, check mtime,
+- `cls-rgw-bucket-index`: prepare, complete, list, dir header, init
+  (`bucket_init_index2` is post-Squid and answers `EOPNOTSUPP` on v19),
+  check and rebuild, suggest changes, remove obj, check mtime,
   check attrs prefix, store pg ver, set tag timeout, update stats, and the
   resharding guard with `get_bucket_resharding`.
 - `cls-rgw-gc`: set entry, defer, list, remove.
