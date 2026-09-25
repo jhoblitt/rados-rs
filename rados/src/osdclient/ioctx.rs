@@ -275,6 +275,24 @@ impl IoCtx {
         })
     }
 
+    /// Zero the bytes `[offset, offset + length)` of an object
+    ///
+    /// Like [`write`](Self::write) this does not truncate. A missing object
+    /// stays missing: the OSD treats the op as a no-op, not as `ENOENT`.
+    pub async fn zero(&self, oid: &str, offset: u64, length: u64) -> Result<WriteResult> {
+        debug!(
+            "Zeroing {} bytes of object {} at offset {}",
+            length, oid, offset
+        );
+
+        let op = OpBuilder::new().zero(offset, length).build();
+        let result = self.execute(oid, op).await?;
+        OSDClient::check_op_result(&result, "zero")?;
+        Ok(WriteResult {
+            version: result.version,
+        })
+    }
+
     /// Read data from an object
     ///
     /// # Arguments

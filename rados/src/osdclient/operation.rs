@@ -187,6 +187,13 @@ impl OpBuilder {
         self
     }
 
+    /// Add a zero operation (clear `length` bytes from `offset`).
+    pub fn zero(mut self, offset: u64, length: u64) -> Self {
+        self.ops.push(OSDOp::zero(offset, length));
+        self.flags |= OsdOpFlags::WRITE;
+        self
+    }
+
     /// Add a sparse read operation
     ///
     /// # Arguments
@@ -557,5 +564,13 @@ mod tests {
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::CmpXattr);
         assert_eq!(ops[1].op, OpCode::WriteFull);
+    }
+
+    #[test]
+    fn zero_builder_is_a_write() {
+        let built = OpBuilder::new().zero(0, 4096).build();
+        assert!(built.is_write());
+        assert!(!built.is_read());
+        assert_eq!(built.into_ops()[0].op, OpCode::Zero);
     }
 }

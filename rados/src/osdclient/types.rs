@@ -519,6 +519,8 @@ pub enum OpCode {
     WriteFull = osd_op!(WR, DATA, 2),
     /// Truncate operation: __CEPH_OSD_OP(WR, DATA, 3)
     Truncate = osd_op!(WR, DATA, 3),
+    /// Zero a byte range: __CEPH_OSD_OP(WR, DATA, 4)
+    Zero = osd_op!(WR, DATA, 4),
     /// Append data to the end of an object: __CEPH_OSD_OP(WR, DATA, 6)
     Append = osd_op!(WR, DATA, 6),
     /// Assert object version matches before executing other ops: __CEPH_OSD_OP(RD, DATA, 8)
@@ -745,6 +747,23 @@ impl OSDOp {
             op: OpCode::Delete,
             flags: 0,
             op_data: OpData::None,
+            indata: Bytes::new(),
+        }
+    }
+
+    /// Zero the bytes `[offset, offset + length)`, as `ObjectOperation::zero`
+    /// does: an extent union and no data. The OSD treats a missing object
+    /// as a no-op, not as an error, and does not create it.
+    pub fn zero(offset: u64, length: u64) -> Self {
+        Self {
+            op: OpCode::Zero,
+            flags: 0,
+            op_data: OpData::Extent {
+                offset,
+                length,
+                truncate_size: 0,
+                truncate_seq: 0,
+            },
             indata: Bytes::new(),
         }
     }
@@ -1703,9 +1722,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_carries_an_extent_and_no_indata() {
+        let op = OSDOp::zero(2, 3);
+        assert_eq!(op.op, OpCode::Zero);
+        assert!(op.indata.is_empty());
+        assert!(matches!(
+            op.op_data,
+            OpData::Extent {
+                offset: 2,
+                length: 3,
+                truncate_size: 0,
+                truncate_seq: 0
+            }
+        ));
+    }
+
+    #[test]
     fn small_op_opcodes_match_rados_h() {
         // __CEPH_OSD_OP(mode, type, nr) from ceph/src/include/rados.h:
         // mode RD 0x1000 / WR 0x2000, type DATA 0x0200 / ATTR 0x0300.
         assert_eq!(OpCode::CmpXattr as u16, 0x1303); // (RD, ATTR, 3)
+        assert_eq!(OpCode::Zero as u16, 0x2204); // (WR, DATA, 4)
     }
 }

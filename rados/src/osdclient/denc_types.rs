@@ -259,6 +259,7 @@ impl Denc for OSDOp {
             | OpCode::WriteFull
             | OpCode::Truncate
             | OpCode::Append
+            | OpCode::Zero
             | OpCode::Stat => {
                 // Extent-based operations
                 let offset = buf.get_u64_le();
@@ -775,6 +776,31 @@ mod tests {
                 value_len: 2,
                 cmp_op: 1,
                 cmp_mode: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn zero_union_roundtrips() {
+        use crate::osdclient::types::{OSDOp, OpCode, OpData};
+
+        let op = OSDOp::zero(2, 3);
+        let mut buf = BytesMut::new();
+        op.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), CEPH_OSD_OP_SIZE);
+        assert_eq!(&buf[..6], &[0x04, 0x22, 0, 0, 0, 0]); // op 0x2204, flags 0
+        assert_eq!(&buf[6..14], &2u64.to_le_bytes());
+        assert_eq!(&buf[14..22], &3u64.to_le_bytes());
+
+        let decoded = OSDOp::decode(&mut buf, 0).unwrap();
+        assert_eq!(decoded.op, OpCode::Zero);
+        assert!(matches!(
+            decoded.op_data,
+            OpData::Extent {
+                offset: 2,
+                length: 3,
+                truncate_size: 0,
+                truncate_seq: 0
             }
         ));
     }
