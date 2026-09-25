@@ -44,8 +44,9 @@ pub use pg_nls_response::{ListObjectImpl, PgNlsResponse};
 pub use pgmap_types::{ObjectstorePerfStat, PoolStat};
 pub use snapshot::SnapId;
 pub use types::{
-    OSDOp, ObjectId, ObjectLocator, OpCode, OpReply, OpResult, OpState, OpTarget, OsdOpFlags,
-    PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId, WriteResult,
+    AllocHintFlags, OSDOp, ObjectId, ObjectLocator, OpCode, OpReply, OpResult, OpState, OpTarget,
+    OsdOpFlags, PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId,
+    WriteResult,
 };
 
 pub use messages::MOSDOp;

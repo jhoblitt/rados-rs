@@ -28,7 +28,7 @@
 
 use crate::osdclient::error::Result;
 use crate::osdclient::omap::{CmpOp, OmapAssertion, OmapKey, OmapKeySet, OmapMap};
-use crate::osdclient::types::{OSDOp, OsdOpFlags};
+use crate::osdclient::types::{AllocHintFlags, OSDOp, OsdOpFlags};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -190,6 +190,22 @@ impl OpBuilder {
     /// Add a zero operation (clear `length` bytes from `offset`).
     pub fn zero(mut self, offset: u64, length: u64) -> Self {
         self.ops.push(OSDOp::zero(offset, length));
+        self.flags |= OsdOpFlags::WRITE;
+        self
+    }
+
+    /// Add a set_alloc_hint operation; see [`OSDOp::set_alloc_hint`].
+    pub fn set_alloc_hint(
+        mut self,
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: AllocHintFlags,
+    ) -> Self {
+        self.ops.push(OSDOp::set_alloc_hint(
+            expected_object_size,
+            expected_write_size,
+            flags,
+        ));
         self.flags |= OsdOpFlags::WRITE;
         self
     }
@@ -572,5 +588,18 @@ mod tests {
         assert!(built.is_write());
         assert!(!built.is_read());
         assert_eq!(built.into_ops()[0].op, OpCode::Zero);
+    }
+
+    #[test]
+    fn set_alloc_hint_builder_is_a_write() {
+        let built = OpBuilder::new()
+            .set_alloc_hint(0, 0, AllocHintFlags::INCOMPRESSIBLE)
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_write());
+        assert!(!built.is_read());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::SetAllocHint);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
     }
 }

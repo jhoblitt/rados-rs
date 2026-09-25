@@ -39,8 +39,9 @@ pub use msgr2::{
     MapMessage, MapReceiver, MapSender, MessageThrottle, Msgr2Error, ThrottleConfig, map_channel,
 };
 pub use osdclient::{
-    BuiltOp, CmpOp, IoCtx, LockFlags, LockRequest, LockType, OSDClient, OSDClientConfig,
-    OSDClientError, OSDMap, OSDMapIncremental, ObjectId, ObjectLocator, ObjectstorePerfStat,
+    AllocHintFlags, BuiltOp, CmpOp, IoCtx, LockFlags, LockRequest, LockType, OSDClient,
+    OSDClientConfig, OSDClientError, OSDMap, OSDMapIncremental, ObjectId, ObjectLocator,
+    ObjectstorePerfStat,
     OmapAssertion, OmapKey, OmapKeySet, OmapKeys, OmapMap, OmapVals, OpBuilder, OpCode, OpReply,
     OpResult, OpState, OpTarget, OsdOpFlags, PgMergeMeta, PgNlsResponse, PgPool, PoolInfo,
     PoolSnapInfo, PoolStat, RadosObject, ReadResult, SnapId, SparseExtent, SparseReadResult,

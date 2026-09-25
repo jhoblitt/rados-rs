@@ -18,7 +18,8 @@ use crate::osdclient::omap::{
 use crate::osdclient::operation::{BuiltOp, OpBuilder};
 use crate::osdclient::snapshot::SnapId;
 use crate::osdclient::types::{
-    OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult, WriteResult,
+    AllocHintFlags, OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult,
+    WriteResult,
 };
 
 /// Maximum entries per PGLS request for object listing pagination
@@ -291,6 +292,28 @@ impl IoCtx {
         Ok(WriteResult {
             version: result.version,
         })
+    }
+
+    /// Hint the OSD about an object's expected size and access pattern, as
+    /// `rados_set_alloc_hint2` does. Creates the object if it does not exist.
+    pub async fn set_alloc_hint(
+        &self,
+        oid: &str,
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: AllocHintFlags,
+    ) -> Result<()> {
+        debug!(
+            "Setting alloc hint on object {} in pool {}: {:?}",
+            oid, self.pool_id, flags
+        );
+
+        let op = OpBuilder::new()
+            .set_alloc_hint(expected_object_size, expected_write_size, flags)
+            .build();
+        let result = self.execute(oid, op).await?;
+        OSDClient::check_op_result(&result, "set_alloc_hint")?;
+        Ok(())
     }
 
     /// Read data from an object

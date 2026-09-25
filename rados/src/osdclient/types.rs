@@ -167,6 +167,25 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `CEPH_OSD_ALLOC_HINT_FLAG_*` from `rados.h`: what the writer expects
+    /// of an object's access pattern, sent with `set_alloc_hint`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct AllocHintFlags: u32 {
+        const SEQUENTIAL_WRITE = 1;
+        const RANDOM_WRITE = 2;
+        const SEQUENTIAL_READ = 4;
+        const RANDOM_READ = 8;
+        const APPEND_ONLY = 16;
+        const IMMUTABLE = 32;
+        const SHORTLIVED = 64;
+        const LONGLIVED = 128;
+        const COMPRESSIBLE = 256;
+        const INCOMPRESSIBLE = 512;
+        const LOG = 1024;
+    }
+}
+
 /// Object identification (corresponds to hobject_t in Ceph)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectId {
@@ -473,6 +492,10 @@ const CEPH_OSD_CMPXATTR_MODE_STRING: u8 = 1;
 /// decimal text and reads the supplied value as a little-endian u64.
 const CEPH_OSD_CMPXATTR_MODE_U64: u8 = 2;
 
+/// `CEPH_OSD_OP_FLAG_FAILOK`, a per-op flag: the OSD carries on past this
+/// op's failure instead of failing the request.
+const CEPH_OSD_OP_FLAG_FAILOK: u32 = 0x2;
+
 /// Helper macro to construct operation codes using Ceph's encoding scheme
 /// Matches __CEPH_OSD_OP(mode, type, nr) macro from rados.h
 macro_rules! osd_op {
@@ -531,6 +554,8 @@ pub enum OpCode {
     Delete = osd_op!(WR, DATA, 5),
     /// Create object: __CEPH_OSD_OP(WR, DATA, 13)
     Create = osd_op!(WR, DATA, 13),
+    /// Allocation hint: __CEPH_OSD_OP(WR, DATA, 35) = SETALLOCHINT
+    SetAllocHint = osd_op!(WR, DATA, 35),
     /// Get extended attribute: __CEPH_OSD_OP(RD, ATTR, 1)
     GetXattr = osd_op!(RD, ATTR, 1),
     /// Set extended attribute: __CEPH_OSD_OP(WR, ATTR, 1)
@@ -626,6 +651,12 @@ pub enum OpData {
     Snap { snapid: u64 },
     /// Version assertion (`ceph_osd_op.assert_ver.ver`)
     AssertVer { ver: u64 },
+    /// Allocation hint (`ceph_osd_op.alloc_hint`)
+    AllocHint {
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: u32,
+    },
     /// Operations with no specific data
     None,
 }
@@ -864,6 +895,30 @@ impl OSDOp {
             op: OpCode::AssertVer,
             flags: 0,
             op_data: OpData::AssertVer { ver },
+            indata: Bytes::new(),
+        }
+    }
+
+    /// Hint the OSD about the object's expected size and access pattern, as
+    /// `ObjectOperation::set_alloc_hint` does.
+    ///
+    /// The op carries `CEPH_OSD_OP_FLAG_FAILOK`, as Objecter sets it: an
+    /// OSD that rejects the hint does not fail the request. The OSD creates
+    /// the object if it does not exist. `0` for either size means no
+    /// expectation.
+    pub fn set_alloc_hint(
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: AllocHintFlags,
+    ) -> Self {
+        Self {
+            op: OpCode::SetAllocHint,
+            flags: CEPH_OSD_OP_FLAG_FAILOK,
+            op_data: OpData::AllocHint {
+                expected_object_size,
+                expected_write_size,
+                flags: flags.bits(),
+            },
             indata: Bytes::new(),
         }
     }
@@ -1738,10 +1793,27 @@ mod tests {
     }
 
     #[test]
+    fn set_alloc_hint_carries_failok_and_the_hint() {
+        let op = OSDOp::set_alloc_hint(4096, 512, AllocHintFlags::INCOMPRESSIBLE);
+        assert_eq!(op.op, OpCode::SetAllocHint);
+        assert_eq!(op.flags, 0x2); // CEPH_OSD_OP_FLAG_FAILOK, as Objecter sets it
+        assert!(op.indata.is_empty());
+        assert!(matches!(
+            op.op_data,
+            OpData::AllocHint {
+                expected_object_size: 4096,
+                expected_write_size: 512,
+                flags: 512
+            }
+        ));
+    }
+
+    #[test]
     fn small_op_opcodes_match_rados_h() {
         // __CEPH_OSD_OP(mode, type, nr) from ceph/src/include/rados.h:
         // mode RD 0x1000 / WR 0x2000, type DATA 0x0200 / ATTR 0x0300.
         assert_eq!(OpCode::CmpXattr as u16, 0x1303); // (RD, ATTR, 3)
         assert_eq!(OpCode::Zero as u16, 0x2204); // (WR, DATA, 4)
+        assert_eq!(OpCode::SetAllocHint as u16, 0x2223); // (WR, DATA, 35)
     }
 }

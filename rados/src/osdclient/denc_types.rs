@@ -227,6 +227,17 @@ impl Denc for OSDOp {
                 buf.put_u64_le(0); // padding
                 buf.put_u32_le(0); // padding
             }
+            OpData::AllocHint {
+                expected_object_size,
+                expected_write_size,
+                flags,
+            } => {
+                buf.put_u64_le(*expected_object_size);
+                buf.put_u64_le(*expected_write_size);
+                buf.put_u32_le(*flags);
+                // Pad to CEPH_OSD_OP_UNION_SIZE: 8 + 8 + 4 = 20, need 8 more
+                buf.put_u64_le(0);
+            }
             OpData::None => {
                 // Empty union - CEPH_OSD_OP_UNION_SIZE bytes of zeros
                 buf.put_u64_le(0);
@@ -315,6 +326,19 @@ impl Denc for OSDOp {
                 let ver = buf.get_u64_le();
                 buf.advance(12);
                 OpData::AssertVer { ver }
+            }
+            OpCode::SetAllocHint => {
+                // alloc_hint: u64 expected_object_size + u64 expected_write_size
+                // + u32 flags + 8 bytes padding
+                let expected_object_size = buf.get_u64_le();
+                let expected_write_size = buf.get_u64_le();
+                let flags = buf.get_u32_le();
+                buf.advance(8);
+                OpData::AllocHint {
+                    expected_object_size,
+                    expected_write_size,
+                    flags,
+                }
             }
             _ => {
                 // Other operations (including ListSnaps) - skip CEPH_OSD_OP_UNION_SIZE bytes
@@ -801,6 +825,34 @@ mod tests {
                 length: 3,
                 truncate_size: 0,
                 truncate_seq: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn alloc_hint_union_roundtrips() {
+        use crate::osdclient::types::{AllocHintFlags, OSDOp, OpCode, OpData};
+
+        let op = OSDOp::set_alloc_hint(4096, 512, AllocHintFlags::INCOMPRESSIBLE);
+        let mut buf = BytesMut::new();
+        op.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), CEPH_OSD_OP_SIZE);
+        assert_eq!(&buf[..6], &[0x23, 0x22, 2, 0, 0, 0]); // op 0x2223, FAILOK
+        assert_eq!(&buf[6..14], &4096u64.to_le_bytes());
+        assert_eq!(&buf[14..22], &512u64.to_le_bytes());
+        assert_eq!(&buf[22..26], &512u32.to_le_bytes());
+        assert!(buf[26..34].iter().all(|b| *b == 0)); // union padding
+        assert_eq!(&buf[34..], &[0, 0, 0, 0]); // payload_len
+
+        let decoded = OSDOp::decode(&mut buf, 0).unwrap();
+        assert_eq!(decoded.op, OpCode::SetAllocHint);
+        assert_eq!(decoded.flags, 2);
+        assert!(matches!(
+            decoded.op_data,
+            OpData::AllocHint {
+                expected_object_size: 4096,
+                expected_write_size: 512,
+                flags: 512
             }
         ));
     }
