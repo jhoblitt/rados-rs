@@ -80,6 +80,10 @@ Plans 3 to 5's Global Constraints apply unchanged. Plus:
   parsed triple would not be.
 - Every dump quirk below was read from the oracle's output, not only
   from `dump()`.
+- No class calls in this plan; the standing rule for later ones: a RD|WR
+  method whose C++ client reads its reply needs `OsdOpFlags::RETURNVEC`
+  (`call::exec_returnvec`) and a reply under `osd_max_write_op_reply_len`
+  (64 bytes by default; more is `EOVERFLOW`).
 
 ## Review Focus
 

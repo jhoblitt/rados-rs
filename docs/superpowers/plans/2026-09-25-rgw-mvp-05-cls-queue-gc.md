@@ -74,6 +74,13 @@ dependencies). Plus:
   RD, the rest RD|WR.
 - `cls_queue_get_stats_ret` is declared but no method, handler or client
   uses it; it is left out.
+- A method flagged RD|WR whose C++ client reads its reply (the
+  `ObjectWriteOperation::exec` overload with an `out` buffer, run with
+  `librados::OPERATION_RETURNVEC`) gets its reply only when the request
+  carries `OsdOpFlags::RETURNVEC`; use `call::exec_returnvec` (plan 4),
+  and keep such a reply under `osd_max_write_op_reply_len` (64 bytes by
+  default; more is `EOVERFLOW`). Every writing method in this plan is
+  reply-less, so the `IoCtx` functions use `call::exec`.
 
 ## Review Focus
 

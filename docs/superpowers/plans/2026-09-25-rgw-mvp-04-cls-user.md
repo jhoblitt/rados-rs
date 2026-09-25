@@ -1860,6 +1860,15 @@ Then merge when green and open the upstream PR from the same branch.
 
 ## Roadmap for later plans
 
+Standing rule from this plan's review: a RD|WR method whose C++ client
+reads its reply needs `RETURNVEC` (`call::exec_returnvec`), and its reply
+must fit `osd_max_write_op_reply_len` (64 bytes by default; more is
+`EOVERFLOW`). Transport follow-up worth a plan of its own: `call` could
+carry each method's Rd/RdWr tag (as `cls_*_ops.h`'s `ClsMethod<RdWrTag>`
+does) so a writing class call is flagged WRITE on the wire as librados
+does; the OSD keys off `CLS_METHOD_WR` either way, so this is client-side
+bookkeeping (mtime, resend rules), not correctness.
+
 `cls-queue-gc`; `cls-rgw-types`; `cls-rgw-bucket-index`; `cls-rgw-gc`;
 `cls-rgw-usage`; `cls-rgw-lc`; `cls-rgw-olh`; `watch-notify`. Deferred
 minors carried forward: `cls_user_reset_stats*` have no `ceph-dencoder`
