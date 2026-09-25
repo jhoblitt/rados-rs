@@ -49,8 +49,8 @@ not repeated here.
 - Branch `cmpxattr-small-ops` is based on `omap-ops` (`bec893e`), because
   its cluster tests need `IoCtx::execute_op` and the xattr fixes; the PR
   describes the stack. A draft PR against the fork's `main` for CI and
-  review, merged there once green; the upstream PR waits for the owner
-  (four are open).
+  review, merged there once green, then an upstream PR from the same
+  branch.
 - Commit subjects follow upstream's `<module>: <imperative summary>`
   style, one logical change per commit, body explaining the wire fact the
   change rests on, and end with the
@@ -2096,6 +2096,12 @@ itself (a temporary worktree of `origin/main`, `git merge --no-ff`, the
 unit suite, the container gate and the cluster suites, then
 `git push origin HEAD:main`), never by rewriting the branch.
 
+As soon as the fork PR is merged, open the upstream PR from the same
+branch (owner's instruction of 2026-09-25): `gh pr create --repo
+tchaikov/rados-rs --base main --head jhoblitt:cmpxattr-small-ops` with the
+same description, prefixed by one line naming the fork-merged PRs it
+stacks on until they land upstream.
+
 - [ ] **Step 6: Final whole-branch review and ledger**
 
 Dispatch the whole-branch review of `bec893e..cmpxattr-small-ops` as
@@ -2112,9 +2118,8 @@ Unchanged from plan 1 after this package: `watch-notify`; `cls-crate`
 (with `version` and `refcount`); `cls-user`; `cls-queue-gc`;
 `cls-rgw-types`; `cls-rgw-bucket-index`; `cls-rgw-gc`; `cls-rgw-usage`;
 `cls-rgw-lc`; `cls-rgw-olh`. Each package merges into the fork's `main`
-once its CI is green (owner's instruction of 2026-09-25). Upstream PRs:
-four are open (#107 to #110); this package's upstream PR waits for the
-owner's word. Deferred minors carried forward:
+once its CI is green and then opens its upstream PR from the same branch
+(owner's instructions of 2026-09-25). Deferred minors carried forward:
 hoist `CEPH_OSD_OP_FLAG_EXCL` out of `OSDOp::create` next to `FAILOK`;
 `OpBuilder` has no xattr methods (tests use `.op(OSDOp::set_xattr(..)?)`);
 a `list_watchers` cluster test with a live watcher belongs to

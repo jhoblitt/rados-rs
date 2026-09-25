@@ -195,9 +195,9 @@ Each package is a branch off upstream `main`, reviewed and CI-checked as
 a draft PR against the fork's `main` and merged there once CI is green,
 as a merge commit that keeps the branch because the upstream PR points
 at it; the fork's `main` is therefore the one git revision the RGW port
-depends on. Upstream PRs open from the same branches when the owner says
-so, at most three at a time before checking in. The rgw branches stack
-on `cls-rgw-types` until it merges, then rebase.
+depends on. As each fork PR merges, an upstream PR opens from the same
+branch; it stacks on the fork-merged packages not yet upstream. The rgw
+branches stack on `cls-rgw-types` until it merges, then rebase.
 
 ## Risks
 
