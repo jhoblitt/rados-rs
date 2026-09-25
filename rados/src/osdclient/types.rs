@@ -545,6 +545,26 @@ pub enum OpCode {
     ListSnaps = osd_op!(RD, DATA, 10),
     /// Roll back object HEAD to a prior snapshot: __CEPH_OSD_OP(WR, DATA, 14)
     Rollback = osd_op!(WR, DATA, 14),
+    /// CEPH_OSD_OP_OMAPGETKEYS
+    OmapGetKeys = osd_op!(RD, DATA, 17),
+    /// CEPH_OSD_OP_OMAPGETVALS
+    OmapGetVals = osd_op!(RD, DATA, 18),
+    /// CEPH_OSD_OP_OMAPGETHEADER
+    OmapGetHeader = osd_op!(RD, DATA, 19),
+    /// CEPH_OSD_OP_OMAPGETVALSBYKEYS
+    OmapGetValsByKeys = osd_op!(RD, DATA, 20),
+    /// CEPH_OSD_OP_OMAPSETVALS
+    OmapSetVals = osd_op!(WR, DATA, 21),
+    /// CEPH_OSD_OP_OMAPSETHEADER
+    OmapSetHeader = osd_op!(WR, DATA, 22),
+    /// CEPH_OSD_OP_OMAPCLEAR
+    OmapClear = osd_op!(WR, DATA, 23),
+    /// CEPH_OSD_OP_OMAPRMKEYS
+    OmapRmKeys = osd_op!(WR, DATA, 24),
+    /// CEPH_OSD_OP_OMAP_CMP
+    OmapCmp = osd_op!(RD, DATA, 25),
+    /// CEPH_OSD_OP_OMAPRMKEYRANGE
+    OmapRmKeyRange = osd_op!(WR, DATA, 44),
 }
 
 impl OpCode {
@@ -1221,12 +1241,16 @@ pub struct OpResult {
 }
 
 impl OpResult {
-    /// Return the outdata of the first operation reply, or an error if the reply list is empty.
-    pub fn first_outdata(&self) -> crate::osdclient::error::Result<&Bytes> {
+    /// Return the first operation reply, or an error if the reply list is empty.
+    pub fn first_reply(&self) -> crate::osdclient::error::Result<&OpReply> {
         self.ops
             .first()
-            .map(|op| &op.outdata)
             .ok_or_else(|| crate::osdclient::error::OSDClientError::Other("No op result".into()))
+    }
+
+    /// Return the outdata of the first operation reply, or an error if the reply list is empty.
+    pub fn first_outdata(&self) -> crate::osdclient::error::Result<&Bytes> {
+        self.first_reply().map(|op| &op.outdata)
     }
 }
 
