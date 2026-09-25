@@ -5,8 +5,7 @@
 **Goal:** Land the second transport package as an upstream-shaped branch:
 `cmpxattr` (the guard RGW puts on every overwrite), `assert_exists`,
 `zero`, `set_alloc_hint` and `list_watchers`, with unit, encoding and
-cluster tests, and create the `integration` branch that merges every
-package so far.
+cluster tests, and merge it into the fork's `main` once its CI is green.
 
 **Architecture:** Four new `OpCode` variants and one new `OpData` variant
 in `types.rs`, with their union bytes in `denc_types.rs`; `OSDOp`
@@ -50,8 +49,8 @@ not repeated here.
 - Branch `cmpxattr-small-ops` is based on `omap-ops` (`bec893e`), because
   its cluster tests need `IoCtx::execute_op` and the xattr fixes; the PR
   describes the stack. A draft PR against the fork's `main` for CI and
-  review, never merged there; the upstream PR waits for the owner (three
-  are open).
+  review, merged there once green; the upstream PR waits for the owner
+  (four are open).
 - Commit subjects follow upstream's `<module>: <imperative summary>`
   style, one logical change per commit, body explaining the wire fact the
   change rests on, and end with the
@@ -73,9 +72,11 @@ not repeated here.
 2. A missing attribute compares as the empty string, not as `ENODATA`:
    `cmpxattr(name, Eq, "")` asserts absence, which is how RGW guards OLH
    initialisation. Pinned in Task 7 (`cmpxattr_missing_xattr_compares_as_empty`).
-3. U64 mode reads its two sides differently: the operand travels as a
-   little-endian u64, the stored attribute is parsed as decimal text, and
-   text that is not a number fails the request with `EINVAL`. Pinned in
+3. The supplied value is the left-hand side of every comparison
+   (`value <op> stored`), the reverse of `omap_cmp`; and U64 mode reads its
+   two sides differently: the operand travels as a little-endian u64, the
+   stored attribute is parsed as decimal text, and text that does not start
+   with a number fails the request with `EINVAL`. Pinned in
    Task 2 (unit, operand bytes) and Task 7 (`cmpxattr_u64_compares_decimal_text`).
 4. `zero` on a missing object is a silent no-op: no `ENOENT`, no object
    created. A caller using it as an existence probe is wrong. Pinned in
@@ -288,7 +289,8 @@ EOF
 - [ ] **Step 1: Write the failing unit tests**
 
 In `types.rs`'s `mod tests`, after `set_xattr_indata_is_raw_name_then_value`
-(add `use crate::osdclient::omap::CmpOp;` to the test module's imports):
+(`use super::*;` brings in `CmpOp` through the module-level import added in
+Step 3, so add no import to the test module):
 
 ```rust
     #[test]
@@ -464,11 +466,13 @@ After `remove_xattr`, add:
     /// Compare an extended attribute with `value` as byte strings, as
     /// `ObjectOperation::cmpxattr(name, op, bufferlist)` does.
     ///
-    /// The OSD evaluates `current <op> value`. A missing attribute compares
-    /// as the empty string, so `CmpOp::Eq` with an empty `value` asserts
-    /// absence. When the comparison holds the op's return code is 1; when
-    /// it does not, the whole request fails with `ECANCELED` and none of
-    /// its writes apply.
+    /// The OSD evaluates `value <op> current`: the supplied operand is the
+    /// left-hand side, so `CmpOp::Gt` holds when `value` exceeds the stored
+    /// attribute (`do_cmp_xattr` in `PrimaryLogPG.cc`). A missing attribute
+    /// compares as the empty string, so `CmpOp::Eq` with an empty `value`
+    /// asserts absence. When the comparison holds the op's return code is
+    /// 1; when it does not, the whole request fails with `ECANCELED` and
+    /// none of its writes apply.
     pub fn cmpxattr(
         name: impl Into<String>,
         op: CmpOp,
@@ -487,8 +491,9 @@ After `remove_xattr`, add:
     /// `ObjectOperation::cmpxattr(name, op, uint64_t)` does.
     ///
     /// The OSD parses the stored attribute as decimal text (missing or
-    /// empty is 0; anything else fails the request with `EINVAL`) and
-    /// receives `value` as a little-endian u64. Result codes are those of
+    /// empty is 0; text that does not start with a decimal number, or that
+    /// overflows u64, fails the request with `EINVAL`) and receives `value`
+    /// as a little-endian u64. Operand order and result codes are those of
     /// [`Self::cmpxattr`].
     pub fn cmpxattr_u64(
         name: impl Into<String>,
@@ -1083,6 +1088,7 @@ In `operation.rs`'s `mod tests`:
             .write_full(Bytes::from_static(b"x"))
             .build();
         assert!(built.is_write());
+        assert!(built.is_read());
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::Stat);
         assert_eq!(ops[1].op, OpCode::WriteFull);
@@ -1101,8 +1107,8 @@ After `OpBuilder::stat`:
 ```rust
     /// Assert that the object exists, as `ObjectOperation::assert_exists`
     /// does: a `STAT` whose `ENOENT` fails the whole request before any
-    /// write in it applies. RGW adds one ahead of every overwrite of an
-    /// existing object.
+    /// write in it applies. RGW uses it to guard bucket-index shard and OLH
+    /// updates that must target an existing object.
     pub fn assert_exists(self) -> Self {
         self.stat()
     }
@@ -1786,11 +1792,13 @@ async fn cmpxattr_u64_compares_decimal_text() {
         .await
         .expect("set ver");
 
+    // The OSD evaluates `value <op> stored`: the supplied operand is the
+    // left-hand side (do_cmp_xattr in PrimaryLogPG.cc).
     for (op, value) in [
-        (CmpOp::Gte, 4),
-        (CmpOp::Gte, 5),
         (CmpOp::Eq, 5),
-        (CmpOp::Lt, 6),
+        (CmpOp::Gte, 5),
+        (CmpOp::Gte, 6),
+        (CmpOp::Lt, 4),
     ] {
         let built = OpBuilder::new()
             .cmpxattr_u64("user.ver", op, value)
@@ -1799,17 +1807,17 @@ async fn cmpxattr_u64_compares_decimal_text() {
         ioctx
             .execute_op(&oid, built)
             .await
-            .unwrap_or_else(|e| panic!("5 {op:?} {value} must hold: {e:?}"));
+            .unwrap_or_else(|e| panic!("{value} {op:?} 5 must hold: {e:?}"));
     }
 
     let built = OpBuilder::new()
-        .cmpxattr_u64("user.ver", CmpOp::Gte, 6)
+        .cmpxattr_u64("user.ver", CmpOp::Gte, 4)
         .expect("cmp")
         .build();
     let err = ioctx
         .execute_op(&oid, built)
         .await
-        .expect_err("5 >= 6 must fail");
+        .expect_err("4 >= 5 must fail");
     assert!(is_osd_error(&err, ECANCELED), "{err:?}");
 
     // The OSD parses the stored value as decimal text; anything else is EINVAL.
@@ -1993,17 +2001,15 @@ EOF
 
 ---
 
-### Task 8: Gate, push, draft PR, integration branch (controller)
+### Task 8: Gate, push, draft PR, merge (controller)
 
 **Files:**
 - No tree changes on `cmpxattr-small-ops` beyond folded fmt hunks.
-- Create: branch `integration` on the fork.
 
 **Interfaces:**
-- Consumes: the seven commits of Tasks 1-7 on `cmpxattr-small-ops`;
-  `call-opcode` at `881c954`.
-- Produces: `jhoblitt:cmpxattr-small-ops` with a green draft PR;
-  `jhoblitt:integration` = `cmpxattr-small-ops` merged with `call-opcode`.
+- Consumes: the seven commits of Tasks 1-7 on `cmpxattr-small-ops`.
+- Produces: `jhoblitt:cmpxattr-small-ops` with a green draft PR, merged
+  into the fork's `main`.
 
 - [ ] **Step 1: Per-commit build proof**
 
@@ -2026,13 +2032,18 @@ rewrite proof: `git diff <old-head> <new-head>` equals the saved fmt diff.
 - [ ] **Step 3: Corpus check for the watcher types (unsandboxed)**
 
 `ceph-dencoder` 19.2.2 ships in the cluster's image. Wrap it so the
-harness's absolute paths resolve inside the container:
+harness's absolute paths resolve inside the container. The `--user` is
+load-bearing: podman on this machine is a remote client to a rootful
+service, and without it the export files the container writes to `/tmp`
+are root-owned, so the harness cannot overwrite its shared export path
+on the next sample and every sample after the first fails its
+rust-to-ceph leg:
 
 ```bash
 cat > /tmp/claude/ceph-dencoder <<'EOF'
 #!/bin/sh
 # ceph-dencoder from the v19.2.2 image; the corpus and /tmp are mounted at their host paths.
-exec podman run --rm -v /home/jhoblitt/github/ceph/ceph-object-corpus:/home/jhoblitt/github/ceph/ceph-object-corpus:ro -v /tmp:/tmp quay.io/ceph/ceph:v19.2.2 ceph-dencoder "$@"
+exec podman run --rm --user "$(id -u):$(id -g)" -v /home/jhoblitt/github/ceph/ceph-object-corpus:/home/jhoblitt/github/ceph/ceph-object-corpus:ro -v /tmp:/tmp quay.io/ceph/ceph:v19.2.2 ceph-dencoder "$@"
 EOF
 chmod +x /tmp/claude/ceph-dencoder
 cd $R && cargo build -p rados --bin dencoder --offline
@@ -2056,7 +2067,7 @@ From `~/github/rados-rs` (unsandboxed): fetch the branch from `$R`, push
 gh pr create --repo jhoblitt/rados-rs --draft --assignee @me --base main --head cmpxattr-small-ops --title "osdclient: cmpxattr and small ops" --body "$(cat <<'EOF'
 Stacked on the omap PR (#2): the first ten commits are `clippy-1.98`, `xattr-raw-name` and `omap-ops`; the seven after them are this PR.
 
-**Motivation.** RGW guards every overwrite with `cmpxattr` on its id tag and `assert_exists`, and hints compressed objects with `set_alloc_hint`; none of the five ops here existed.
+**Motivation.** RGW guards every overwrite with `cmpxattr` on its id tag, guards bucket-index updates with `assert_exists`, and hints compressed objects with `set_alloc_hint`; none of the five ops here existed.
 
 **What changed.** `cmpxattr` (string and u64 modes), `assert_exists`, `zero`, `set_alloc_hint` carrying `FAILOK`, and `list_watchers` with the `watch_item_t` decoder, each with `OpBuilder` and `IoCtx` methods and unit, encoding and cluster tests.
 
@@ -2068,26 +2079,29 @@ EOF
 ```
 Start one background CI watcher for the PR in the same turn.
 
-- [ ] **Step 5: Create the integration branch**
+- [ ] **Step 5: Merge the PR when CI is green**
+
+The fork's `main` is the integration point (owner's instruction of
+2026-09-25). Once every check on the draft PR is green, mark it ready and
+merge it with a merge commit, keeping the branch because the upstream PR
+points at it:
 
 ```bash
-cd $R && git checkout -q -b integration cmpxattr-small-ops && git merge --no-ff -m 'Merge call-opcode into integration' call-opcode
+gh pr ready N --repo jhoblitt/rados-rs && gh pr merge N --repo jhoblitt/rados-rs --merge
 ```
-Expected conflicts: `rados/src/osdclient/types.rs` (the `Call` variant
-and the two opcode tests: keep both tests; `Call` becomes `osd_op!(RD,
-EXEC, 1)`, which needs an `(RD, EXEC, $nr)` macro arm from `call-opcode`),
-`.github/workflows/test-with-ceph.yml` (keep every test name from both
-sides). After resolving: `cargo test -p rados --lib --offline`, the
-container gate, and the cluster suites
-`osdclient_{rados,xattr,omap,exec,small}_operations` all green. Push
-`integration` to the fork with `git push origin integration`. No PR.
+
+If GitHub reports the PR conflicting with something merged after this
+branch was cut, resolve the conflicts in the merge commit on `main`
+itself (a temporary worktree of `origin/main`, `git merge --no-ff`, the
+unit suite, the container gate and the cluster suites, then
+`git push origin HEAD:main`), never by rewriting the branch.
 
 - [ ] **Step 6: Final whole-branch review and ledger**
 
 Dispatch the whole-branch review of `bec893e..cmpxattr-small-ops` as
 `subagent-driven-development` prescribes, apply its findings with the
 fixup fold and proof, re-push with `--force-with-lease`, and record the
-outcome, the PR number, the CI verdict and the integration merge commit
+outcome, the PR number, the CI verdict and the merge commit
 in the ledger. Then delete plan 1's SDD workspace.
 
 ---
@@ -2097,9 +2111,10 @@ in the ledger. Then delete plan 1's SDD workspace.
 Unchanged from plan 1 after this package: `watch-notify`; `cls-crate`
 (with `version` and `refcount`); `cls-user`; `cls-queue-gc`;
 `cls-rgw-types`; `cls-rgw-bucket-index`; `cls-rgw-gc`; `cls-rgw-usage`;
-`cls-rgw-lc`; `cls-rgw-olh`. `integration` is re-merged after every
-package. Upstream PRs: three are open (#107, #108, #109); this package's
-upstream PR waits for the owner's word. Deferred minors carried forward:
+`cls-rgw-lc`; `cls-rgw-olh`. Each package merges into the fork's `main`
+once its CI is green (owner's instruction of 2026-09-25). Upstream PRs:
+four are open (#107 to #110); this package's upstream PR waits for the
+owner's word. Deferred minors carried forward:
 hoist `CEPH_OSD_OP_FLAG_EXCL` out of `OSDOp::create` next to `FAILOK`;
 `OpBuilder` has no xattr methods (tests use `.op(OSDOp::set_xattr(..)?)`);
 a `list_watchers` cluster test with a live watcher belongs to

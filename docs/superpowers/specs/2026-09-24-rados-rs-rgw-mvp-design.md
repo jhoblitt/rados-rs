@@ -191,13 +191,13 @@ the list of watchers that did not ack; it is not an error.
 
 ## Branches and pull requests
 
-Fork `main` mirrors upstream and never diverges. Each package is a branch
-off upstream `main`, reviewed and CI-checked as a draft PR against the
-fork's `main` that is never merged there; upstream PRs open from the same
-branches when the owner says so, at most three at a time before checking
-in. An `integration` branch merges every package so the RGW port can
-depend on one git revision. The rgw branches stack on `cls-rgw-types`
-until it merges, then rebase.
+Each package is a branch off upstream `main`, reviewed and CI-checked as
+a draft PR against the fork's `main` and merged there once CI is green,
+as a merge commit that keeps the branch because the upstream PR points
+at it; the fork's `main` is therefore the one git revision the RGW port
+depends on. Upstream PRs open from the same branches when the owner says
+so, at most three at a time before checking in. The rgw branches stack
+on `cls-rgw-types` until it merges, then rebase.
 
 ## Risks
 
