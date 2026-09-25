@@ -101,6 +101,12 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("pg_pool_t", None, true), // ceph-dencoder adds computed fields
     TypeSpec::new("watch_item_t", None, false),
     TypeSpec::new("obj_list_watch_response_t", None, false),
+    // Object classes (rados-cls)
+    TypeSpec::new("obj_version", None, false),
+    TypeSpec::new("cls_version_set_op", None, false),
+    TypeSpec::new("cls_version_inc_op", None, false),
+    TypeSpec::new("cls_version_check_op", None, false),
+    TypeSpec::new("cls_version_read_ret", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

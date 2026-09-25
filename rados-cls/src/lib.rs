@@ -8,6 +8,8 @@
 //! [`rados::OSDClientError::OSDError`]; a reply that does not decode is
 //! [`rados::OSDClientError::Denc`].
 
+// A build with no class has no caller for `call`, so it stays out.
+#[cfg(feature = "version")]
 mod call;
 
 #[cfg(feature = "refcount")]

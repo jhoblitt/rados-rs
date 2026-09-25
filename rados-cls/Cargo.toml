@@ -11,7 +11,8 @@ homepage.workspace = true
 [features]
 # The list grows as classes land; each one adds itself here and to
 # default.
-default = []
+default = ["version"]
+version = []
 
 [dependencies]
 rados = { path = "../rados", version = "0.1.4" }

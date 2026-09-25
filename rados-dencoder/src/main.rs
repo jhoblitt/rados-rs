@@ -25,6 +25,10 @@ use rados::{
     Denc, EVersion, EntityAddr, HObject, ListWatchersReply, MonInfo, MonMap, PgNlsResponse,
     PoolSnapInfo, RadosError, UTime, UuidD, VersionedEncode, WatchItem,
 };
+use rados_cls::version::{
+    CheckOp as VersionCheckOp, IncOp as VersionIncOp, ObjVersion, ReadRet as VersionReadRet,
+    SetOp as VersionSetOp,
+};
 use serde::Serialize;
 use std::any::Any;
 use std::fmt;
@@ -145,6 +149,13 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "watch_item_t" => Some(type_info_denc::<WatchItem>()),
         "obj_list_watch_response_t" => Some(type_info_denc::<ListWatchersReply>()),
 
+        // Object classes (rados-cls)
+        "obj_version" => Some(type_info_denc::<ObjVersion>()),
+        "cls_version_set_op" => Some(type_info_denc::<VersionSetOp>()),
+        "cls_version_inc_op" => Some(type_info_denc::<VersionIncOp>()),
+        "cls_version_check_op" => Some(type_info_denc::<VersionCheckOp>()),
+        "cls_version_read_ret" => Some(type_info_denc::<VersionReadRet>()),
+
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
         "mon_info_t" => Some(type_info_denc::<MonInfo>()),
@@ -186,6 +197,12 @@ fn list_types() {
     println!("  pg_pool_t         - Pool configuration [versioned, feature-dependent: multiple]");
     println!("  watch_item_t      - One watcher of an object [versioned]");
     println!("  obj_list_watch_response_t - LIST_WATCHERS reply [versioned]");
+    println!();
+    println!("OBJECT CLASSES (rados-cls)");
+    println!("  obj_version       - The version class's (ver, tag) pair [versioned]");
+    println!(
+        "  cls_version_set_op / cls_version_inc_op / cls_version_check_op / cls_version_read_ret [versioned]"
+    );
     println!();
     println!("LEVEL 4: Top-level cluster structures");
     println!("  Test these ONLY after all lower levels are validated");
