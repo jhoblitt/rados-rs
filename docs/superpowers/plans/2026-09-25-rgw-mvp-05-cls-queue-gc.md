@@ -38,7 +38,11 @@ dependencies). Plus:
 
 - Branch `cls-queue-gc` is based on the fork's `main` after plan 4
   merges; `rados-cls/src/dump.rs` exists with `utime`, `gmtime` and
-  `civil_from_days`.
+  `civil_from_days`, and `lib.rs` gates it on `feature = "user"`.
+- Every helper in `dump` is gated on the class features that use it, and
+  the module on the union, so each single-class build and the empty build
+  stay warning-free under CI's per-class clippy step. A helper lands in
+  the commit of its first user, never ahead of it.
 - The `call` module (after plan 3's fix wave) offers `op`, `raw_op`,
   `exec`, `exec_raw`, `decode`, `decode_bytes`; request-less methods use
   `raw_op`/`exec_raw` with `Bytes::new()`.
@@ -126,25 +130,29 @@ present; three containers up. Then the workspace and ledger as in plan
 
 ---
 
-### Task 1: `dump`: the streamed `real_time` form, and `bool_as_int` shared
+### Task 1: `dump`: `bool_as_int` shared, and the module gated per helper
 
 **Files:**
-- Modify: `rados-cls/src/dump.rs`, `rados-cls/src/refcount.rs` (drop its
-  private `bool_as_int`, use `crate::dump::bool_as_int`).
+- Modify: `rados-cls/src/dump.rs`, `rados-cls/src/lib.rs`,
+  `rados-cls/src/refcount.rs` (drop its private `bool_as_int`, use
+  `crate::dump::bool_as_int`).
 
 **Interfaces:**
-- Consumes: `civil_from_days` from plan 4.
-- Produces: `pub(crate) fn real_time<S: Serializer>(t: &UTime, s: S)`
-  for `#[serde(serialize_with = "crate::dump::real_time")]`;
-  `pub(crate) fn iso_utc(t: &UTime) -> String`;
-  `pub(crate) fn bool_as_int<S: Serializer>(b: &bool, s: S)`.
+- Produces: `pub(crate) fn bool_as_int<S: Serializer>(b: &bool, s: S)`
+  gated `#[cfg(feature = "refcount")]` (Task 3 widens it to
+  `any(feature = "refcount", feature = "rgw")`); `utime`, `gmtime` and
+  `civil_from_days` gated `#[cfg(feature = "user")]`; the `mod dump;`
+  line gated `any(feature = "refcount", feature = "user")`. The
+  `real_time` renderer comes in Task 3 with its first user.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing test**
 
-Append to `dump.rs`'s test module:
+Append to `dump.rs`'s test module (the `real_time` test below belongs to
+Task 3, where the renderer lands):
 
 ```rust
     #[test]
+    #[cfg(feature = "rgw")]
     fn streamed_real_time_is_iso_with_a_numeric_offset() {
         // operator<<(ostream&, real_time): calendar form even at the epoch,
         // microseconds, and the zone's %z, which is +0000 where dencoder runs.
@@ -157,6 +165,7 @@ Append to `dump.rs`'s test module:
     }
 
     #[test]
+    #[cfg(feature = "refcount")]
     fn bool_as_int_prints_zero_or_one() {
         #[derive(serde::Serialize)]
         struct T(#[serde(serialize_with = "bool_as_int")] bool);
@@ -168,20 +177,35 @@ Append to `dump.rs`'s test module:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rados-cls --lib --offline dump`
-Expected: compile error, `iso_utc`/`bool_as_int` not found.
+Expected: compile error, `bool_as_int` not found.
 
 - [ ] **Step 3: Implement**
 
-Add to `dump.rs`:
+Add to `dump.rs` now (Task 1):
+
+```rust
+/// `dump_int((int)b)`: a bool printed as `0` or `1`.
+#[cfg(feature = "refcount")]
+pub(crate) fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u8(u8::from(*b))
+}
+```
+
+and put `#[cfg(feature = "user")]` on `utime`, `gmtime` and
+`civil_from_days` (plus `#[cfg(feature = "user")]` on their tests), and
+change `lib.rs` to `#[cfg(any(feature = "refcount", feature = "user"))]
+pub(crate) mod dump;`. Task 3 adds, with the `rgw` module that uses it:
 
 ```rust
 /// A `real_time` that `dump` streams with `operator<<`: the calendar form
 /// with microseconds and the zone offset, which is `+0000` where
 /// `ceph-dencoder` runs.
+#[cfg(feature = "rgw")]
 pub(crate) fn real_time<S: serde::Serializer>(t: &UTime, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&iso_utc(t))
 }
 
+#[cfg(feature = "rgw")]
 pub(crate) fn iso_utc(t: &UTime) -> String {
     let usec = t.nsec / 1000;
     let (year, month, day) = civil_from_days(i64::from(t.sec / 86_400));
@@ -193,35 +217,31 @@ pub(crate) fn iso_utc(t: &UTime) -> String {
         secs % 60
     )
 }
-
-/// `dump_int((int)b)`: a bool printed as `0` or `1`.
-pub(crate) fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_u8(u8::from(*b))
-}
 ```
 
-In `refcount.rs`, delete the private `bool_as_int` and point its
-`serialize_with` attributes at `"crate::dump::bool_as_int"`. `dump.rs` is
-already `pub(crate) mod dump;` in `lib.rs` (plan 4); it must not be
-feature-gated, since three classes now use it.
+with `civil_from_days` widened to `any(feature = "user", feature = "rgw")`,
+`bool_as_int` to `any(feature = "refcount", feature = "rgw")`, and the
+`mod dump;` gate to `any(feature = "refcount", feature = "rgw", feature =
+"user")`.
+
+In `refcount.rs` (Task 1), delete the private `bool_as_int` and point its
+`serialize_with` attributes at `"crate::dump::bool_as_int"`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p rados-cls --lib --offline`
-Expected: all pass (plan 4's count plus 2), no warnings.
+Run: `cargo test -p rados-cls --lib --offline && cargo check -p rados-cls --no-default-features --features refcount --offline`
+Expected: all pass (plan 4's count plus 1), no warnings in either.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rados-cls/src/dump.rs rados-cls/src/refcount.rs
+git add rados-cls/src/dump.rs rados-cls/src/lib.rs rados-cls/src/refcount.rs
 git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
-cls: dump a streamed real_time and share bool_as_int
+cls: share bool_as_int through dump, gated per class
 
-cls_rgw_gc_obj_info::dump streams its time through operator<<, which
-prints the calendar form with microseconds and the zone's %z offset;
-ceph-dencoder runs in UTC, so the corpus string ends in +0000. The
-refcount class's bool-as-int helper moves to dump, since the GC list
-reply needs it too.
+The refcount class's bool-as-int helper moves to dump, since the GC
+list reply will need it too. Each renderer in dump is now gated on the
+classes that use it, so a build of one class stays warning-free.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 EOF
@@ -904,8 +924,9 @@ EOF
 **Files:**
 - Create: `rados-cls/src/rgw/mod.rs`, `rados-cls/src/rgw/types.rs`,
   `rados-cls/src/rgw/gc.rs`.
-- Modify: `rados-cls/Cargo.toml` (feature `rgw`, in `default`),
-  `rados-cls/src/lib.rs`, `.github/workflows/ci.yml`,
+- Modify: `rados-cls/src/dump.rs` (`real_time`, `iso_utc`, their test,
+  the widened gates; see Task 1), `rados-cls/Cargo.toml` (feature `rgw`,
+  in `default`), `rados-cls/src/lib.rs`, `.github/workflows/ci.yml`,
   `rados-dencoder/src/main.rs` (nine arms), the corpus test (nine
   `TypeSpec`s).
 
@@ -1435,7 +1456,7 @@ Expected: 8 passed, no warnings.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rados-cls/Cargo.toml rados-cls/src/lib.rs rados-cls/src/rgw .github/workflows/ci.yml rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
+git add rados-cls/Cargo.toml rados-cls/src/dump.rs rados-cls/src/lib.rs rados-cls/src/rgw .github/workflows/ci.yml rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
 git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
 cls: add the rgw module with the GC entry types
 
@@ -1445,7 +1466,8 @@ class's own methods will join. cls_rgw_obj version 2 appended the full
 key after the version-1 strings, so the name is on the wire twice;
 cls_rgw_gc_list_ret version 2 put next_marker before truncated;
 cls_rgw_gc_list_op's expired_only defaults to true. The GC entry's time
-dumps as operator<< streams a real_time.
+dumps as operator<< streams a real_time: the calendar form with
+microseconds and the zone's %z offset, +0000 where ceph-dencoder runs.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 EOF

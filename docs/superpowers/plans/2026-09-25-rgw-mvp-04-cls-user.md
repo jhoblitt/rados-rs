@@ -66,6 +66,14 @@ builds with the scratchpad `CARGO_HOME`; no new dependencies). Plus:
    one with `exclusive` is `EEXIST`, `get`/`rm` of a missing one is
    `ENOENT`, and `list` filters by path prefix on the class side. Pinned
    in Task 4 (`user_account_resources`).
+6. `reset_user_stats2` writes, and the OSD clears every op's output data
+   on a successful write unless the request carries
+   `CEPH_OSD_FLAG_RETURNVEC` (RGW runs this call with
+   `librados::OPERATION_RETURNVEC`); without the flag the reply is empty
+   and the decode fails. `rados` gains the flag (Task 1) and
+   `user::reset_stats2` runs its op with it. Pinned in Task 4
+   (`user_reset_stats`), which failed exactly that way before the flag
+   existed.
 
 ---
 
@@ -89,7 +97,45 @@ Then the workspace and ledger as in plan 3's Task 0.
 
 ---
 
-### Task 1: The `dump` module: timestamps as `encode_json` prints them
+### Task 1: The `RETURNVEC` op flag (`rados`)
+
+**Files:**
+- Modify: `rados/src/osdclient/types.rs` (`OsdOpFlags::RETURNVEC = 0x4000000`),
+  `rados/src/osdclient/operation.rs` (`OpBuilder::returnvec()` and a unit test).
+
+**Interfaces:**
+- Produces: `OsdOpFlags::RETURNVEC`, documented as `CEPH_OSD_FLAG_RETURNVEC`
+  (`librados::OPERATION_RETURNVEC`): return each op's result and output
+  data on a successful write, which the OSD otherwise clears;
+  `OpBuilder::returnvec(self) -> Self` next to `ignore_overlay`. Task 3's
+  `reset_stats2` uses it.
+
+- [ ] **Step 1: Flag, builder method, test**
+
+The test `returnvec_adds_the_flag_and_keeps_the_ops` builds
+`OpBuilder::new().write_full(vec![1, 2, 3]).returnvec().build()` and
+asserts the flag bit `0x4000000`, `WRITE`, and one op.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add rados/src/osdclient/types.rs rados/src/osdclient/operation.rs
+git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
+osdclient: the RETURNVEC flag
+
+A write's reply carries only the overall result: the OSD clears each
+op's return code and output data unless the request carries
+CEPH_OSD_FLAG_RETURNVEC. A class method that writes and replies, such
+as cls_user's reset_user_stats2, needs it, and RGW runs that call with
+librados::OPERATION_RETURNVEC.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 1b: The `dump` module: timestamps as `encode_json` prints them
 
 **Files:**
 - Create: `rados-cls/src/dump.rs`.
@@ -178,7 +224,9 @@ mod tests {
 ```
 
 Add `pub(crate) mod dump;` to `rados-cls/src/lib.rs` after the gated
-`mod call;`, with no `cfg` of its own.
+`mod call;`. Task 2 gates it on `feature = "user"`: a single-class build
+without `user` has no caller for it, and CI lints each class alone. (This
+commit alone warns about the unused helpers; the next one uses them.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -561,8 +609,9 @@ mod tests {
 Add to `rados-cls/Cargo.toml`: `user = []` under `[features]` and `"user"`
 to `default`. Add `#[cfg(feature = "user")] pub mod user;` to `lib.rs`
 (keep the `pub mod` lines alphabetical: refcount, user, version) and
-`feature = "user"` to the `mod call` gate. In `ci.yml`, the per-class
-clippy loop becomes `for features in "" refcount user version; do`.
+`feature = "user"` to the `mod call` gate, and `#[cfg(feature = "user")]`
+on `pub(crate) mod dump;`. In `ci.yml`, the per-class clippy loop becomes
+`for features in "" refcount user version; do`.
 
 Run: `cargo test -p rados-cls --lib --offline user`
 Expected: FAIL to compile: `Bucket`, `BucketEntry`, ... not found.
@@ -1223,7 +1272,9 @@ pub fn reset_stats_op(time: UTime) -> Result<OSDOp> {
 }
 
 /// `reset_user_stats2`: one page of the recompute; loop from `op.marker`
-/// while the reply is truncated. Decode with [`decode_reset_stats2`].
+/// while the reply is truncated. The method writes, so its reply comes
+/// back only when the operation carries `OpBuilder::returnvec`; decode it
+/// with [`decode_reset_stats2`].
 pub fn reset_stats2_op(op: &ResetStats2Op) -> Result<OSDOp> {
     call::op(CLASS, "reset_user_stats2", op)
 }
@@ -1364,8 +1415,12 @@ pub async fn reset_stats(ioctx: &IoCtx, oid: &str, time: UTime) -> Result<()> {
 
 /// See [`reset_stats2_op`].
 pub async fn reset_stats2(ioctx: &IoCtx, oid: &str, op: &ResetStats2Op) -> Result<ResetStats2Ret> {
-    let out = call::exec(ioctx, oid, CLASS, "reset_user_stats2", op).await?;
-    call::decode_bytes(out)
+    let built = OpBuilder::new()
+        .op(reset_stats2_op(op)?)
+        .returnvec()
+        .build();
+    let result = ioctx.execute_op(oid, built).await?;
+    decode_reset_stats2(result.first_reply()?)
 }
 
 /// See [`account_resource_add_op`].
