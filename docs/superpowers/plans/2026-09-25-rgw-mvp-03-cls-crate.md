@@ -75,8 +75,9 @@ container; `gh` for the fork.
    claims), and none of the request's writes apply. Pinned in Task 5
    (`version_inc_conds_and_check`, `version_check_guards_a_write`).
 2. An object that was never versioned reads as `{ver: 0, tag: ""}`, a
-   success, not an error; and the first `inc` creates `ver` 1 with a
-   24-character random tag that later `inc`s keep. Pinned in Task 5
+   success, not an error; and the first `inc` initialises the version to 1
+   with a 24-character random tag and then bumps it, so it reads back as
+   2, and later `inc`s keep the tag. Pinned in Task 5
    (`version_inc_creates_then_bumps`).
 3. `refcount::put` of the last reference removes the object; `put` of an
    unknown or already-retired tag is a silent success; `put` on an object
@@ -415,7 +416,8 @@ only:
 //! Server facts the API rests on (`src/cls/version/cls_version.cc`): a
 //! failed condition fails the request with `ECANCELED`; an object that was
 //! never versioned reads as `{ver: 0, tag: ""}`; `inc` on such an object
-//! creates `ver` 1 with a random 24-character tag, and later `inc`s keep
+//! initialises the version to 1 with a random 24-character tag and then
+//! increments it, so the first `inc` reads back as 2, and later `inc`s keep
 //! the tag; `set` stores its argument without any check.
 
 #[cfg(test)]
@@ -703,8 +705,8 @@ pub fn set_op(objv: &ObjVersion) -> Result<OSDOp> {
     call::op(CLASS, "set", &SetOp { objv: objv.clone() })
 }
 
-/// `cls_version_inc(op)`: bump `ver` by one, creating the version if the
-/// object has none.
+/// `cls_version_inc(op)`: bump `ver` by one; a missing version is
+/// initialised to 1 first, so the first `inc` reads back as 2.
 pub fn inc_op() -> Result<OSDOp> {
     call::op(CLASS, "inc", &IncOp::default())
 }
@@ -754,7 +756,8 @@ pub async fn set(ioctx: &IoCtx, oid: &str, objv: &ObjVersion) -> Result<()> {
         .map(drop)
 }
 
-/// Bump `oid`'s version, creating it if absent.
+/// Bump `oid`'s version; a missing one is initialised first, so the first
+/// call reads back as 2.
 pub async fn inc(ioctx: &IoCtx, oid: &str) -> Result<()> {
     call::exec(ioctx, oid, CLASS, "inc", &IncOp::default())
         .await
@@ -1032,6 +1035,21 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn json_truncates_tags_at_a_nul() {
+        let mut refs = BTreeMap::new();
+        refs.insert("a\u{0}b".to_owned(), true);
+        let mut retired_refs = BTreeSet::new();
+        retired_refs.insert("c\u{0}".to_owned());
+        assert_eq!(
+            serde_json::to_value(ObjRefcount { refs, retired_refs }).expect("json"),
+            serde_json::json!({
+                "refs": [{"oid": "a", "active": true}],
+                "retired_refs": ["c"]
+            })
+        );
+    }
 }
 ```
 
@@ -1159,8 +1177,14 @@ impl VersionedEncode for ObjRefcount {
 
 rados::impl_denc_for_versioned!(ObjRefcount);
 
+/// `obj_refcount::dump` prints each tag with `c_str()`, so a tag holding
+/// a NUL, as RGW once wrote them, dumps only up to it.
+fn c_str(s: &str) -> &str {
+    s.find('\0').map_or(s, |i| &s[..i])
+}
+
 /// `obj_refcount::dump`: `refs` as `{"oid", "active"}` objects,
-/// `retired_refs` as strings.
+/// `retired_refs` as strings, each tag through [`c_str`].
 impl Serialize for ObjRefcount {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         struct Ref<'a>(&'a str, bool);
@@ -1183,14 +1207,27 @@ impl Serialize for ObjRefcount {
             ) -> std::result::Result<S::Ok, S::Error> {
                 let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
                 for (oid, active) in self.0 {
-                    seq.serialize_element(&Ref(oid, *active))?;
+                    seq.serialize_element(&Ref(c_str(oid), *active))?;
+                }
+                seq.end()
+            }
+        }
+        struct Retired<'a>(&'a BTreeSet<String>);
+        impl Serialize for Retired<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for tag in self.0 {
+                    seq.serialize_element(c_str(tag))?;
                 }
                 seq.end()
             }
         }
         let mut state = serializer.serialize_struct("ObjRefcount", 2)?;
         state.serialize_field("refs", &Refs(&self.refs))?;
-        state.serialize_field("retired_refs", &self.retired_refs)?;
+        state.serialize_field("retired_refs", &Retired(&self.retired_refs))?;
         state.end()
     }
 }
@@ -1411,12 +1448,12 @@ async fn version_inc_creates_then_bumps() {
 
     version::inc(&ioctx, &oid).await.expect("first inc");
     let first = version::read(&ioctx, &oid).await.expect("read");
-    assert_eq!(first.ver, 1);
+    assert_eq!(first.ver, 2, "init_version stores 1 and inc bumps it");
     assert_eq!(first.tag.len(), 24, "init_version makes a 24-char tag: {first:?}");
 
     version::inc(&ioctx, &oid).await.expect("second inc");
     let second = version::read(&ioctx, &oid).await.expect("read");
-    assert_eq!(second, objv(2, &first.tag), "inc keeps the tag");
+    assert_eq!(second, objv(3, &first.tag), "inc keeps the tag");
 
     ioctx.remove(&oid).await.expect("remove");
 }
