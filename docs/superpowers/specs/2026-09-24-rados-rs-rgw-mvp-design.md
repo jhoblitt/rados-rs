@@ -79,8 +79,9 @@ The ten `OMAP*` op codes from `rados.h`, each with an `OpBuilder` method
 whose encoded arguments follow `Objecter.h` exactly (for example
 `omap_get_vals` encodes `start_after`, `max_to_get`, `filter_prefix` in
 that order; `omap_cmp` encodes a map of key to value and comparison
-operator). Reply decoders return `BTreeMap<String, Bytes>` plus the `more`
-flag where the OSD sends one. `IoCtx` gains single-op conveniences. The
+operator). Reply decoders return `BTreeMap<Bytes, Bytes>` plus the `more`
+flag where the OSD sends one; keys are byte strings, never `String`, because
+RGW's bucket index uses bytes outside UTF-8. `IoCtx` gains single-op conveniences. The
 builder path matters more than the conveniences: RGW batches omap writes
 with xattr and data ops in one transaction, and a compound op is the only
 way to get the OSD's atomicity.
