@@ -15,6 +15,7 @@ homepage.workspace = true
 default = ["version", "refcount"]
 version = []
 refcount = []
+user = []
 
 [dependencies]
 rados = { path = "../rados", version = "0.1.4" }
