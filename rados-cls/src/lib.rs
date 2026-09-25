@@ -11,7 +11,7 @@
 // A build with no class has no caller for `call`, so it stays out.
 #[cfg(any(feature = "version", feature = "refcount", feature = "user"))]
 mod call;
-#[cfg(feature = "user")]
+#[cfg(any(feature = "refcount", feature = "user"))]
 pub(crate) mod dump;
 
 #[cfg(feature = "refcount")]

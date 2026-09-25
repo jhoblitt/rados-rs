@@ -1,11 +1,13 @@
 //! Renderings that match `ceph-dencoder`'s `dump_json` where `serde`'s
 //! defaults do not.
 
+#[cfg(feature = "user")]
 use rados::UTime;
 
 /// `encode_json` of a `utime_t` streams `utime_t::gmtime`: a count of
 /// seconds below ten years prints as `<sec>.<usec>`, anything later as
 /// ISO 8601 with six microsecond digits and a `Z`.
+#[cfg(feature = "user")]
 pub(crate) fn utime<S: serde::Serializer>(
     t: &UTime,
     serializer: S,
@@ -14,6 +16,7 @@ pub(crate) fn utime<S: serde::Serializer>(
 }
 
 /// `utime_t::gmtime` with `legacy_form` false.
+#[cfg(feature = "user")]
 pub(crate) fn gmtime(t: &UTime) -> String {
     let usec = t.nsec / 1000;
     if t.sec < 315_360_000 {
@@ -32,6 +35,7 @@ pub(crate) fn gmtime(t: &UTime) -> String {
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`;
 /// Howard Hinnant's `civil_from_days`.
+#[cfg(feature = "user")]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -45,11 +49,18 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// `dump_int((int)b)`: a bool printed as `0` or `1`.
+#[cfg(feature = "refcount")]
+pub(crate) fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u8(u8::from(*b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "user")]
     fn short_times_print_as_seconds_and_microseconds() {
         // utime_t::gmtime: below ten years of seconds it prints the raw count.
         assert_eq!(gmtime(&UTime { sec: 1, nsec: 0 }), "1.000000");
@@ -70,6 +81,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "user")]
     fn absolute_times_print_as_iso_8601_with_microseconds() {
         // A cls_user_bucket_entry corpus sample: 0x66f91c3f seconds,
         // 753627000 nanoseconds, which ceph-dencoder dumps as below.
@@ -97,6 +109,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "user")]
     fn civil_dates_match_known_days() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
@@ -105,6 +118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "user")]
     fn serializes_as_a_json_string() {
         #[derive(serde::Serialize)]
         struct T {
@@ -121,5 +135,14 @@ mod tests {
             .expect("json"),
             serde_json::json!({"t": "12345.000000"})
         );
+    }
+
+    #[test]
+    #[cfg(feature = "refcount")]
+    fn bool_as_int_prints_zero_or_one() {
+        #[derive(serde::Serialize)]
+        struct T(#[serde(serialize_with = "bool_as_int")] bool);
+        assert_eq!(serde_json::to_string(&T(true)).expect("json"), "1");
+        assert_eq!(serde_json::to_string(&T(false)).expect("json"), "0");
     }
 }
