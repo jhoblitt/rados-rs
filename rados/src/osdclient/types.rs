@@ -1241,12 +1241,16 @@ pub struct OpResult {
 }
 
 impl OpResult {
-    /// Return the outdata of the first operation reply, or an error if the reply list is empty.
-    pub fn first_outdata(&self) -> crate::osdclient::error::Result<&Bytes> {
+    /// Return the first operation reply, or an error if the reply list is empty.
+    pub fn first_reply(&self) -> crate::osdclient::error::Result<&OpReply> {
         self.ops
             .first()
-            .map(|op| &op.outdata)
             .ok_or_else(|| crate::osdclient::error::OSDClientError::Other("No op result".into()))
+    }
+
+    /// Return the outdata of the first operation reply, or an error if the reply list is empty.
+    pub fn first_outdata(&self) -> crate::osdclient::error::Result<&Bytes> {
+        self.first_reply().map(|op| &op.outdata)
     }
 }
 
