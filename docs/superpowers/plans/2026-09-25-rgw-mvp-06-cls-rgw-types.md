@@ -55,6 +55,19 @@ Plans 3 to 5's Global Constraints apply unchanged. Plus:
   (`main` at e234256339f): meta 8, header 8, reshard entry 3, usage
   entry 4. The extra fields are not modelled; `decode_content` reads
   the v19.2.2 fields and the versioned decoder skips the rest.
+- The floor rule, settled by plan 5's review and binding from here on:
+  every hand-written `decode_content` calls `rados::check_min_version!`
+  at the version Ceph v19 writes and reads no older branch, except
+  where a corpus archive the harness runs by default (18.2.0 or
+  19.2.0-404) holds an older sample; then that one older form is
+  decoded and the type doc names the archive as the reason. The
+  release hint names the release that first wrote the floor version
+  (found with `git log -S` and `git tag --contains` in the Ceph tree).
+  Here every hand-written decoder floors at v19's version (meta 7, dir
+  entry 8, header 7, dir 2, bilog entry 4, category stats 3,
+  bucket-instance entry 3, reshard entry 2) except `rgw_usage_log_entry`,
+  which floors at 3 because the 19.2.0 corpus holds version-3 samples
+  (v19.2.2 writes 4); no other older branch is written.
 - Legacy one-byte headers (`DECODE_START_LEGACY_COMPAT_LEN` with
   `struct_v` below the compat threshold: meta below 3, dir entry below
   3, header below 2, pending info below 2, category stats below 2, dir
@@ -106,9 +119,10 @@ Plans 3 to 5's Global Constraints apply unchanged. Plus:
    `tag_timeout`, `max_marker`, `syncstopped`; `cls_rgw_lc_obj_head` omits
    `shard_rollover_date`. Pinned per type.
 4. Version handling: encode v19.2.2's version, accept `main`'s
-   (`MAX_DECODE_VERSION`), and read older corpus forms where the corpus
-   has them (`rgw_usage_log_entry` v3). Pinned in Tasks 3 and 5 and by
-   the corpus run.
+   (`MAX_DECODE_VERSION`), floor at v19's version with
+   `check_min_version!`, and read the one older corpus form
+   (`rgw_usage_log_entry` v3). Pinned in Tasks 3 and 5 and by the corpus
+   run.
 5. `rgw_cls_bi_entry` dumps its payload decoded by `type` (`plain`/
    `instance` as a dir entry, `olh` as an OLH entry, nothing for
    `invalid`), so its `Serialize` decodes `data`; `get_info` mirrors the
@@ -249,13 +263,13 @@ Test helper (copy into each test module that pins oracle bytes):
     }
 
     #[test]
-    fn category_stats_and_its_v2_default() {
+    fn category_stats_floors_at_three() {
         let s = CategoryStats { total_size: 1024, total_size_rounded: 4096, num_entries: 2, actual_size: 1024 };
         assert_eq!(bytes(&s), unhex("0302200000000004000000000000001000000000000002000000000000000004000000000000"));
         assert_eq!(json(&s), r#"{"total_size":1024,"total_size_rounded":4096,"num_entries":2,"actual_size":1024}"#);
-        // Version 2 had no actual_size; it reads as total_size.
+        // Version 2 had no actual_size; it is below the floor.
         let v2 = unhex("0202180000000004000000000000001000000000000002000000000000");
-        assert_eq!(CategoryStats::decode(&mut &v2[..], 0).expect("decode").actual_size, 1024);
+        assert!(CategoryStats::decode(&mut &v2[..], 0).is_err());
     }
 
     #[test]
@@ -531,8 +545,8 @@ pub struct CategoryStats {
     pub num_entries: u64,
     pub actual_size: u64,
 }
-// VersionedEncode: MAX_DECODE_VERSION 3, version 3, compat 2; encode the four u64s;
-// decode three, then actual_size if struct_v >= 3 else total_size; size Some(32).
+// VersionedEncode: MAX_DECODE_VERSION 3, version 3, compat 2; check_min_version!(3);
+// encode and decode the four u64s; size Some(32).
 
 /// `rgw_zone_set_entry`: `zone[:location_key]` on the wire as one string,
 /// split at the first colon; ordered by zone then key with no key first.
@@ -617,9 +631,9 @@ Wire and dump facts, all verified against the oracle:
 
 - `DirEntryMeta` (`rgw_bucket_dir_entry_meta`): encode version 7, compat
   3, `MAX_DECODE_VERSION` 8. Wire: `category` (ObjCategory), `size` u64,
-  `mtime` UTime, `etag`, `owner`, `owner_display_name`, `content_type`
-  (v2+), `accounted_size` u64 (v4+, else `= size`), `user_data` (v5+),
-  `storage_class` (v6+), `appendable` bool (v7+); v8 adds two restore
+  `mtime` UTime, `etag`, `owner`, `owner_display_name`, `content_type`,
+  `accounted_size` u64, `user_data`, `storage_class`, `appendable` bool;
+  floor 7 (`check_min_version!`), no older branch; v8 adds two restore
   fields, skipped. Dump order: `category` (number), `size`, `mtime`
   (utime), `etag`, `storage_class` (raw), `owner`, `owner_display_name`,
   `content_type`, `accounted_size`, `user_data`, `appendable` (bool).
@@ -632,9 +646,9 @@ Wire and dump facts, all verified against the oracle:
   Vec<(String, PendingInfo)>`, `index_ver: u64`, `tag`, `flags: u16`,
   `versioned_epoch: u64`. Wire: `key.name`, `ver.epoch` as a plain u64,
   `exists`, `meta`, `pending_map` (u32 count, then string + PendingInfo
-  pairs), `locator` (v2+), `ver` (v4+, else `pool = -1`; this decode
-  overwrites the epoch read earlier), packed `index_ver` (v5+), `tag`
-  (v5+), `key.instance` (v6+), `flags` (v7+), `versioned_epoch` (v8+).
+  pairs), `locator`, `ver` (this decode overwrites the epoch read
+  earlier), packed `index_ver`, `tag`, `key.instance`, `flags`,
+  `versioned_epoch`; floor 8, no older branch.
   Dump: `name`, `instance`, `ver`, `locator`, `exists`, `meta`, `tag`,
   `flags` (number), `pending_map` (`map_entries`), `versioned_epoch`; no
   `index_ver`. Helpers `is_current`, `is_delete_marker`, `is_visible`,
@@ -651,10 +665,8 @@ Wire and dump facts, all verified against the oracle:
   `MAX_DECODE_VERSION` 8. Fields: `stats: BTreeMap<ObjCategory,
   CategoryStats>`, `tag_timeout: u64`, `ver: u64`, `master_ver: u64`,
   `max_marker: String`, `new_instance: BucketInstanceEntry`,
-  `syncstopped: bool`. Wire in that order with the version gates the C++
-  has (`tag_timeout` v3+, `ver`/`master_ver` v4+, `max_marker` v5+,
-  `new_instance` v6+, `syncstopped` v7+; v8's `reshardlog_entries` is
-  skipped). Dump: `ver` (number), `master_ver`, `stats` as an array
+  `syncstopped: bool`. Wire in that order; floor 7, no older branch;
+  v8's `reshardlog_entries` is skipped. Dump: `ver` (number), `master_ver`, `stats` as an array
   alternating the category number and the stats object, `new_instance`;
   nothing else. Helpers `resharding()`, `resharding_in_progress()`.
   Oracle instance 1 (93 bytes):
@@ -672,8 +684,8 @@ Wire and dump facts, all verified against the oracle:
   ModifyOp`, `state: PendingState`, `index_ver: u64`, `tag`, `bilog_flags:
   u16`, `owner`, `owner_display_name`, `zones_trace: ZoneSet`. Wire: `id`,
   `object`, `timestamp`, `ver`, `tag`, `op` u8, `state` u8, packed
-  `index_ver`, `instance` (v2+), `bilog_flags` (v2+), `owner` and
-  `owner_display_name` (v3+), `zones_trace` (v4+). Dump: `op_id` (id),
+  `index_ver`, `instance`, `bilog_flags`, `owner`, `owner_display_name`,
+  `zones_trace`; floor 4, no older branch. Dump: `op_id` (id),
   `op_tag` (tag), `op` (name), `object`, `instance`, `state` (`pending`,
   `complete`, else `invalid`), `index_ver` (number), `timestamp`
   (`utime_nsec`), `ver`, `bilog_flags` (number), `versioned` (bool:
@@ -697,9 +709,8 @@ Wire and dump facts, all verified against the oracle:
 - `ReshardEntry` (`cls_rgw_reshard_entry`): encode version 2, compat 1,
   `MAX_DECODE_VERSION` 3. Fields `time: UTime`, `tenant`, `bucket_name`,
   `bucket_id`, `old_num_shards: u32`, `new_num_shards: u32`. Wire in that
-  order; a version-1 buffer carries a string `new_instance_id` between
-  `bucket_id` and the shard counts (read and dropped); v3's `initiator`
-  byte is skipped. Dump: `time` (utime), `tenant`, `bucket_name`,
+  order; floor 2 (version 1 carried a `new_instance_id` string that is not
+  read); v3's `initiator` byte is skipped. Dump: `time` (utime), `tenant`, `bucket_name`,
   `bucket_id`, `old_num_shards`, `tentative_new_num_shards`. `key()` =
   `tenant + ":" + bucket_name`. Oracle instance 0 (56 bytes):
   `02013200000002000000030000000600000074656e616e74070000006275636b657431090000006275636b65745f69640800000040000000`
@@ -827,8 +838,9 @@ Facts:
   `bucket`, `epoch: u64`, `total_usage: UsageData`, `usage_map:
   BTreeMap<String, UsageData>`, `s3select_usage: S3selectUsageData`.
   Wire: `owner`, `bucket`, `epoch`, the four `total_usage` fields inline
-  (no header), `usage_map` (v2+; a v1 buffer sets `usage_map[""] =
-  total_usage`), `payer` (v3+), `s3select_usage` (v4+). Dump: `owner`,
+  (no header), `usage_map`, `payer`, `s3select_usage` (v4+ only: floor 3
+  because the 19.2.0 corpus holds version-3 samples, the one older form
+  this plan reads). Dump: `owner`,
   `payer`, `bucket`, `epoch`, `total_usage` object, `categories` as an
   array of `{category, bytes_sent, bytes_received, ops, successful_ops}`,
   `s3select` object. Helpers `aggregate(&mut self, &Self, categories:

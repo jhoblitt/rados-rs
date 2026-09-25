@@ -6,7 +6,7 @@
 `lc_put_head`, `lc_get_entry`, `lc_set_entry`, `lc_rm_entry`,
 `lc_get_next_entry`, `lc_list_entries`): their ten request and reply
 structs (two pinned against `ceph-dencoder` v19.2.2 and the corpus, the
-rest by construction including their legacy pair forms), op
+rest by construction), op
 constructors and `IoCtx` functions in `rgw::lc`, and cluster tests that
 pin the class's head, entry and paging semantics on Ceph v19.2.2, which
 upstream does not test at all.
@@ -45,16 +45,14 @@ Plans 3 to 9's Global Constraints apply unchanged. Plus:
   these two are registered with `ceph-dencoder`; `cls_rgw_lc_rm_entry_op`
   has corpus directories but no registration and is left out of the
   corpus table.
-- Legacy forms: version 1 of `set_entry_op`, `rm_entry_op`,
-  `get_next_entry_ret` and `get_entry_ret` carried a `pair<string, int>`
-  (a string then an `i32`), read back as `{bucket, start_time 0, status}`;
-  `get_entry_ret` version 1 also existed with a full entry, so its
-  decoder tries the entry first and falls back to the pair.
-  `list_entries_ret` version 1 and 2 carried `map<string, int>` (2 adds
-  `is_truncated`); version 3 carries the entries. The port encodes
-  version 2 (entries) and version 3 (list request and reply) and decodes
-  every older form; the list request's `compat_v` is not modelled since
-  the port always sends 3 and so always receives 3.
+- Legacy forms, not decoded (the floor rule of plan 6; every corpus
+  sample here is version 2): version 1 of `set_entry_op`, `rm_entry_op`,
+  `get_next_entry_ret` and `get_entry_ret` carried a `pair<string, int>`,
+  and `list_entries_ret` versions 1 and 2 carried `map<string, int>`. The
+  port encodes version 2 (entries) and version 3 (list request and
+  reply), floors the entry types at 2 and the list reply at 3, and does
+  not model the list request's `compat_v` (it always sends 3 and so
+  always receives 3).
 - Server facts (`cls_rgw.cc`, v19): the head is the omap header,
   `get_head` on an empty header returns a default head, a decode failure
   is `EINVAL`; `get_entry` is `ENOENT` for an absent key and `EIO` for an
@@ -74,10 +72,10 @@ Plans 3 to 9's Global Constraints apply unchanged. Plus:
 
 ## Review Focus
 
-1. The entry-carrying requests and replies are version 2 over compat 2
-   with a pair-shaped version 1; `get_entry_ret` tries both v1 shapes.
-   Pinned by construction in Task 1.
-2. `list_entries_ret` decodes the map forms of versions 1 and 2 and the
+1. The entry-carrying requests and replies are version 2 over compat 2;
+   the pair-shaped version 1 is below the floor and rejected. Pinned by
+   construction in Task 1.
+2. `list_entries_ret` floors at 3 (its map forms are rejected) and the
    vector form of version 3; the client sorts entries by bucket as the
    C++ decoder does. Pinned in Task 1.
 3. `get_next_entry` after the last key is a default entry, not `ENOENT`;
@@ -103,18 +101,14 @@ As plan 3's Task 0; branch `cls-rgw-lc` off the fork's `main` after plan
 
 **Interfaces:**
 - Types: `GetEntryOp { marker }` (v1, derived); `GetEntryRet { entry:
-  LcEntry }` (encode v2 compat 2; hand-written decode: v1 tries
-  `LcEntry` then the pair; dump `{"entry": ...}`); `SetEntryOp { entry }`
-  (v2/2; v1 pair; custom `Serialize` flattening `bucket`, `start_time`,
-  `status`); `RmEntryOp { entry }` (v2/2; v1 pair); `GetNextEntryOp {
-  marker }` (v1); `GetNextEntryRet { entry }` (v2/2; v1 pair); `PutHeadOp
-  { head: LcObjHead }` (v1); `GetHeadRet { head }` (v1); `ListEntriesOp {
-  marker, max_entries: u32 }` (encode v3 compat 1; decode any); `ListRet
-  { entries: Vec<LcEntry>, is_truncated: bool }` (encode v3 compat 1;
-  decode: v <= 2 a `BTreeMap<String, i32>` into entries with
-  `start_time` 0, else the vector; `is_truncated` from v2).
-- A private `fn decode_pair<B: Buf>(buf, features) -> Result<LcEntry>`
-  shared by the four v1 branches.
+  LcEntry }` (v2/2, derived; dump `{"entry": ...}`); `SetEntryOp { entry }`
+  (v2/2, derived; custom `Serialize` flattening `bucket`, `start_time`,
+  `status`); `RmEntryOp { entry }` (v2/2); `GetNextEntryOp { marker }`
+  (v1); `GetNextEntryRet { entry }` (v2/2); `PutHeadOp { head: LcObjHead
+  }` (v1); `GetHeadRet { head }` (v1); `ListEntriesOp { marker,
+  max_entries: u32 }` (v3/1, derived); `ListRet { entries: Vec<LcEntry>,
+  is_truncated: bool }` (v3/1, derived). The derive's decode rejects a
+  `struct_v` below its version, which is the floor here.
 - Op constructors: `get_head_op()` (raw, empty), `put_head_op(&LcObjHead)`,
   `get_entry_op(marker: &str)`, `set_entry_op(&LcEntry)`,
   `rm_entry_op(&LcEntry)`, `get_next_entry_op(marker: &str)`,
@@ -128,12 +122,10 @@ As plan 3's Task 0; branch `cls-rgw-lc` off the fork's `main` after plan
 
 Unit tests pin: the two oracle vectors and JSON; the pair form
 `010109000000010000006203000000` (that is `01 01 09000000 01000000 62
-03000000`) decoding as `SetEntryOp`, `RmEntryOp`, `GetNextEntryRet` and
-`GetEntryRet` to `{b, 0, 3}`; a v1 `GetEntryRet` holding a full entry
-(`0101` + a v1 `LcEntry`) decoding to that entry; a v2 `ListRet`
-`02010e0000000100000001000000610100000000` (`{"a": 1}`, not truncated)
-decoding to `[{a, 0, 1}]`; a v3 round trip of two entries; every
-constructor's class and method (`rgwlc_get_head`, ...).
+03000000`) rejected by `SetEntryOp`, `RmEntryOp`, `GetNextEntryRet` and
+`GetEntryRet`; a v2 `ListRet` `02010e0000000100000001000000610100000000`
+rejected; a v3 `ListRet` round trip of two entries; every constructor's
+class and method (`rgwlc_get_head`, ...).
 
 Commit:
 
@@ -142,9 +134,8 @@ cls: the rgw lifecycle methods
 
 Mirrors cls_rgw_client.h's lc_get_head, lc_put_head, lc_get_entry,
 lc_set_entry, lc_rm_entry, lc_get_next_entry and lc_list_entries. The
-entry requests and replies are version 2 over a pair<string, int>
-version 1, the get-entry reply also having shipped a full entry as
-version 1; the list reply carried a map before version 3. cls_rgw.cc
+entry requests and replies are version 2, the list reply version 3;
+their pair and map forms are below the Squid floor. cls_rgw.cc
 keeps the head in the omap header, answers a missing next entry with
 an empty one, and reads legacy pair values when listing.
 
@@ -201,7 +192,7 @@ As plan 3's Task 6: corpus over the two names; cluster suites through
 ```
 **Motivation.** RGW's lifecycle worker walks per-shard entries through the `rgw` class's lc methods and records its position in the shard head; a Rust RGW running lifecycle needs all seven.
 
-**What changed.** `rados-cls`'s `rgw::lc` gains the ten lc requests and replies (the version-1 pair forms decoded too), op constructors and `IoCtx` functions, and cluster tests that pin the head, entry and paging semantics upstream leaves untested.
+**What changed.** `rados-cls`'s `rgw::lc` gains the ten lc requests and replies op constructors and `IoCtx` functions, and cluster tests that pin the head, entry and paging semantics upstream leaves untested.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```

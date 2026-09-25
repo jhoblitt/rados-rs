@@ -75,6 +75,23 @@ dependencies). Plus:
   RD, the rest RD|WR.
 - `cls_queue_get_stats_ret` is declared but no method, handler or client
   uses it; it is left out.
+- The floor rule, settled by plan 5's review and binding from here on:
+  every hand-written `decode_content` calls `rados::check_min_version!`
+  at the version Ceph v19 writes and reads no older branch, except
+  where a corpus archive the harness runs by default (18.2.0 or
+  19.2.0-404) holds an older sample; then that one older form is
+  decoded and the type doc names the archive as the reason. The
+  release hint names the release that first wrote the floor version
+  (found with `git log -S` and `git tag --contains` in the Ceph tree).
+  Here: `cls_queue_list_op` keeps its version-1 branch (the 18.2.0
+  corpus holds only version-1 samples); `cls_rgw_obj`, `cls_rgw_gc_list_op`
+  and `cls_rgw_gc_list_ret` floor at 2 (their older samples live only in
+  archives the harness never runs), so Review Focus 2's version-1
+  branches for those three are not written and their tests assert
+  rejection instead. `queue::init` and `rgw_gc::init` need the object to
+  exist (the class reads the head first and a missing object is
+  `ENOENT`); C++ callers put a create in the same compound, and the docs
+  say so.
 - A method flagged RD|WR whose C++ client reads its reply (the
   `ObjectWriteOperation::exec` overload with an `out` buffer, run with
   `librados::OPERATION_RETURNVEC`) gets its reply only when the request

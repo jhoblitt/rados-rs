@@ -94,8 +94,8 @@ Plans 3 to 10's Global Constraints apply unchanged. Plus:
 ## Review Focus
 
 1. `rgw_cls_link_olh_op` (5/1) always writes a `u64` seconds copy of
-   `unmod_since` before the `real_time`; the decoder reads the seconds
-   alone at version 2, both at 3 and above. Pinned against the oracle.
+   `unmod_since` before the `real_time`; the decoder floors at 5 and
+   reads both, dropping the seconds. Pinned against the oracle.
 2. `rgw_cls_unlink_instance_op` (3/1) dumps no `olh_tag`; the read
    request is version 1 on v19. Pinned.
 3. The v19 epoch rule: 0 means class-assigned, first 2, then increasing;
@@ -127,12 +127,13 @@ As plan 3's Task 0; branch `cls-rgw-olh` off the fork's `main` after plan
   op_tag: String, meta: DirEntryMeta, olh_epoch: u64, log_op: bool,
   bilog_flags: u16, unmod_since: UTime, high_precision_time: bool,
   zones_trace: ZoneSet }` (hand-written: encode v5 compat 1 in the wire
-  order with the `u64` seconds before `unmod_since`; decode with the
-  version branches; `Serialize` in dump order with `unmod_since` via
+  order with the `u64` seconds before `unmod_since`; decode floors at 5
+  with `check_min_version!` and reads the wire order, dropping the
+  seconds; `Serialize` in dump order with `unmod_since` via
   `dump::utime`, `bilog_flags` as a number, `zones_trace` bare);
   `UnlinkInstanceOp { key, op_tag, olh_epoch, log_op, bilog_flags,
-  olh_tag, zones_trace }` (hand-written: encode v3/1; `olh_tag` from v2,
-  `zones_trace` from v3; `Serialize` omits `olh_tag`); `ReadOlhLogOp {
+  olh_tag, zones_trace }` (hand-written: encode v3/1; floor 3; `Serialize`
+  omits `olh_tag`); `ReadOlhLogOp {
   olh: ObjKey, ver_marker: u64, olh_tag }` (v1, derived); `ReadOlhLogRet {
   log: BTreeMap<u64, Vec<OlhLogEntry>>, is_truncated: bool }` (v1;
   `Serialize`: `log` via `dump::map_entries`, then `is_truncated`);
@@ -148,9 +149,8 @@ As plan 3's Task 0; branch `cls-rgw-olh` off the fork's `main` after plan
   no guard themselves (plan 7's rule).
 
 Unit tests pin the six oracle vectors and JSON, a version-2
-`LinkOlhOp` decode (seconds only: build the bytes by hand from the v5
-vector with header `0201`, the content up to `bilog_flags`, then one
-`u64`), and each constructor's class and method.
+`LinkOlhOp` vector rejected (below the floor), and each constructor's
+class and method.
 
 Commit:
 

@@ -75,10 +75,10 @@ Plans 3 to 6's Global Constraints apply unchanged. Plus:
 - Suggestions are a raw concatenation of `u8 op` and an encoded
   `rgw_bucket_dir_entry`: `op` is `b'r'` (114) or `b'u'` (117), or'ed
   with `0x80` when the change should be bilogged.
-- The hand-written decoders read every version branch the C++ has where
-  the type is a request the dencoder round-trips (prepare, complete,
-  list op, list ret); legacy one-byte headers below the compat threshold
-  are not decoded (plan 6's rule).
+- The floor rule (plan 6): every hand-written decoder calls
+  `check_min_version!` at v19's version and reads no older branch; all
+  corpus samples here are at v19's versions (prepare 7, complete 9, list
+  op 6, list ret 4), so no older form is decoded.
 
 ## Review Focus
 
@@ -180,8 +180,7 @@ Facts and pins (oracle instances; `unhex` helper as plan 6):
   `MAX_DECODE_VERSION` 7. Fields `op: ModifyOp`, `key: ObjKey`, `tag`,
   `locator`, `log_op: bool`, `bilog_flags: u16`, `zones_trace: ZoneSet`.
   Wire: `op` u8, `tag`, `locator`, `log_op`, `key`, `bilog_flags`,
-  `zones_trace`. Decode: `op`; `key.name` if v < 5; `tag`; `locator` v2+;
-  `log_op` v4+; `key` v5+; `bilog_flags` v6+; `zones_trace` v7+. Dump (v19):
+  `zones_trace`; floor 7, decoded in wire order. Dump (v19):
   `op` (number), `name`, `tag`, `locator`, `log_op`, `bilog_flags`,
   `zones_trace` (bare array). `Default` has `op: ModifyOp::UNKNOWN`. Pin
   instance 1 `{ADD, name "name", tag "tag", locator "locator"}` (50 B) =
@@ -193,12 +192,8 @@ Facts and pins (oracle instances; `unhex` helper as plan 6):
   `locator`, `ver: EntryVer`, `meta: DirEntryMeta`, `tag` (C++ `op_tag`),
   `log_op`, `bilog_flags: u16`, `remove_objs: Vec<ObjKey>`, `zones_trace`.
   Wire: `op` u8, `ver.epoch` u64, `meta`, `tag`, `locator`, `remove_objs`,
-  `ver`, `log_op`, `key`, `bilog_flags`, `zones_trace`. Decode: `op`;
-  `key.name` if v < 7; `ver.epoch`; `meta`; `tag`; `locator` v2+;
-  `remove_objs` as strings (names only) if 4 <= v < 7, else as keys;
-  `ver` v5+ (else `pool = -1`; note the later `ver` overwrites the epoch
-  read earlier); `log_op` v6+; `key` v7+; `bilog_flags` v8+;
-  `zones_trace` v9+. Dump: `op`, `name`, `instance`, `locator`, `ver`,
+  `ver`, `log_op`, `key`, `bilog_flags`, `zones_trace`; floor 9, decoded
+  in wire order (the later `ver` overwrites the epoch read earlier). Dump: `op`, `name`, `instance`, `locator`, `ver`,
   `meta`, `tag`, `log_op`, `bilog_flags`, `zones_trace`. Pin instance 1
   `{DEL, name "name", locator "locator", ver {2, 100}, tag "tag", meta =
   plan 6's meta instance 1}` (159 B) =
@@ -208,15 +203,13 @@ Facts and pins (oracle instances; `unhex` helper as plan 6):
   `MAX_DECODE_VERSION` 6. Fields `start_obj: ObjKey`, `num_entries: u32`,
   `filter_prefix`, `list_versions: bool`, `delimiter`. Wire:
   `num_entries`, `filter_prefix`, `start_obj`, `list_versions`,
-  `delimiter`. Decode: `start_obj.name` if v < 4; `num_entries`;
-  `filter_prefix` v3+; `start_obj` v4+; `list_versions` v5+; `delimiter`
-  v6+. Dump: `start_obj` (the name only), `num_entries`. Pin instance 1
+  `delimiter`; floor 6, decoded in wire order. Dump: `start_obj` (the name only), `num_entries`. Pin instance 1
   (55 B) =
   `060431000000640000000d00000066696c7465725f7072656669780101110000000900000073746172745f6f626a000000000000000000`
   = `{"start_obj":"start_obj","num_entries":100}`.
 - `ListRet` (`rgw_cls_list_ret`): version 4, compat 2, `MAX_DECODE_VERSION`
-  4. Fields `dir: Dir`, `is_truncated: bool`, `marker: ObjKey`. Decode
-  `marker` only if v >= 4. Dump: `dir`, `is_truncated` (int); no `marker`.
+  4. Fields `dir: Dir`, `is_truncated: bool`, `marker: ObjKey`; floor 4.
+  Dump: `dir`, `is_truncated` (int); no `marker`.
   Pin instance 3 `{default dir, truncated}` (85 B) =
   `04024f00000002023a00000007023000000000000000000000000000000000000000000000000000000000000000000000000301090000000000000000ffffffff0000000000010101080000000000000000000000`
   = `{"dir":{"header":{"ver":0,"master_ver":0,"stats":[],"new_instance":{"reshard_status":"not-resharding"}},"map":[]},"is_truncated":1}`.
