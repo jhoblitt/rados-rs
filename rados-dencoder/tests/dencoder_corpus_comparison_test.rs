@@ -150,6 +150,8 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_gc_list_op", None, false),
     TypeSpec::new("cls_rgw_gc_list_ret", None, false),
     TypeSpec::new("cls_rgw_gc_remove_op", None, false),
+    TypeSpec::new("cls_rgw_gc_urgent_data", None, false),
+    TypeSpec::new("cls_rgw_gc_queue_init_op", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

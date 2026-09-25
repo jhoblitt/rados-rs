@@ -26,7 +26,7 @@ use rados::{
     PoolSnapInfo, RadosError, UTime, UuidD, VersionedEncode, WatchItem,
 };
 use rados_cls::queue::{
-    Entry as QueueEntry, EnqueueOp as QueueEnqueueOp, GetCapacityRet as QueueGetCapacityRet,
+    EnqueueOp as QueueEnqueueOp, Entry as QueueEntry, GetCapacityRet as QueueGetCapacityRet,
     Head as QueueHead, InitOp as QueueInitOp, ListOp as QueueListOp, ListRet as QueueListRet,
     Marker as QueueMarker, RemoveOp as QueueRemoveOp,
 };
@@ -41,6 +41,7 @@ use rados_cls::rgw::gc::{
 use rados_cls::rgw::types::{
     GcObjInfo, Obj as RgwObj, ObjChain as RgwObjChain, ObjKey as RgwObjKey,
 };
+use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
 use rados_cls::user::{
     AccountHeader as UserAccountHeader, AccountResource as UserAccountResource,
     AccountResourceAddOp as UserAccountResourceAddOp,
@@ -229,6 +230,8 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
         "cls_rgw_gc_list_ret" => Some(type_info_denc::<RgwGcListRet>()),
         "cls_rgw_gc_remove_op" => Some(type_info_denc::<RgwGcRemoveOp>()),
+        "cls_rgw_gc_urgent_data" => Some(type_info_denc::<RgwGcUrgentData>()),
+        "cls_rgw_gc_queue_init_op" => Some(type_info_denc::<RgwGcQueueInitOp>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -300,6 +303,7 @@ fn list_types() {
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );
+    println!("  cls_rgw_gc_urgent_data / cls_rgw_gc_queue_init_op [versioned]");
     println!();
     println!("LEVEL 4: Top-level cluster structures");
     println!("  Test these ONLY after all lower levels are validated");

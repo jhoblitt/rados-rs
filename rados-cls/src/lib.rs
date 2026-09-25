@@ -13,7 +13,8 @@
     feature = "version",
     feature = "refcount",
     feature = "user",
-    feature = "queue"
+    feature = "queue",
+    feature = "rgw_gc"
 ))]
 mod call;
 #[cfg(any(feature = "refcount", feature = "rgw", feature = "user"))]
@@ -25,6 +26,8 @@ pub mod queue;
 pub mod refcount;
 #[cfg(feature = "rgw")]
 pub mod rgw;
+#[cfg(feature = "rgw_gc")]
+pub mod rgw_gc;
 #[cfg(feature = "user")]
 pub mod user;
 #[cfg(feature = "version")]
