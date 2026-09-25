@@ -207,7 +207,9 @@ Replace the body of `check_op_result` in `client.rs` (lines 994-1016) with:
     /// zero or positive is success. Some ops report success with a positive
     /// code (`CMPXATTR` returns 1 when the comparison holds), so this tests
     /// `< 0`, not `!= 0`, on the overall result and on the first op's
-    /// return code.
+    /// return code. The per-op `FAILOK` flag is not honoured here: if the
+    /// first op carries it and fails, its negative code is reported even
+    /// though the OSD let the request succeed.
     pub(crate) fn check_op_result(
         result: &crate::osdclient::types::OpResult,
         op_name: &str,
@@ -470,9 +472,9 @@ After `remove_xattr`, add:
     /// left-hand side, so `CmpOp::Gt` holds when `value` exceeds the stored
     /// attribute (`do_cmp_xattr` in `PrimaryLogPG.cc`). A missing attribute
     /// compares as the empty string, so `CmpOp::Eq` with an empty `value`
-    /// asserts absence. When the comparison holds the op's return code is
-    /// 1; when it does not, the whole request fails with `ECANCELED` and
-    /// none of its writes apply.
+    /// asserts that the attribute is absent or empty. When the comparison
+    /// holds the op's return code is 1; when it does not, the whole request
+    /// fails with `ECANCELED` and none of its writes apply.
     pub fn cmpxattr(
         name: impl Into<String>,
         op: CmpOp,
@@ -1420,6 +1422,8 @@ impl Serialize for WatchItem {
 /// `watch_item_t` is `ENCODE_START(2, 1)`: name, cookie, timeout, and
 /// from v2 the address. Squid emits v2.
 impl VersionedEncode for WatchItem {
+    const MAX_DECODE_VERSION: u8 = 2;
+
     fn encoding_version(&self, _features: u64) -> u8 {
         2
     }
@@ -1485,6 +1489,8 @@ pub struct ListWatchersReply {
 /// `obj_list_watch_response_t` is `ENCODE_START(1, 1)` around a
 /// `std::list<watch_item_t>`, which encodes as a u32 count then the items.
 impl VersionedEncode for ListWatchersReply {
+    const MAX_DECODE_VERSION: u8 = 1;
+
     fn encoding_version(&self, _features: u64) -> u8 {
         1
     }
@@ -1738,9 +1744,10 @@ async fn cmpxattr_match_returns_one() {
         .execute_op(&oid, op)
         .await
         .expect("a holding comparison is a success, not an error");
-    // PrimaryLogPG returns the comparison's truth value as the op's result.
+    // PrimaryLogPG returns the comparison's truth value as the op's result,
+    // and a read-only request carries it as the overall result too.
     assert_eq!(result.ops[0].return_code, 1);
-    assert!(result.result >= 0);
+    assert_eq!(result.result, 1);
 
     ioctx.remove(&oid).await.expect("remove");
 }
