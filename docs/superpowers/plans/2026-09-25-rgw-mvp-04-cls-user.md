@@ -32,7 +32,12 @@ builds with the scratchpad `CARGO_HOME`; no new dependencies). Plus:
 
 - A feature enters `rados-cls`'s `default` list in the commit that adds its
   module, so every commit builds alone.
-- Branch `cls-user` is based on the fork's `main` after plan 3 merges.
+- Branch `cls-user` is based on the fork's `main` after plan 3 merges,
+  whose fix wave gave `call` the helpers `op`, `raw_op`, `exec`,
+  `exec_raw`, `decode`, `decode_bytes` (a request-less method uses
+  `raw_op`/`exec_raw` with `Bytes::new()`), gated `mod call` on
+  `any(...)` of every class feature, and added the CI step "Run clippy
+  on each rados-cls class alone", whose loop lists every feature name.
 - `ceph::real_time` is `rados::UTime` on the wire (u32 seconds, u32
   nanoseconds, no version header), and dumps as `utime_t::gmtime` prints
   it: seconds below 315,360,000 (ten years) as `<sec>.<usec>` with six
@@ -172,7 +177,8 @@ mod tests {
 }
 ```
 
-Add `pub(crate) mod dump;` to `rados-cls/src/lib.rs` after `mod call;`.
+Add `pub(crate) mod dump;` to `rados-cls/src/lib.rs` after the gated
+`mod call;`, with no `cfg` of its own.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -256,8 +262,10 @@ EOF
 - Create: `rados-cls/src/user.rs` (types, tests; the client functions come
   in Task 3).
 - Modify: `rados-cls/Cargo.toml` (feature `user`, added to `default`),
-  `rados-cls/src/lib.rs` (`#[cfg(feature = "user")] pub mod user;`),
-  `rados-dencoder/src/main.rs`, `rados-dencoder/tests/dencoder_corpus_comparison_test.rs`.
+  `rados-cls/src/lib.rs` (`#[cfg(feature = "user")] pub mod user;` and
+  `user` in the `mod call` gate), `.github/workflows/ci.yml` (`user` in
+  the per-class clippy loop), `rados-dencoder/src/main.rs`,
+  `rados-dencoder/tests/dencoder_corpus_comparison_test.rs`.
 
 **Interfaces:**
 - Consumes: `rados::{Denc, RadosError, UTime, VersionedDenc,
@@ -552,7 +560,9 @@ mod tests {
 
 Add to `rados-cls/Cargo.toml`: `user = []` under `[features]` and `"user"`
 to `default`. Add `#[cfg(feature = "user")] pub mod user;` to `lib.rs`
-(keep the `pub mod` lines alphabetical: refcount, user, version).
+(keep the `pub mod` lines alphabetical: refcount, user, version) and
+`feature = "user"` to the `mod call` gate. In `ci.yml`, the per-class
+clippy loop becomes `for features in "" refcount user version; do`.
 
 Run: `cargo test -p rados-cls --lib --offline user`
 Expected: FAIL to compile: `Bucket`, `BucketEntry`, ... not found.
@@ -1026,7 +1036,7 @@ Expected: all pass, seven new tests in `rados-cls`, no warnings.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rados-cls/Cargo.toml rados-cls/src/lib.rs rados-cls/src/user.rs rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
+git add rados-cls/Cargo.toml rados-cls/src/lib.rs rados-cls/src/user.rs .github/workflows/ci.yml rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
 git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
 cls: add the user class types
 
@@ -1050,7 +1060,7 @@ EOF
   tests).
 
 **Interfaces:**
-- Consumes: Task 2's types; `crate::call::{op, bare_op, exec, decode,
+- Consumes: Task 2's types; `crate::call::{op, raw_op, exec, decode,
   decode_bytes}`; `rados::osdclient::{IoCtx, OSDOp, OpReply}`.
 - Produces: op constructors `set_buckets_op(&[BucketEntry], bool, UTime)`,
   `complete_stats_sync_op(UTime)`, `remove_bucket_op(&Bucket)`,
