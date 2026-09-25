@@ -840,8 +840,9 @@ impl IoCtx {
     /// Execute a built, possibly compound, operation on `oid`.
     ///
     /// Only checks the overall result and the first op's return code (via
-    /// `check_op_result`); return codes of later ops in a compound
-    /// operation are the caller's to inspect in the returned [`OpResult`].
+    /// `check_op_result`, where a negative code is the failure); return
+    /// codes of later ops in a compound operation are the caller's to
+    /// inspect in the returned [`OpResult`].
     pub async fn execute_op(&self, oid: impl Into<String>, op: BuiltOp) -> Result<OpResult> {
         let oid = oid.into();
         debug!("Executing op for object '{}' in pool {}", oid, self.pool_id);
