@@ -141,6 +141,15 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_queue_list_ret", None, false),
     TypeSpec::new("cls_queue_remove_op", None, false),
     TypeSpec::new("cls_queue_get_capacity_ret", None, false),
+    TypeSpec::new("cls_rgw_obj_key", None, false),
+    TypeSpec::new("cls_rgw_obj", None, false),
+    TypeSpec::new("cls_rgw_obj_chain", None, false),
+    TypeSpec::new("cls_rgw_gc_obj_info", None, false),
+    TypeSpec::new("cls_rgw_gc_set_entry_op", None, false),
+    TypeSpec::new("cls_rgw_gc_defer_entry_op", None, false),
+    TypeSpec::new("cls_rgw_gc_list_op", None, false),
+    TypeSpec::new("cls_rgw_gc_list_ret", None, false),
+    TypeSpec::new("cls_rgw_gc_remove_op", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

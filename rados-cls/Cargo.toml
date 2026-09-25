@@ -12,11 +12,12 @@ homepage.workspace = true
 # Every class is on by default so the workspace's tests and lints cover
 # them; a client that calls only some classes turns defaults off and
 # names the ones it uses.
-default = ["version", "refcount", "user", "queue"]
+default = ["version", "refcount", "user", "queue", "rgw"]
 version = []
 refcount = []
 user = []
 queue = []
+rgw = []
 
 [dependencies]
 rados = { path = "../rados", version = "0.1.4" }

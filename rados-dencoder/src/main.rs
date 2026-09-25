@@ -34,6 +34,13 @@ use rados_cls::refcount::{
     GetOp as RefcountGetOp, ObjRefcount, PutOp as RefcountPutOp, ReadOp as RefcountReadOp,
     ReadRet as RefcountReadRet, SetOp as RefcountSetOp,
 };
+use rados_cls::rgw::gc::{
+    DeferEntryOp as RgwGcDeferEntryOp, ListOp as RgwGcListOp, ListRet as RgwGcListRet,
+    RemoveOp as RgwGcRemoveOp, SetEntryOp as RgwGcSetEntryOp,
+};
+use rados_cls::rgw::types::{
+    GcObjInfo, Obj as RgwObj, ObjChain as RgwObjChain, ObjKey as RgwObjKey,
+};
 use rados_cls::user::{
     AccountHeader as UserAccountHeader, AccountResource as UserAccountResource,
     AccountResourceAddOp as UserAccountResourceAddOp,
@@ -213,6 +220,15 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_queue_list_ret" => Some(type_info_denc::<QueueListRet>()),
         "cls_queue_remove_op" => Some(type_info_denc::<QueueRemoveOp>()),
         "cls_queue_get_capacity_ret" => Some(type_info_denc::<QueueGetCapacityRet>()),
+        "cls_rgw_obj_key" => Some(type_info_denc::<RgwObjKey>()),
+        "cls_rgw_obj" => Some(type_info_denc::<RgwObj>()),
+        "cls_rgw_obj_chain" => Some(type_info_denc::<RgwObjChain>()),
+        "cls_rgw_gc_obj_info" => Some(type_info_denc::<GcObjInfo>()),
+        "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
+        "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
+        "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
+        "cls_rgw_gc_list_ret" => Some(type_info_denc::<RgwGcListRet>()),
+        "cls_rgw_gc_remove_op" => Some(type_info_denc::<RgwGcRemoveOp>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -279,6 +295,10 @@ fn list_types() {
     println!(
         "  cls_queue_{{init,enqueue,list,remove}}_op / cls_queue_list_ret / \
          cls_queue_get_capacity_ret [versioned]"
+    );
+    println!("  cls_rgw_{{obj_key,obj,obj_chain,gc_obj_info}} [versioned]");
+    println!(
+        "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );
     println!();
     println!("LEVEL 4: Top-level cluster structures");

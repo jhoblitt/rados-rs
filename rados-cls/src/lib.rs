@@ -16,13 +16,15 @@
     feature = "queue"
 ))]
 mod call;
-#[cfg(any(feature = "refcount", feature = "user"))]
+#[cfg(any(feature = "refcount", feature = "rgw", feature = "user"))]
 pub(crate) mod dump;
 
 #[cfg(feature = "queue")]
 pub mod queue;
 #[cfg(feature = "refcount")]
 pub mod refcount;
+#[cfg(feature = "rgw")]
+pub mod rgw;
 #[cfg(feature = "user")]
 pub mod user;
 #[cfg(feature = "version")]
