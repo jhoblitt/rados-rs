@@ -169,6 +169,14 @@ impl OpBuilder {
         self
     }
 
+    /// Assert that the object exists, as `ObjectOperation::assert_exists`
+    /// does: a `STAT` whose `ENOENT` fails the whole request before any
+    /// write in it applies. RGW uses it to guard bucket-index shard and OLH
+    /// updates that must target an existing object.
+    pub fn assert_exists(self) -> Self {
+        self.stat()
+    }
+
     /// Add a delete operation
     pub fn delete(mut self) -> Self {
         self.ops.push(OSDOp::delete());
@@ -600,6 +608,19 @@ mod tests {
         assert!(!built.is_read());
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::SetAllocHint);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
+    }
+
+    #[test]
+    fn assert_exists_is_a_stat() {
+        let built = OpBuilder::new()
+            .assert_exists()
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_write());
+        assert!(built.is_read());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::Stat);
         assert_eq!(ops[1].op, OpCode::WriteFull);
     }
 }
