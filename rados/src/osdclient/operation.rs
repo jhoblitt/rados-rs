@@ -27,8 +27,8 @@
 //! ```
 
 use crate::osdclient::error::Result;
-use crate::osdclient::omap::{OmapAssertion, OmapKey, OmapKeySet, OmapMap};
-use crate::osdclient::types::{OSDOp, OsdOpFlags};
+use crate::osdclient::omap::{CmpOp, OmapAssertion, OmapKey, OmapKeySet, OmapMap};
+use crate::osdclient::types::{AllocHintFlags, OSDOp, OsdOpFlags};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -169,6 +169,14 @@ impl OpBuilder {
         self
     }
 
+    /// Assert that the object exists, as `ObjectOperation::assert_exists`
+    /// does: a `STAT` whose `ENOENT` fails the whole request before any
+    /// write in it applies. RGW uses it to guard bucket-index shard and OLH
+    /// updates that must target an existing object.
+    pub fn assert_exists(self) -> Self {
+        self.stat()
+    }
+
     /// Add a delete operation
     pub fn delete(mut self) -> Self {
         self.ops.push(OSDOp::delete());
@@ -183,6 +191,29 @@ impl OpBuilder {
     /// succeeds silently if it already exists.
     pub fn create(mut self, exclusive: bool) -> Self {
         self.ops.push(OSDOp::create(exclusive));
+        self.flags |= OsdOpFlags::WRITE;
+        self
+    }
+
+    /// Add a zero operation (clear `length` bytes from `offset`).
+    pub fn zero(mut self, offset: u64, length: u64) -> Self {
+        self.ops.push(OSDOp::zero(offset, length));
+        self.flags |= OsdOpFlags::WRITE;
+        self
+    }
+
+    /// Add a set_alloc_hint operation; see [`OSDOp::set_alloc_hint`].
+    pub fn set_alloc_hint(
+        mut self,
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: AllocHintFlags,
+    ) -> Self {
+        self.ops.push(OSDOp::set_alloc_hint(
+            expected_object_size,
+            expected_write_size,
+            flags,
+        ));
         self.flags |= OsdOpFlags::WRITE;
         self
     }
@@ -241,6 +272,14 @@ impl OpBuilder {
     /// Add a list_snaps operation (enumerate clones/snapshots of an object)
     pub fn list_snaps(mut self) -> Self {
         self.ops.push(OSDOp::list_snaps());
+        self.flags |= OsdOpFlags::READ;
+        self
+    }
+
+    /// Add a list_watchers operation; decode its reply with
+    /// [`crate::osdclient::watchers::decode_list_watchers`].
+    pub fn list_watchers(mut self) -> Self {
+        self.ops.push(OSDOp::list_watchers());
         self.flags |= OsdOpFlags::READ;
         self
     }
@@ -344,6 +383,23 @@ impl OpBuilder {
     /// of only assertions makes no change.
     pub fn omap_cmp(mut self, assertions: &BTreeMap<OmapKey, OmapAssertion>) -> Result<Self> {
         self.ops.push(OSDOp::omap_cmp(assertions)?);
+        self.flags |= OsdOpFlags::READ;
+        Ok(self)
+    }
+
+    /// Add a cmpxattr assertion on a byte-string attribute; the request
+    /// fails with `ECANCELED` when it does not hold. RGW guards every
+    /// overwrite with one on the object's id tag.
+    pub fn cmpxattr(mut self, name: impl Into<String>, op: CmpOp, value: Bytes) -> Result<Self> {
+        self.ops.push(OSDOp::cmpxattr(name, op, value)?);
+        self.flags |= OsdOpFlags::READ;
+        Ok(self)
+    }
+
+    /// Add a cmpxattr assertion on an integer attribute; see
+    /// [`OSDOp::cmpxattr_u64`] for how the OSD reads each side.
+    pub fn cmpxattr_u64(mut self, name: impl Into<String>, op: CmpOp, value: u64) -> Result<Self> {
+        self.ops.push(OSDOp::cmpxattr_u64(name, op, value)?);
         self.flags |= OsdOpFlags::READ;
         Ok(self)
     }
@@ -526,5 +582,61 @@ mod tests {
         let ops = built.into_ops();
         assert_eq!(ops[0].op, OpCode::OmapSetVals);
         assert_eq!(ops[1].op, OpCode::OmapGetHeader);
+    }
+
+    #[test]
+    fn cmpxattr_builder_is_a_read() {
+        let built = OpBuilder::new()
+            .cmpxattr("user.tag", CmpOp::Eq, Bytes::from_static(b"t"))
+            .expect("cmp")
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_read());
+        assert!(built.is_write());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::CmpXattr);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
+    }
+
+    #[test]
+    fn zero_builder_is_a_write() {
+        let built = OpBuilder::new().zero(0, 4096).build();
+        assert!(built.is_write());
+        assert!(!built.is_read());
+        assert_eq!(built.into_ops()[0].op, OpCode::Zero);
+    }
+
+    #[test]
+    fn set_alloc_hint_builder_is_a_write() {
+        let built = OpBuilder::new()
+            .set_alloc_hint(0, 0, AllocHintFlags::INCOMPRESSIBLE)
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_write());
+        assert!(!built.is_read());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::SetAllocHint);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
+    }
+
+    #[test]
+    fn list_watchers_builder_is_a_read() {
+        let built = OpBuilder::new().list_watchers().build();
+        assert!(built.is_read());
+        assert!(!built.is_write());
+        assert_eq!(built.into_ops()[0].op, OpCode::ListWatchers);
+    }
+
+    #[test]
+    fn assert_exists_is_a_stat() {
+        let built = OpBuilder::new()
+            .assert_exists()
+            .write_full(Bytes::from_static(b"x"))
+            .build();
+        assert!(built.is_write());
+        assert!(built.is_read());
+        let ops = built.into_ops();
+        assert_eq!(ops[0].op, OpCode::Stat);
+        assert_eq!(ops[1].op, OpCode::WriteFull);
     }
 }

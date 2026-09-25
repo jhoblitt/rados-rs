@@ -29,6 +29,7 @@ pub mod snapshot;
 pub(crate) mod throttle;
 pub(crate) mod tracker;
 pub mod types;
+pub mod watchers;
 
 // Re-export commonly used types
 pub use client::{OSDClient, OSDClientConfig, default_client_inc};
@@ -44,9 +45,11 @@ pub use pg_nls_response::{ListObjectImpl, PgNlsResponse};
 pub use pgmap_types::{ObjectstorePerfStat, PoolStat};
 pub use snapshot::SnapId;
 pub use types::{
-    OSDOp, ObjectId, ObjectLocator, OpCode, OpReply, OpResult, OpState, OpTarget, OsdOpFlags,
-    PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId, WriteResult,
+    AllocHintFlags, OSDOp, ObjectId, ObjectLocator, OpCode, OpReply, OpResult, OpState, OpTarget,
+    OsdOpFlags, PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId,
+    WriteResult,
 };
+pub use watchers::{ListWatchersReply, WatchItem};
 
 pub use messages::MOSDOp;
 

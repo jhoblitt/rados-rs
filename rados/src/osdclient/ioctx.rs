@@ -18,8 +18,10 @@ use crate::osdclient::omap::{
 use crate::osdclient::operation::{BuiltOp, OpBuilder};
 use crate::osdclient::snapshot::SnapId;
 use crate::osdclient::types::{
-    OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult, WriteResult,
+    AllocHintFlags, OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult,
+    WriteResult,
 };
+use crate::osdclient::watchers::{WatchItem, decode_list_watchers};
 
 /// Maximum entries per PGLS request for object listing pagination
 const MAX_ENTRIES_PER_REQUEST: usize = 100;
@@ -273,6 +275,46 @@ impl IoCtx {
         Ok(WriteResult {
             version: result.version,
         })
+    }
+
+    /// Zero the bytes `[offset, offset + length)` of an object
+    ///
+    /// Like [`write`](Self::write) this does not truncate. A missing object
+    /// stays missing: the OSD treats the op as a no-op, not as `ENOENT`.
+    pub async fn zero(&self, oid: &str, offset: u64, length: u64) -> Result<WriteResult> {
+        debug!(
+            "Zeroing {} bytes of object {} at offset {}",
+            length, oid, offset
+        );
+
+        let op = OpBuilder::new().zero(offset, length).build();
+        let result = self.execute(oid, op).await?;
+        OSDClient::check_op_result(&result, "zero")?;
+        Ok(WriteResult {
+            version: result.version,
+        })
+    }
+
+    /// Hint the OSD about an object's expected size and access pattern, as
+    /// `rados_set_alloc_hint2` does. Creates the object if it does not exist.
+    pub async fn set_alloc_hint(
+        &self,
+        oid: &str,
+        expected_object_size: u64,
+        expected_write_size: u64,
+        flags: AllocHintFlags,
+    ) -> Result<()> {
+        debug!(
+            "Setting alloc hint on object {} in pool {}: {:?}",
+            oid, self.pool_id, flags
+        );
+
+        let op = OpBuilder::new()
+            .set_alloc_hint(expected_object_size, expected_write_size, flags)
+            .build();
+        let result = self.execute(oid, op).await?;
+        OSDClient::check_op_result(&result, "set_alloc_hint")?;
+        Ok(())
     }
 
     /// Read data from an object
@@ -684,6 +726,20 @@ impl IoCtx {
         Ok(self.get_xattrs(oid).await?.into_keys().collect())
     }
 
+    /// List the clients watching an object, as `rados_list_watchers` does.
+    pub async fn list_watchers(&self, oid: impl Into<String>) -> Result<Vec<WatchItem>> {
+        let oid = oid.into();
+        debug!(
+            "Listing watchers of object '{}' in pool {}",
+            oid, self.pool_id
+        );
+
+        let op = OpBuilder::new().list_watchers().build();
+        let result = self.execute(&oid, op).await?;
+        OSDClient::check_op_result(&result, "list_watchers")?;
+        decode_list_watchers(result.first_reply()?)
+    }
+
     /// List omap keys after `start_after`.
     ///
     /// `max_return` of 0 returns no entries; pass a positive limit, which
@@ -840,8 +896,9 @@ impl IoCtx {
     /// Execute a built, possibly compound, operation on `oid`.
     ///
     /// Only checks the overall result and the first op's return code (via
-    /// `check_op_result`); return codes of later ops in a compound
-    /// operation are the caller's to inspect in the returned [`OpResult`].
+    /// `check_op_result`, where a negative code is the failure); return
+    /// codes of later ops in a compound operation are the caller's to
+    /// inspect in the returned [`OpResult`].
     pub async fn execute_op(&self, oid: impl Into<String>, op: BuiltOp) -> Result<OpResult> {
         let oid = oid.into();
         debug!("Executing op for object '{}' in pool {}", oid, self.pool_id);
