@@ -13,10 +13,13 @@
 //! one is `EEXIST`, `get` and `rm` of a missing one are `ENOENT`.
 
 use bytes::{Buf, BufMut, Bytes};
+use rados::osdclient::error::Result;
+use rados::osdclient::{IoCtx, OSDOp, OpReply};
 use rados::{Denc, RadosError, UTime, VersionedDenc, VersionedEncode};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
 
+use crate::call;
 use crate::dump;
 
 /// The class name.
@@ -73,7 +76,9 @@ impl VersionedEncode for Bucket {
             self.marker.encode(buf, features)?;
             self.bucket_id.encode(buf, features)?;
             self.explicit_placement.index_pool.encode(buf, features)?;
-            self.explicit_placement.data_extra_pool.encode(buf, features)
+            self.explicit_placement
+                .data_extra_pool
+                .encode(buf, features)
         }
     }
 
@@ -363,7 +368,10 @@ pub struct AccountResourceAddOp {
 }
 
 impl Serialize for AccountResourceAddOp {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("AccountResourceAddOp", 3)?;
         state.serialize_field("name", &self.entry.name)?;
         state.serialize_field("path", &self.entry.path)?;
@@ -410,6 +418,301 @@ pub struct AccountResourceListRet {
     pub entries: Vec<AccountResource>,
     pub truncated: bool,
     pub marker: String,
+}
+
+/// `cls_user_set_buckets`: record `entries` in the user's index. With
+/// `add`, absent buckets are inserted and existing ones keep their stats
+/// but refresh `bucket_id` and `creation_time`; without it, absent
+/// buckets are skipped and existing ones take the entries' stats. `time`
+/// becomes the header's `last_stats_update` if later.
+pub fn set_buckets_op(entries: &[BucketEntry], add: bool, time: UTime) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "set_buckets_info",
+        &SetBucketsOp {
+            entries: entries.to_vec(),
+            add,
+            time,
+        },
+    )
+}
+
+/// `cls_user_complete_stats_sync`: raise the header's `last_stats_sync`
+/// to `time`.
+pub fn complete_stats_sync_op(time: UTime) -> Result<OSDOp> {
+    call::op(CLASS, "complete_stats_sync", &CompleteStatsSyncOp { time })
+}
+
+/// `cls_user_remove_bucket`: drop `bucket` from the index and its stats
+/// from the header; a bucket that is not there is a success.
+pub fn remove_bucket_op(bucket: &Bucket) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "remove_bucket",
+        &RemoveBucketOp {
+            bucket: bucket.clone(),
+        },
+    )
+}
+
+/// `cls_user_bucket_list`: up to `max_entries` (the class caps it at
+/// 1000) entries after `marker`, stopping before the first name at or
+/// past `end_marker` when it is not empty. Decode with
+/// [`decode_list_buckets`].
+pub fn list_buckets_op(marker: &str, end_marker: &str, max_entries: i32) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "list_buckets",
+        &ListBucketsOp {
+            marker: marker.to_owned(),
+            max_entries,
+            end_marker: end_marker.to_owned(),
+        },
+    )
+}
+
+/// Decode the reply to [`list_buckets_op`].
+pub fn decode_list_buckets(reply: &OpReply) -> Result<ListBucketsRet> {
+    call::decode(reply)
+}
+
+/// `cls_user_get_header`: the op; decode with [`decode_get_header`].
+pub fn get_header_op() -> Result<OSDOp> {
+    call::op(CLASS, "get_header", &GetHeaderOp {})
+}
+
+/// Decode the reply to [`get_header_op`].
+pub fn decode_get_header(reply: &OpReply) -> Result<Header> {
+    Ok(call::decode::<GetHeaderRet>(reply)?.header)
+}
+
+/// `cls_user_reset_stats`: recompute the header's stats from every entry
+/// in one call and stamp `time`.
+pub fn reset_stats_op(time: UTime) -> Result<OSDOp> {
+    call::op(CLASS, "reset_user_stats", &ResetStatsOp { time })
+}
+
+/// `reset_user_stats2`: one page of the recompute; loop from `op.marker`
+/// while the reply is truncated. Run every page with
+/// `OpBuilder::returnvec`: the method writes (the final page rewrites the
+/// header), and the OSD clears a writing request's replies unless that
+/// flag is set. Decode the reply with [`decode_reset_stats2`].
+pub fn reset_stats2_op(op: &ResetStats2Op) -> Result<OSDOp> {
+    call::op(CLASS, "reset_user_stats2", op)
+}
+
+/// Decode the reply to [`reset_stats2_op`].
+pub fn decode_reset_stats2(reply: &OpReply) -> Result<ResetStats2Ret> {
+    call::decode(reply)
+}
+
+/// `cls_user_account_resource_add`: index `entry` by its lower-cased
+/// name. A new entry past `limit` is `EUSERS`; an existing one with
+/// `exclusive` is `EEXIST`, otherwise it is overwritten.
+pub fn account_resource_add_op(
+    entry: &AccountResource,
+    exclusive: bool,
+    limit: u32,
+) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "account_resource_add",
+        &AccountResourceAddOp {
+            entry: entry.clone(),
+            exclusive,
+            limit,
+        },
+    )
+}
+
+/// `cls_user_account_resource_get`: the op; `ENOENT` when absent. Decode
+/// with [`decode_account_resource_get`].
+pub fn account_resource_get_op(name: &str) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "account_resource_get",
+        &AccountResourceGetOp {
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// Decode the reply to [`account_resource_get_op`].
+pub fn decode_account_resource_get(reply: &OpReply) -> Result<AccountResource> {
+    Ok(call::decode::<AccountResourceGetRet>(reply)?.entry)
+}
+
+/// `cls_user_account_resource_rm`: `ENOENT` when absent.
+pub fn account_resource_rm_op(name: &str) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "account_resource_rm",
+        &AccountResourceRmOp {
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// `cls_user_account_resource_list`: up to `max_entries` (capped at 1000)
+/// resources after `marker` whose `path` starts with `path_prefix`; the
+/// reply's `marker` and `truncated` describe the omap page. Decode with
+/// [`decode_account_resource_list`].
+pub fn account_resource_list_op(
+    marker: &str,
+    path_prefix: &str,
+    max_entries: u32,
+) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "account_resource_list",
+        &AccountResourceListOp {
+            marker: marker.to_owned(),
+            path_prefix: path_prefix.to_owned(),
+            max_entries,
+        },
+    )
+}
+
+/// Decode the reply to [`account_resource_list_op`].
+pub fn decode_account_resource_list(reply: &OpReply) -> Result<AccountResourceListRet> {
+    call::decode(reply)
+}
+
+/// See [`set_buckets_op`].
+pub async fn set_buckets(
+    ioctx: &IoCtx,
+    oid: &str,
+    entries: &[BucketEntry],
+    add: bool,
+    time: UTime,
+) -> Result<()> {
+    let op = SetBucketsOp {
+        entries: entries.to_vec(),
+        add,
+        time,
+    };
+    call::exec(ioctx, oid, CLASS, "set_buckets_info", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`complete_stats_sync_op`].
+pub async fn complete_stats_sync(ioctx: &IoCtx, oid: &str, time: UTime) -> Result<()> {
+    call::exec(
+        ioctx,
+        oid,
+        CLASS,
+        "complete_stats_sync",
+        &CompleteStatsSyncOp { time },
+    )
+    .await
+    .map(drop)
+}
+
+/// See [`remove_bucket_op`].
+pub async fn remove_bucket(ioctx: &IoCtx, oid: &str, bucket: &Bucket) -> Result<()> {
+    let op = RemoveBucketOp {
+        bucket: bucket.clone(),
+    };
+    call::exec(ioctx, oid, CLASS, "remove_bucket", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`list_buckets_op`].
+pub async fn list_buckets(
+    ioctx: &IoCtx,
+    oid: &str,
+    marker: &str,
+    end_marker: &str,
+    max_entries: i32,
+) -> Result<ListBucketsRet> {
+    let op = ListBucketsOp {
+        marker: marker.to_owned(),
+        max_entries,
+        end_marker: end_marker.to_owned(),
+    };
+    let out = call::exec(ioctx, oid, CLASS, "list_buckets", &op).await?;
+    call::decode_bytes(out)
+}
+
+/// See [`get_header_op`].
+pub async fn get_header(ioctx: &IoCtx, oid: &str) -> Result<Header> {
+    let out = call::exec(ioctx, oid, CLASS, "get_header", &GetHeaderOp {}).await?;
+    Ok(call::decode_bytes::<GetHeaderRet>(out)?.header)
+}
+
+/// See [`reset_stats_op`].
+pub async fn reset_stats(ioctx: &IoCtx, oid: &str, time: UTime) -> Result<()> {
+    call::exec(
+        ioctx,
+        oid,
+        CLASS,
+        "reset_user_stats",
+        &ResetStatsOp { time },
+    )
+    .await
+    .map(drop)
+}
+
+/// See [`reset_stats2_op`].
+pub async fn reset_stats2(ioctx: &IoCtx, oid: &str, op: &ResetStats2Op) -> Result<ResetStats2Ret> {
+    let out = call::exec_returnvec(ioctx, oid, CLASS, "reset_user_stats2", op).await?;
+    call::decode_bytes(out)
+}
+
+/// See [`account_resource_add_op`].
+pub async fn account_resource_add(
+    ioctx: &IoCtx,
+    oid: &str,
+    entry: &AccountResource,
+    exclusive: bool,
+    limit: u32,
+) -> Result<()> {
+    let op = AccountResourceAddOp {
+        entry: entry.clone(),
+        exclusive,
+        limit,
+    };
+    call::exec(ioctx, oid, CLASS, "account_resource_add", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`account_resource_get_op`].
+pub async fn account_resource_get(ioctx: &IoCtx, oid: &str, name: &str) -> Result<AccountResource> {
+    let op = AccountResourceGetOp {
+        name: name.to_owned(),
+    };
+    let out = call::exec(ioctx, oid, CLASS, "account_resource_get", &op).await?;
+    Ok(call::decode_bytes::<AccountResourceGetRet>(out)?.entry)
+}
+
+/// See [`account_resource_rm_op`].
+pub async fn account_resource_rm(ioctx: &IoCtx, oid: &str, name: &str) -> Result<()> {
+    let op = AccountResourceRmOp {
+        name: name.to_owned(),
+    };
+    call::exec(ioctx, oid, CLASS, "account_resource_rm", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`account_resource_list_op`].
+pub async fn account_resource_list(
+    ioctx: &IoCtx,
+    oid: &str,
+    marker: &str,
+    path_prefix: &str,
+    max_entries: u32,
+) -> Result<AccountResourceListRet> {
+    let op = AccountResourceListOp {
+        marker: marker.to_owned(),
+        path_prefix: path_prefix.to_owned(),
+        max_entries,
+    };
+    let out = call::exec(ioctx, oid, CLASS, "account_resource_list", &op).await?;
+    call::decode_bytes(out)
 }
 
 #[cfg(test)]
@@ -478,7 +781,10 @@ mod tests {
         let bytes = encode_with_capacity(&test_bucket(0), 0).expect("encode");
         assert_eq!(bytes.as_ref(), &test_bucket_wire(0)[..]);
         assert_eq!(&bytes[..2], &[7, 3]);
-        assert_eq!(Bucket::decode(&mut bytes.clone(), 0).expect("decode"), test_bucket(0));
+        assert_eq!(
+            Bucket::decode(&mut bytes.clone(), 0).expect("decode"),
+            test_bucket(0)
+        );
     }
 
     #[test]
@@ -493,7 +799,10 @@ mod tests {
         c.extend_from_slice(&str_wire("bucket.id.1"));
         c.extend_from_slice(&str_wire("default-placement"));
         assert_eq!(bytes.as_ref(), &frame(9, 8, &c)[..]);
-        assert_eq!(Bucket::decode(&mut bytes.clone(), 0).expect("decode"), bucket);
+        assert_eq!(
+            Bucket::decode(&mut bytes.clone(), 0).expect("decode"),
+            bucket
+        );
     }
 
     #[test]
@@ -536,7 +845,10 @@ mod tests {
         c.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(c.len(), 94);
         assert_eq!(bytes.as_ref(), &frame(9, 5, &c)[..]);
-        assert_eq!(BucketEntry::decode(&mut bytes.clone(), 0).expect("decode"), entry);
+        assert_eq!(
+            BucketEntry::decode(&mut bytes.clone(), 0).expect("decode"),
+            entry
+        );
     }
 
     #[test]
@@ -703,5 +1015,60 @@ mod tests {
                 "last_stats_update": "2.000000"
             }})
         );
+    }
+
+    #[test]
+    fn ops_name_the_class_and_method() {
+        use rados::osdclient::types::OpData;
+
+        let op = list_buckets_op("m", "", 10).expect("op");
+        assert!(op.indata.starts_with(b"userlist_buckets"));
+        assert!(matches!(
+            op.op_data,
+            OpData::Call {
+                class_len: 4,
+                method_len: 12,
+                ..
+            }
+        ));
+        let op = get_header_op().expect("op");
+        assert!(op.indata.starts_with(b"userget_header"));
+        assert!(matches!(op.op_data, OpData::Call { indata_len: 6, .. }));
+        let op = account_resource_list_op("", "/p", 5).expect("op");
+        assert!(op.indata.starts_with(b"useraccount_resource_list"));
+    }
+
+    #[test]
+    fn decoders_unwrap_the_replies() {
+        let ret = ListBucketsRet {
+            entries: vec![test_entry(2)],
+            marker: s("buck.2"),
+            truncated: true,
+        };
+        let reply = rados::OpReply {
+            return_code: 0,
+            outdata: encode_with_capacity(&ret, 0).expect("encode"),
+        };
+        assert_eq!(decode_list_buckets(&reply).expect("decode"), ret);
+
+        let header = Header {
+            stats: Stats {
+                total_entries: 1,
+                total_bytes: 2,
+                total_bytes_rounded: 3,
+            },
+            ..Header::default()
+        };
+        let reply = rados::OpReply {
+            return_code: 0,
+            outdata: encode_with_capacity(
+                &GetHeaderRet {
+                    header: header.clone(),
+                },
+                0,
+            )
+            .expect("encode"),
+        };
+        assert_eq!(decode_get_header(&reply).expect("decode"), header);
     }
 }
