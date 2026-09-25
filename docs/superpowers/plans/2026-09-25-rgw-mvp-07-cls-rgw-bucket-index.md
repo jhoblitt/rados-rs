@@ -278,7 +278,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 
 **Interfaces:**
 - `pub const CLASS: &str = "rgw"` (in `rgw/mod.rs`, shared by every rgw
-  method module), `pub const ERR_BUSY_RESHARDING: i32 = 2300`.
+  method module), `pub const ERR_BUSY_RESHARDING: i32 = 2300`. This is
+  the `rgw` feature's first class call, so `feature = "rgw"` joins the
+  `mod call` gate in `lib.rs` in this commit.
 - Op constructors, `-> Result<OSDOp>`: `init_index_op()` (raw, empty);
   `set_tag_timeout_op(u64)`; `prepare_op(&PrepareOp)`;
   `complete_op(&CompleteOp)`; `list_op(&ListOp)`; `dir_header_op()`

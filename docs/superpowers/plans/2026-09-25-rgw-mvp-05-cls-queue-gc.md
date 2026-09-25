@@ -47,9 +47,10 @@ dependencies). Plus:
   `exec`, `exec_raw`, `decode`, `decode_bytes`; request-less methods use
   `raw_op`/`exec_raw` with `Bytes::new()`.
 - Features: `queue = []`, `rgw = []`, `rgw_gc = ["queue", "rgw"]`;
-  `lib.rs` gates `mod call` on `any(...)` of every class feature, and the
-  CI step "Run clippy on each rados-cls class alone" loops over every
-  feature name.
+  `lib.rs` gates `mod call` on `any(...)` of every feature whose module
+  calls a class (not `rgw`, which holds only types here), and the CI step
+  "Run clippy on each rados-cls class alone" loops over every feature
+  name.
 - A `ceph::real_time` that `dump` streams with `dump_stream(...) << t`
   (as `cls_rgw_gc_obj_info::dump` does) prints through
   `operator<<(ostream&, real_time)`: ISO 8601 in the process's local zone
@@ -1436,9 +1437,10 @@ pub struct RemoveOp {
 ```
 
 `Cargo.toml`: `rgw = []`, in `default`. `lib.rs`: `#[cfg(feature =
-"rgw")] pub mod rgw;` and `rgw` in the `mod call` gate (the module does
-not call yet, but the gate lists every class feature so the rule stays
-mechanical). `ci.yml`: `rgw` in the loop.
+"rgw")] pub mod rgw;`. The `mod call` gate lists the classes that call,
+and `rgw` makes no class calls yet, so it stays out (a lone `rgw` build
+would otherwise warn on every unused helper; `rgw` joins the gate with
+its first methods in plan 7). `ci.yml`: `rgw` in the loop.
 
 Dencoder: import `rados_cls::rgw::gc::{DeferEntryOp as RgwGcDeferEntryOp,
 ListOp as RgwGcListOp, ListRet as RgwGcListRet, RemoveOp as
