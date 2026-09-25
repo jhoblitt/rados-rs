@@ -1416,6 +1416,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rados-dencoder"
+version = "0.1.4"
+dependencies = [
+ "bytes",
+ "rados",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

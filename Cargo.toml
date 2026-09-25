@@ -2,6 +2,7 @@
 members = [
     "rados",
     "rados-denc-macros",
+    "rados-dencoder",
     "examples",
 ]
 resolver = "3"
