@@ -9,7 +9,7 @@
 //! [`rados::OSDClientError::Denc`].
 
 // A build with no class has no caller for `call`, so it stays out.
-#[cfg(feature = "version")]
+#[cfg(any(feature = "version", feature = "refcount"))]
 mod call;
 
 #[cfg(feature = "refcount")]

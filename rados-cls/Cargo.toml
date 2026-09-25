@@ -9,10 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-# The list grows as classes land; each one adds itself here and to
-# default.
-default = ["version"]
+# Every class is on by default so the workspace's tests and lints cover
+# them; a client that calls only some classes turns defaults off and
+# names the ones it uses.
+default = ["version", "refcount"]
 version = []
+refcount = []
 
 [dependencies]
 rados = { path = "../rados", version = "0.1.4" }

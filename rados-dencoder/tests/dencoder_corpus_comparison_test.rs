@@ -107,6 +107,12 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_version_inc_op", None, false),
     TypeSpec::new("cls_version_check_op", None, false),
     TypeSpec::new("cls_version_read_ret", None, false),
+    TypeSpec::new("cls_refcount_get_op", None, false),
+    TypeSpec::new("cls_refcount_put_op", None, false),
+    TypeSpec::new("cls_refcount_set_op", None, false),
+    TypeSpec::new("cls_refcount_read_op", None, false),
+    TypeSpec::new("cls_refcount_read_ret", None, false),
+    TypeSpec::new("obj_refcount", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

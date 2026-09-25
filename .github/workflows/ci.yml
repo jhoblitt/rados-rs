@@ -57,6 +57,16 @@ jobs:
           -D warnings
           -D clippy::uninlined_format_args
 
+      - name: Run clippy on each rados-cls class alone
+        # A client that calls only some classes turns the defaults off and
+        # names the ones it uses, so every single-class build (and the
+        # empty one) must be warning-free too. The lib only: the cluster
+        # tests need every class.
+        run: |
+          for features in "" version refcount; do
+            cargo clippy -p rados-cls --no-default-features --features "$features" -- -D warnings -D clippy::uninlined_format_args
+          done
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
