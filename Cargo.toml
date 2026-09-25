@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "rados",
+    "rados-cls",
     "rados-denc-macros",
     "rados-dencoder",
     "examples",
