@@ -99,7 +99,10 @@ jobs:
           RUST_LOG: info
 
       - name: Run rados-cls Integration Tests (CRC enabled)
-        run: cargo test -p rados-cls --test cls_version_refcount -- --ignored --nocapture
+        run: |
+          for test in cls_version_refcount cls_user; do
+            cargo test -p rados-cls --test "$test" -- --ignored --nocapture
+          done
         env:
           RADOS_MS_CRC_DATA: "true"
           RUST_BACKTRACE: full
@@ -116,7 +119,10 @@ jobs:
           RUST_LOG: info
 
       - name: Run rados-cls Integration Tests (CRC disabled)
-        run: cargo test -p rados-cls --test cls_version_refcount -- --ignored --nocapture
+        run: |
+          for test in cls_version_refcount cls_user; do
+            cargo test -p rados-cls --test "$test" -- --ignored --nocapture
+          done
         env:
           RADOS_MS_CRC_DATA: "false"
           RUST_BACKTRACE: full

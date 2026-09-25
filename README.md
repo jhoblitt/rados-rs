@@ -19,7 +19,7 @@ The workspace contains three published crates plus two non-published packages:
 |---|---|
 | `rados` | Main library crate (`denc`, `auth`, `cephconfig`, `crush`, `msgr2`, `monclient`, `osdclient` modules). |
 | `rados-denc-macros` | Proc-macro crate providing DENC derive macros. |
-| `rados-cls` | Client-side encodings for Ceph object classes (`version`, `refcount`), one module per class behind a feature of the same name. |
+| `rados-cls` | Client-side encodings for Ceph object classes (`version`, `refcount`, `user`), one module per class behind a feature of the same name. |
 | `rados-dencoder` | Non-published `ceph-dencoder` work-alike: the `dencoder` binary the corpus comparison test drives. |
 | `examples` | Non-published root examples package, including the `rados` CLI example. |
 

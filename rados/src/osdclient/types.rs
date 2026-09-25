@@ -164,6 +164,12 @@ bitflags::bitflags! {
         /// Force op even if cluster is full.
         /// Mirrors `CEPH_OSD_FLAG_FULL_FORCE`.
         const FULL_FORCE = 0x1000000;
+        /// Return each op's result and output data on a successful write,
+        /// which the OSD otherwise clears; an op's data past
+        /// `osd_max_write_op_reply_len` (64 bytes by default) fails the
+        /// request with `EOVERFLOW`. Mirrors `CEPH_OSD_FLAG_RETURNVEC`
+        /// (`librados::OPERATION_RETURNVEC`).
+        const RETURNVEC = 0x4000000;
     }
 }
 

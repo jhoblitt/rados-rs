@@ -39,6 +39,27 @@ pub(crate) async fn exec_raw(
     ioctx.exec(oid, class, method, indata).await
 }
 
+/// Send one class call on `oid` as a write whose reply is wanted:
+/// `OpBuilder::returnvec` keeps the method's output data, which the OSD
+/// otherwise clears on a successful write, up to
+/// `osd_max_write_op_reply_len` (64 bytes by default; more is
+/// `EOVERFLOW`). Only the `user` class has such a method so far.
+#[cfg(feature = "user")]
+pub(crate) async fn exec_returnvec<R: Denc>(
+    ioctx: &IoCtx,
+    oid: &str,
+    class: &str,
+    method: &str,
+    req: &R,
+) -> Result<Bytes> {
+    let op = rados::OpBuilder::new()
+        .op(raw_op(class, method, encode_with_capacity(req, 0)?)?)
+        .returnvec()
+        .build();
+    let result = ioctx.execute_op(oid, op).await?;
+    Ok(result.first_outdata()?.clone())
+}
+
 /// Decode a reply struct from an op's outdata.
 pub(crate) fn decode<T: Denc>(reply: &OpReply) -> Result<T> {
     decode_bytes(reply.outdata.clone())

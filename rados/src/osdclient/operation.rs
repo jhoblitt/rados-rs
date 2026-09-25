@@ -253,6 +253,17 @@ impl OpBuilder {
         self
     }
 
+    /// Ask for each op's result and output data even though the operation
+    /// writes; without it the OSD returns only the overall result. A class
+    /// method that writes and replies (`cls_user`'s `reset_user_stats2`)
+    /// needs this. The OSD caps each op's returned data at
+    /// `osd_max_write_op_reply_len`, 64 bytes by default, and answers a
+    /// larger reply with `EOVERFLOW`.
+    pub fn returnvec(mut self) -> Self {
+        self.flags |= OsdOpFlags::RETURNVEC;
+        self
+    }
+
     /// Set operation priority
     ///
     /// Higher values = higher priority. Default is -1 (use system default).
@@ -509,6 +520,19 @@ mod tests {
 
         assert!(op.flags.contains(OsdOpFlags::BALANCE_READS));
         assert!(op.flags.contains(OsdOpFlags::READ));
+    }
+
+    #[test]
+    fn returnvec_adds_the_flag_and_keeps_the_ops() {
+        let op = OpBuilder::new()
+            .write_full(vec![1, 2, 3])
+            .returnvec()
+            .build();
+
+        assert!(op.flags.contains(OsdOpFlags::RETURNVEC));
+        assert!(op.flags.contains(OsdOpFlags::WRITE));
+        assert_eq!(op.flags.bits() & 0x4000000, 0x4000000);
+        assert_eq!(op.ops.len(), 1);
     }
 
     #[test]
