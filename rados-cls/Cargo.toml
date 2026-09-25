@@ -12,7 +12,7 @@ homepage.workspace = true
 # Every class is on by default so the workspace's tests and lints cover
 # them; a client that calls only some classes turns defaults off and
 # names the ones it uses.
-default = ["version", "refcount"]
+default = ["version", "refcount", "user"]
 version = []
 refcount = []
 user = []
