@@ -264,9 +264,16 @@ pub struct UserBucket {
 }
 
 /// `rgw_cls_usage_log_add_op`: entries to fold into the log. `user` is
-/// never set by the C++ client nor read by the class.
+/// never set by the C++ client nor read by the class. Version 2 added
+/// `user`; the decoder floors at version 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
-#[denc(crate = "rados", version = 2, compat = 1)]
+#[denc(
+    crate = "rados",
+    version = 2,
+    compat = 1,
+    min_version = 2,
+    ceph_release = "Jewel v10+"
+)]
 pub struct AddOp {
     pub info: UsageLogInfo,
     pub user: String,
@@ -1000,5 +1007,19 @@ mod tests {
             outdata: encode_with_capacity(&ret, 0).expect("encode"),
         };
         assert_eq!(decode_read(&reply).expect("decode"), ret);
+    }
+
+    #[test]
+    fn add_op_floors_at_version_2() {
+        let mut wire = bytes(&AddOp::default());
+        wire[..2].copy_from_slice(&[1, 1]);
+        let err = AddOp::decode(&mut &wire[..], 0).expect_err("version 1");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(rados::CodecError::VersionTooOld { got: 1, min: 2, .. })
+            ),
+            "{err:?}"
+        );
     }
 }
