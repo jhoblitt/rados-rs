@@ -29,6 +29,7 @@ pub mod snapshot;
 pub(crate) mod throttle;
 pub(crate) mod tracker;
 pub mod types;
+pub mod watch;
 pub mod watchers;
 
 // Re-export commonly used types
@@ -47,8 +48,9 @@ pub use snapshot::SnapId;
 pub use types::{
     AllocHintFlags, OSDOp, ObjectId, ObjectLocator, OpCode, OpReply, OpResult, OpState, OpTarget,
     OsdOpFlags, PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId,
-    WriteResult,
+    WatchOp, WriteResult,
 };
+pub use watch::{NotifyAck, NotifyResult, NotifyTimeout, WatchEvent, Watcher, decode_notify_reply};
 pub use watchers::{ListWatchersReply, WatchItem};
 
 pub use messages::MOSDOp;

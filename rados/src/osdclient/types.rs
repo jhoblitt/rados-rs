@@ -624,6 +624,12 @@ pub enum OpCode {
     ListSnaps = osd_op!(RD, DATA, 10),
     /// List the object's watchers: __CEPH_OSD_OP(RD, DATA, 9) = LIST_WATCHERS
     ListWatchers = osd_op!(RD, DATA, 9),
+    /// Register, reconnect, ping or remove a watch: __CEPH_OSD_OP(WR, DATA, 15)
+    Watch = osd_op!(WR, DATA, 15),
+    /// Notify an object's watchers: __CEPH_OSD_OP(RD, DATA, 6)
+    Notify = osd_op!(RD, DATA, 6),
+    /// Acknowledge a notify as a watcher: __CEPH_OSD_OP(RD, DATA, 7)
+    NotifyAck = osd_op!(RD, DATA, 7),
     /// Roll back object HEAD to a prior snapshot: __CEPH_OSD_OP(WR, DATA, 14)
     Rollback = osd_op!(WR, DATA, 14),
     /// CEPH_OSD_OP_OMAPGETKEYS
@@ -704,8 +710,37 @@ pub enum OpData {
         expected_write_size: u64,
         flags: u32,
     },
+    /// Watch sub-operation (`ceph_osd_op.watch`); `ver` is unused by the OSD
+    Watch {
+        cookie: u64,
+        ver: u64,
+        op: u8,
+        generation: u32,
+        timeout: u32,
+    },
+    /// Notify (`ceph_osd_op.notify`): the notifier's own linger cookie
+    Notify { cookie: u64 },
     /// Operations with no specific data
     None,
+}
+
+/// `CEPH_OSD_WATCH_OP_*`: the sub-operation a `WATCH` op carries.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive,
+)]
+#[repr(u8)]
+pub enum WatchOp {
+    /// Remove the watch.
+    Unwatch = 0,
+    /// librados v1 watch; this crate does not send it.
+    LegacyWatch = 1,
+    /// Register the watch.
+    Watch = 3,
+    /// Re-establish a registered watch on a new session or PG interval.
+    Reconnect = 5,
+    /// Keep the watch alive; the OSD answers `-ETIMEDOUT` when it wants a
+    /// reconnect and `-ENOTCONN` when the watch is gone.
+    Ping = 7,
 }
 
 /// Single OSD operation
@@ -1219,6 +1254,75 @@ impl OSDOp {
         }
     }
 
+    /// A `WATCH` op with sub-op `op` and generation 0, as
+    /// `ObjectOperation::watch` builds it. `timeout` is the watch timeout
+    /// in seconds, 0 for the OSD's `osd_client_watch_timeout`.
+    pub fn watch(cookie: u64, op: WatchOp, timeout: u32) -> Self {
+        Self::watch_op(cookie, op, 0, timeout)
+    }
+
+    /// A `WATCH{PING}` tagged with the registration generation it pings.
+    pub fn watch_ping(cookie: u64, generation: u32) -> Self {
+        Self::watch_op(cookie, WatchOp::Ping, generation, 0)
+    }
+
+    /// A `WATCH{RECONNECT}` carrying the new registration generation.
+    pub fn watch_reconnect(cookie: u64, generation: u32) -> Self {
+        Self::watch_op(cookie, WatchOp::Reconnect, generation, 0)
+    }
+
+    fn watch_op(cookie: u64, op: WatchOp, generation: u32, timeout: u32) -> Self {
+        Self {
+            op: OpCode::Watch,
+            flags: 0,
+            op_data: OpData::Watch {
+                cookie,
+                ver: 0,
+                op: op.into(),
+                generation,
+                timeout,
+            },
+            indata: Bytes::new(),
+        }
+    }
+
+    /// A `NOTIFY` op, as `ObjectOperation::notify` builds it: the union
+    /// holds the notifier's linger cookie, and the indata is protocol
+    /// version 1, the timeout in seconds (0 lets the OSD apply its own
+    /// default) and the length-prefixed payload. The reply's outdata is the
+    /// `u64` notify id.
+    pub fn notify(cookie: u64, timeout_secs: u32, payload: Bytes) -> Self {
+        use bytes::BufMut;
+        let mut indata = bytes::BytesMut::with_capacity(12 + payload.len());
+        indata.put_u32_le(1);
+        indata.put_u32_le(timeout_secs);
+        indata.put_u32_le(payload.len() as u32);
+        indata.extend_from_slice(&payload);
+        Self {
+            op: OpCode::Notify,
+            flags: 0,
+            op_data: OpData::Notify { cookie },
+            indata: indata.freeze(),
+        }
+    }
+
+    /// A `NOTIFY_ACK` op: the notify id, the acking watch's cookie and the
+    /// length-prefixed reply, all in the indata; the union is unused.
+    pub fn notify_ack(notify_id: u64, cookie: u64, reply: Bytes) -> Self {
+        use bytes::BufMut;
+        let mut indata = bytes::BytesMut::with_capacity(20 + reply.len());
+        indata.put_u64_le(notify_id);
+        indata.put_u64_le(cookie);
+        indata.put_u32_le(reply.len() as u32);
+        indata.extend_from_slice(&reply);
+        Self {
+            op: OpCode::NotifyAck,
+            flags: 0,
+            op_data: OpData::None,
+            indata: indata.freeze(),
+        }
+    }
+
     /// Roll back object HEAD to a prior pool snapshot (ROLLBACK)
     ///
     /// # Arguments
@@ -1496,6 +1600,44 @@ mod tests {
         assert_eq!(OpCode::ListXattrs as u16, 0x1302); // __CEPH_OSD_OP(RD, ATTR, 2)
         assert_eq!(OpCode::Pgnls as u16, 0x1505); // __CEPH_OSD_OP(RD, PG, 5)
         assert_eq!(OpCode::Call as u16, 0x1401); // __CEPH_OSD_OP(RD, EXEC, 1)
+    }
+
+    #[test]
+    fn watch_notify_opcodes_match_rados_h() {
+        assert_eq!(OpCode::Watch as u16, 0x220f); // __CEPH_OSD_OP(WR, DATA, 15)
+        assert_eq!(OpCode::Notify as u16, 0x1206); // __CEPH_OSD_OP(RD, DATA, 6)
+        assert_eq!(OpCode::NotifyAck as u16, 0x1207); // __CEPH_OSD_OP(RD, DATA, 7)
+        assert!(OpCode::Watch.is_write() && !OpCode::Watch.is_read());
+        assert!(OpCode::Notify.is_read() && !OpCode::Notify.is_write());
+        assert!(OpCode::NotifyAck.is_read() && !OpCode::NotifyAck.is_write());
+    }
+
+    #[test]
+    fn notify_indata_is_version_timeout_and_payload() {
+        let op = OSDOp::notify(1, 10, Bytes::from_static(b"hi"));
+        assert_eq!(
+            op.indata.as_ref(),
+            &[1, 0, 0, 0, 0x0a, 0, 0, 0, 2, 0, 0, 0, 0x68, 0x69]
+        );
+    }
+
+    #[test]
+    fn notify_ack_indata_is_id_cookie_and_reply() {
+        let op = OSDOp::notify_ack(5, 6, Bytes::from_static(b"r"));
+        let mut want = 5u64.to_le_bytes().to_vec();
+        want.extend_from_slice(&6u64.to_le_bytes());
+        want.extend_from_slice(&[1, 0, 0, 0, 0x72]);
+        assert_eq!(op.indata.as_ref(), want.as_slice());
+        assert!(matches!(op.op_data, OpData::None));
+    }
+
+    #[test]
+    fn watch_op_values_match_rados_h() {
+        assert_eq!(u8::from(WatchOp::Unwatch), 0);
+        assert_eq!(u8::from(WatchOp::LegacyWatch), 1);
+        assert_eq!(u8::from(WatchOp::Watch), 3);
+        assert_eq!(u8::from(WatchOp::Reconnect), 5);
+        assert_eq!(u8::from(WatchOp::Ping), 7);
     }
 
     #[test]
