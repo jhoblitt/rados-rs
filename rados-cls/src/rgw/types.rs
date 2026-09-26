@@ -109,37 +109,6 @@ pub struct GcObjInfo {
     pub time: UTime,
 }
 
-/// A one-byte Ceph enum. Ceph decodes any byte and later releases add
-/// values, so the newtype keeps the byte; the constants name the values
-/// v19 knows.
-macro_rules! byte_enum {
-    ($(#[$doc:meta])* $name:ident { $($k:ident = $v:expr),* $(,)? }) => {
-        $(#[$doc])*
-        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-        #[serde(transparent)]
-        pub struct $name(pub u8);
-
-        impl $name {
-            $(pub const $k: Self = Self($v);)*
-        }
-
-        impl Denc for $name {
-            fn encode<B: BufMut>(&self, buf: &mut B, features: u64) -> std::result::Result<(), RadosError> {
-                self.0.encode(buf, features)
-            }
-
-            fn decode<B: Buf>(buf: &mut B, features: u64) -> std::result::Result<Self, RadosError> {
-                Ok(Self(u8::decode(buf, features)?))
-            }
-
-            fn encoded_size(&self, _features: u64) -> Option<usize> {
-                Some(1)
-            }
-        }
-    };
-}
-pub(crate) use byte_enum;
-
 byte_enum! {
     /// `RGWObjCategory`: what a bucket-index entry accounts for. Dumps as a number.
     ObjCategory { NONE = 0, MAIN = 1, SHADOW = 2, MULTI_META = 3, CLOUD_TIERED = 4 }
