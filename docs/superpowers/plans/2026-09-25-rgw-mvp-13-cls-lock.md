@@ -27,7 +27,7 @@ reuses them.
 
 **Tech Stack:** as plan 3.
 
-**Spec:** `docs/superpowers/specs/2026-09-24-rados-rs-rgw-mvp-design.md`,
+**Spec:** `docs/superpowers/specs/2026-09-24-rados-rs-rgw-mvp-design.md` (in the clone, the copy at `.superpowers/plan-copies/2026-09-24-rados-rs-rgw-mvp-design.md`),
 "`cls-lock`: lock, unlock, break, get info, set cookie, assert locked,
 with radosgw's lock names, cookies and durations documented per worker".
 Placement as the spec's crate-layout section states: the seven-method
@@ -75,7 +75,7 @@ dependencies). Plus:
 - Oracle: `ceph-dencoder` from `quay.io/ceph/ceph:v19.2.2`
   (`/tmp/claude/ceph-dencoder`); raw captures and the script that made
   them are in `/tmp/claude/cls-lock-oracle/` (`run.sh`, `<type>.<N>.bin`,
-  `ea.<N>.bin` for `entity_addr_t`). **`select_test` counts from 1** and
+  `ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file) for `entity_addr_t`). **`select_test` counts from 1** and
   `0` wraps to the last instance: `select_test 1` is the populated
   instance, `select_test 2` the default-constructed one (§2.12). Every
   pin below says which.
@@ -173,7 +173,7 @@ are not touched.
   Today family 0 gives 0 and other families 128 (`STORAGE_SIZE`). The doc
   comment says it mirrors `entity_addr_t::get_sockaddr_len`.
   `encoded_size` follows.
-- Pins (from `/tmp/claude/cls-lock-oracle/ea.<N>.bin`, 47 bytes each):
+- Pins (from `/tmp/claude/cls-lock-oracle/ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)``, 47 bytes each):
   `entity_addr_t` `select_test 1` = `EntityAddr { addr_type: None, nonce:
   0, sockaddr_data: zeros }` =
   `0101012800000000000000000000001c000000` + 56 hex zeros;
@@ -257,8 +257,8 @@ Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 - Observe the IPv6 and family-1 strings first: write these marker-1
   `entity_addr_t` encodings (Legacy, `sockaddr_in6` = family 10 LE, port
   BE, flowinfo, 16 address bytes, scope id) to
-  `/tmp/claude/cls-lock-oracle/ea.<N>.bin` and run `ceph-dencoder type
-  entity_addr_t import ea.<N>.bin decode dump_json` (unsandboxed); the
+  `/tmp/claude/cls-lock-oracle/ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)`` and run `ceph-dencoder type
+  entity_addr_t import ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)` decode dump_json` (unsandboxed); the
   `addr` field is the pin's `<sockaddr>` part, with `/<nonce>` appended:
   - `::1.2.3.4` port 1 nonce 0:
     `0101012800000001000000000000001c0000000a000001000000000000000000000000000000000102030400000000`
@@ -774,3 +774,7 @@ sockaddr printer (it prints IPv6 uncompressed and a fixed family 0);
 behavior for the driver. Outside rados-rs: rgw-go's
 `docs/exclusions.md` lock bullet should drop `bucket_instance_lock` and
 the registry lock and add `RGWCompleteMultipart` (§4.9).
+
+## Pre-flight (2026-09-25, against 3fe03d3)
+
+- Every tree claim verified (`.superpowers/sdd/2026-09-25-rgw-mvp-13-cls-lock/preflight.md`, 47 rows): `sockaddr_len` returns 0 for family 0 and 128 for other families (`rados/src/denc/entity_addr.rs:189-197`), the existing test asserts 19; `PackedEntityName` derives no `Ord`/`Display`/`Hash` (derive `Hash`; write `Ord`/`PartialOrd` by hand since zerocopy's `U64` orders unsigned); `LockType`/`LockFlags` are public with the C++ values and re-exported, without `Denc`; the oracle directory holds `ea.1`-`ea.3` and the 22 struct captures, all matching the pins; the five IPv6/family-1 captures are the implementer's to make. Note for test 1: a compound `assert_exists` + class call goes out with only the READ flag (`OpCode::Call` is `RD|EXEC`), as every class write call in the crate already does; the OSD classifies the op by the method's flags.
