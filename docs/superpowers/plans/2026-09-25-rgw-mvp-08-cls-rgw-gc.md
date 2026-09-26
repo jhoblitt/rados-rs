@@ -49,8 +49,9 @@ Plans 3 to 7's Global Constraints apply unchanged. Plus:
   `ECANCELED` or `EPERM`; `RGWGC::list` reads a shard's omap entries and
   its `obj_version` until the shard proves transitioned; `gc_remove`
   retires processed tags on untransitioned shards; `gc_defer_entry` has
-  no caller in v19 (`RGWRados::defer_gc` is disabled) and is deleted in
-  `main`.
+  no caller in v19 (`RGWRados::defer_gc`, its only route, is called by
+  nothing); `main` removes `defer_gc` and `RGWGC::async_defer_chain`
+  but the class still registers the method.
 
 ## Review Focus
 
