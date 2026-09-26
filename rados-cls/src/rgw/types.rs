@@ -209,6 +209,12 @@ impl ReshardStatus {
     }
 }
 
+byte_enum! {
+    /// `RGWCheckMTimeType`: how `obj_check_mtime` compares the object's
+    /// mtime (left) with the request's (right).
+    CheckMtimeType { EQ = 0, LT = 1, LE = 2, GT = 3, GE = 4 }
+}
+
 /// `rgw_bucket_dir_entry` flag bits.
 pub const FLAG_VER: u16 = 0x1;
 pub const FLAG_CURRENT: u16 = 0x2;
