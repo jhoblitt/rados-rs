@@ -175,6 +175,18 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_lc_entry", None, false),
     // No corpus directory and no test instances.
     TypeSpec::new("cls_rgw_lc_obj_head", None, false),
+    TypeSpec::new("rgw_cls_tag_timeout_op", None, false),
+    TypeSpec::new("rgw_cls_obj_prepare_op", None, false),
+    TypeSpec::new("rgw_cls_obj_complete_op", None, false),
+    TypeSpec::new("rgw_cls_list_op", None, false),
+    TypeSpec::new("rgw_cls_list_ret", None, false),
+    TypeSpec::new("rgw_cls_check_index_ret", None, false),
+    TypeSpec::new("rgw_cls_obj_remove_op", None, false),
+    TypeSpec::new("rgw_cls_obj_store_pg_ver_op", None, false),
+    TypeSpec::new("rgw_cls_obj_check_attrs_prefix", None, false),
+    TypeSpec::new("cls_rgw_set_bucket_resharding_op", None, false),
+    TypeSpec::new("cls_rgw_clear_bucket_resharding_op", None, false),
+    TypeSpec::new("cls_rgw_guard_bucket_resharding_op", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];
