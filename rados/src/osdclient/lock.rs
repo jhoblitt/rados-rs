@@ -7,20 +7,75 @@ use bytes::{Buf, BufMut};
 use std::time::Duration;
 
 /// Lock type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum LockType {
+    #[default]
     None = 0,
     Exclusive = 1,
     Shared = 2,
     ExclusiveEphemeral = 3,
 }
 
+impl TryFrom<u8> for LockType {
+    type Error = RadosError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(LockType::None),
+            1 => Ok(LockType::Exclusive),
+            2 => Ok(LockType::Shared),
+            3 => Ok(LockType::ExclusiveEphemeral),
+            _ => Err(RadosError::InvalidData(format!(
+                "invalid cls_lock type {value}"
+            ))),
+        }
+    }
+}
+
+/// One byte, `ClsLockType`. C++ decoders cast any byte to the enum; this
+/// one refuses an unknown byte with `RadosError::InvalidData`. Only a
+/// request the class would reject with `EINVAL` can carry one: `lock`
+/// validates the type before storing it, so a stored lock never does.
+impl Denc for LockType {
+    fn encode<B: BufMut>(&self, buf: &mut B, _features: u64) -> Result<(), RadosError> {
+        buf.put_u8(*self as u8);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B, features: u64) -> Result<Self, RadosError> {
+        LockType::try_from(<u8 as Denc>::decode(buf, features)?)
+    }
+
+    fn encoded_size(&self, _features: u64) -> Option<usize> {
+        Some(1)
+    }
+}
+
 bitflags::bitflags! {
     /// Lock flags
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct LockFlags: u8 {
         const MAY_RENEW = 0x01;
         const MUST_RENEW = 0x02;
+    }
+}
+
+/// One byte; unknown bits are kept, as the C++ decoder keeps any byte.
+impl Denc for LockFlags {
+    fn encode<B: BufMut>(&self, buf: &mut B, _features: u64) -> Result<(), RadosError> {
+        buf.put_u8(self.bits());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B, features: u64) -> Result<Self, RadosError> {
+        Ok(LockFlags::from_bits_retain(<u8 as Denc>::decode(
+            buf, features,
+        )?))
+    }
+
+    fn encoded_size(&self, _features: u64) -> Option<usize> {
+        Some(1)
     }
 }
 
@@ -89,6 +144,38 @@ pub struct UnlockRequest {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+
+    fn round_trip<T: Denc + PartialEq + std::fmt::Debug>(value: T, byte: u8) {
+        let mut buf = BytesMut::new();
+        value.encode(&mut buf, 0).expect("encode");
+        assert_eq!(&buf[..], &[byte]);
+        assert_eq!(value.encoded_size(0), Some(1));
+        assert_eq!(T::decode(&mut &[byte][..], 0).expect("decode"), value);
+    }
+
+    #[test]
+    fn lock_type_and_flags_are_one_byte() {
+        round_trip(LockType::None, 0);
+        round_trip(LockType::Exclusive, 1);
+        round_trip(LockType::Shared, 2);
+        round_trip(LockType::ExclusiveEphemeral, 3);
+        round_trip(LockFlags::empty(), 0);
+        round_trip(LockFlags::MAY_RENEW, 1);
+        round_trip(LockFlags::MUST_RENEW, 2);
+        round_trip(LockFlags::from_bits_retain(0x04), 4);
+    }
+
+    #[test]
+    fn unknown_lock_type_is_refused() {
+        assert!(LockType::try_from(4).is_err());
+        assert!(LockType::decode(&mut &[4u8][..], 0).is_err());
+    }
+
+    #[test]
+    fn lock_type_and_flags_defaults() {
+        assert_eq!(LockType::default(), LockType::None);
+        assert_eq!(LockFlags::default(), LockFlags::empty());
+    }
 
     #[test]
     fn test_unlock_request_encodes_ceph_version_header() {
