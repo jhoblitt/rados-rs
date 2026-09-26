@@ -1,15 +1,39 @@
 //! The bucket index: from `cls_rgw_types.h`, the entry and its parts,
 //! the dir header and dir, the bilog entry, and the bucket-instance and
 //! reshard entries; from `cls_rgw_ops.h`, the request and reply structs
-//! of the bucket-index, resharding and head-object methods.
+//! of the bucket-index, resharding and head-object methods; and, as
+//! `cls_rgw_client.h` has them, those methods' op constructors and
+//! async calls.
+//!
+//! The index writes ([`prepare`], [`complete`], [`suggest_changes`],
+//! [`rebuild_index`], [`update_stats`], [`set_tag_timeout`]) take no
+//! resharding guard of their own: Ceph v19's class does not guard itself,
+//! and RGW decides per call site to put [`guard_op`] in front of the
+//! write in one compound operation, which then fails with
+//! `OSDError { code: -ERR_BUSY_RESHARDING }` while the shard reshards.
+//! The `*_op` constructors are for building that compound.
+//!
+//! Server facts (Ceph v19 `cls_rgw.cc`): a second [`init_index`] is
+//! `EINVAL`, so RGW creates the shard with `create(exclusive)` first to
+//! get `EEXIST`; every header write bumps `ver`. `bucket_list` skips
+//! entries flagged `FLAG_VER_MARKER`; without `list_versions` it also
+//! skips entries that are not visible and any entry named like
+//! `start_obj`; it collapses names under `delimiter` into one entry
+//! flagged `FLAG_COMMON_PREFIX`; it never returns the `0x80` namespace.
+//! It does return entries whose `exists` is false (a delete that
+//! completed while another tag is pending leaves one); RGW filters those
+//! itself.
 
 use std::collections::BTreeMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use rados::{Denc, OmapKey, RadosError, UTime, VersionedDenc, VersionedEncode};
+use rados::osdclient::error::Result;
+use rados::osdclient::{IoCtx, OSDOp, OpReply};
+use rados::{Denc, OSDClientError, OmapKey, RadosError, UTime, VersionedDenc, VersionedEncode};
 use serde::Serialize;
 use serde::ser::{SerializeSeq, SerializeStruct};
 
+use super::CLASS;
 use super::olh::OlhEntry;
 use super::packed;
 use super::types::{
@@ -17,6 +41,7 @@ use super::types::{
     FLAG_DELETE_MARKER, FLAG_VER, FLAG_VER_MARKER, ModifyOp, ObjCategory, ObjKey, PendingInfo,
     PendingState, ReshardStatus, ZoneSet, rounded_size,
 };
+use crate::call;
 
 /// `rgw_bucket_dir_entry_meta`: what the bucket index caches about an
 /// object's content. Squid v19.2.2 writes version 7 (compat 3); version
@@ -1481,6 +1506,413 @@ pub fn encode_suggestions(suggestions: &[Suggestion]) -> std::result::Result<Byt
     Ok(buf.freeze())
 }
 
+/// `CLS_RGW_ERR_BUSY_RESHARDING`: RGW passes its negation to the guard,
+/// and a guarded write fails with `OSDError { code: -2300 }` while the
+/// shard is resharding.
+pub const ERR_BUSY_RESHARDING: i32 = 2300;
+
+/// `RGWBIAdvanceAndRetryError`: `bucket_list`'s answer when it gave up
+/// before finding an entry to return.
+const EFBIG: i32 = 27;
+
+/// How many times [`list`] resends from the returned marker before
+/// giving up with `EFBIG`.
+const MAX_LIST_ADVANCES: usize = 64;
+
+/// `cls_rgw_bucket_init_index`: write an empty header to a new shard.
+/// `EINVAL` when the shard already has one.
+pub fn init_index_op() -> Result<OSDOp> {
+    call::raw_op(CLASS, "bucket_init_index", Bytes::new())
+}
+
+/// `bucket_set_tag_timeout`: store `tag_timeout` seconds in the
+/// header.
+pub fn set_tag_timeout_op(tag_timeout: u64) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "bucket_set_tag_timeout",
+        &TagTimeoutOp { tag_timeout },
+    )
+}
+
+/// `cls_rgw_bucket_prepare_op`: add `op.tag` to the pending map of the
+/// entry for `op.key`, creating a non-existent entry if there is none.
+/// The stats are untouched; an empty tag is `EINVAL`.
+pub fn prepare_op(op: &PrepareOp) -> Result<OSDOp> {
+    call::op(CLASS, "bucket_prepare_op", op)
+}
+
+/// `cls_rgw_bucket_complete_op`: drop `op.tag` from the entry's pending
+/// map (`EINVAL` if it is not there) and apply `op.op`. A `ver` from the
+/// entry's pool with a non-zero epoch not newer than the entry's turns
+/// the op into a cancel, which leaves the stats alone but still stores
+/// `ver` on the entry; an `ADD` replaces the entry's accounting with
+/// `meta`'s;
+/// a `DEL` unaccounts the entry and removes it, or keeps it with `exists`
+/// false while other tags are pending. `remove_objs` are unaccounted and
+/// removed whatever `op` is.
+pub fn complete_op(op: &CompleteOp) -> Result<OSDOp> {
+    call::op(CLASS, "bucket_complete_op", op)
+}
+
+/// `cls_rgw_bucket_list_op`: one page of entries; decode with
+/// [`decode_list`]. A reply that is truncated with no entries comes with
+/// result `EFBIG`, which [`list`] handles.
+pub fn list_op(op: &ListOp) -> Result<OSDOp> {
+    call::op(CLASS, "bucket_list", op)
+}
+
+/// `bucket_list` for zero entries, which returns the header alone;
+/// decode with [`decode_dir_header`].
+pub fn dir_header_op() -> Result<OSDOp> {
+    list_op(&ListOp::default())
+}
+
+/// `bucket_check_index`: the stored header and one recomputed
+/// from the entries; decode with [`decode_check_index`].
+pub fn check_index_op() -> Result<OSDOp> {
+    call::raw_op(CLASS, "bucket_check_index", Bytes::new())
+}
+
+/// `bucket_rebuild_index`: replace the header's stats with the
+/// recomputed ones. `master_ver`, `max_marker` and the reshard status go
+/// back to their defaults; `ver` is bumped.
+pub fn rebuild_index_op() -> Result<OSDOp> {
+    call::raw_op(CLASS, "bucket_rebuild_index", Bytes::new())
+}
+
+/// `cls_rgw_bucket_update_stats`: add `stats` to the header's, or replace
+/// the named categories when `absolute`.
+pub fn update_stats_op(
+    absolute: bool,
+    stats: &BTreeMap<ObjCategory, CategoryStats>,
+) -> Result<OSDOp> {
+    let op = UpdateStatsOp {
+        absolute,
+        stats: stats.clone(),
+    };
+    call::op(CLASS, "bucket_update_stats", &op)
+}
+
+/// `cls_rgw_suggest_changes`: apply each suggestion whose entry has no
+/// pending tag younger than the tag timeout (the header's, else the
+/// OSD's `rgw_pending_bucket_index_op_expiration`, else 120 s) and whose
+/// `index_ver` is not older than the stored entry's; an applied update
+/// stamps the entry with the header's `ver`, so a later suggestion must
+/// carry the entry as listed. Suggestions for keys not in the index are
+/// skipped.
+pub fn suggest_changes_op(suggestions: &[Suggestion]) -> Result<OSDOp> {
+    call::raw_op(
+        CLASS,
+        "dir_suggest_changes",
+        encode_suggestions(suggestions)?,
+    )
+}
+
+/// `cls_rgw_remove_obj`: on a head object, not an index shard. Removes
+/// the object and, if any xattr starts with one of `keep_attr_prefixes`,
+/// recreates it empty with only those xattrs. `ENOENT` when absent.
+pub fn remove_obj_op(keep_attr_prefixes: &[String]) -> Result<OSDOp> {
+    let op = RemoveObjOp {
+        keep_attr_prefixes: keep_attr_prefixes.to_vec(),
+    };
+    call::op(CLASS, "obj_remove", &op)
+}
+
+/// `cls_rgw_obj_store_pg_ver`: store the PG's current version as an
+/// encoded `u64` in the head object's xattr `attr`.
+pub fn store_pg_ver_op(attr: &str) -> Result<OSDOp> {
+    let op = StorePgVerOp {
+        attr: attr.to_owned(),
+    };
+    call::op(CLASS, "obj_store_pg_ver", &op)
+}
+
+/// `cls_rgw_obj_check_attrs_prefix`: `ECANCELED` when whether the head
+/// object has an xattr starting with `prefix` equals `fail_if_exist`;
+/// an empty prefix is `EINVAL`.
+pub fn check_attrs_prefix_op(prefix: &str, fail_if_exist: bool) -> Result<OSDOp> {
+    let op = CheckAttrsPrefixOp {
+        check_prefix: prefix.to_owned(),
+        fail_if_exist,
+    };
+    call::op(CLASS, "obj_check_attrs_prefix", &op)
+}
+
+/// `cls_rgw_obj_check_mtime`: `ECANCELED` unless `object mtime <kind>
+/// mtime` holds, compared in whole seconds unless `high_precision_time`.
+/// A missing object counts as mtime 0.
+pub fn check_mtime_op(
+    mtime: UTime,
+    kind: CheckMtimeType,
+    high_precision_time: bool,
+) -> Result<OSDOp> {
+    let op = CheckMtimeOp {
+        mtime,
+        kind,
+        high_precision_time,
+    };
+    call::op(CLASS, "obj_check_mtime", &op)
+}
+
+/// `cls_rgw_set_bucket_resharding`: store `status` in the header; the
+/// rest of the entry is not stored.
+pub fn set_bucket_resharding_op(status: ReshardStatus) -> Result<OSDOp> {
+    let op = SetBucketReshardingOp {
+        entry: BucketInstanceEntry {
+            reshard_status: status,
+        },
+    };
+    call::op(CLASS, "set_bucket_resharding", &op)
+}
+
+/// `cls_rgw_clear_bucket_resharding`: reset the header's reshard status.
+pub fn clear_bucket_resharding_op() -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "clear_bucket_resharding",
+        &ClearBucketReshardingOp {},
+    )
+}
+
+/// `cls_rgw_guard_bucket_resharding`: fail with `ret_err` when the
+/// header's reshard status is anything but `NOT_RESHARDING`, which
+/// aborts the compound operation it leads.
+pub fn guard_bucket_resharding_op(ret_err: i32) -> Result<OSDOp> {
+    call::op(
+        CLASS,
+        "guard_bucket_resharding",
+        &GuardBucketReshardingOp { ret_err },
+    )
+}
+
+/// The guard RGW puts in front of every index write:
+/// [`guard_bucket_resharding_op`] with `-ERR_BUSY_RESHARDING`.
+pub fn guard_op() -> Result<OSDOp> {
+    guard_bucket_resharding_op(-ERR_BUSY_RESHARDING)
+}
+
+/// `cls_rgw_get_bucket_resharding`: decode with
+/// [`decode_get_bucket_resharding`].
+pub fn get_bucket_resharding_op() -> Result<OSDOp> {
+    call::op(CLASS, "get_bucket_resharding", &GetBucketReshardingOp {})
+}
+
+/// Decode the reply to [`list_op`].
+pub fn decode_list(reply: &OpReply) -> Result<ListRet> {
+    call::decode(reply)
+}
+
+/// Decode the reply to [`dir_header_op`].
+pub fn decode_dir_header(reply: &OpReply) -> Result<DirHeader> {
+    Ok(call::decode::<ListRet>(reply)?.dir.header)
+}
+
+/// Decode the reply to [`check_index_op`].
+pub fn decode_check_index(reply: &OpReply) -> Result<CheckIndexRet> {
+    call::decode(reply)
+}
+
+/// Decode the reply to [`get_bucket_resharding_op`].
+pub fn decode_get_bucket_resharding(reply: &OpReply) -> Result<BucketInstanceEntry> {
+    Ok(call::decode::<GetBucketReshardingRet>(reply)?.new_instance)
+}
+
+/// See [`init_index_op`].
+pub async fn init_index(ioctx: &IoCtx, oid: &str) -> Result<()> {
+    call::exec_raw(ioctx, oid, CLASS, "bucket_init_index", Bytes::new())
+        .await
+        .map(drop)
+}
+
+/// See [`set_tag_timeout_op`].
+pub async fn set_tag_timeout(ioctx: &IoCtx, oid: &str, tag_timeout: u64) -> Result<()> {
+    let op = TagTimeoutOp { tag_timeout };
+    call::exec(ioctx, oid, CLASS, "bucket_set_tag_timeout", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`prepare_op`].
+pub async fn prepare(ioctx: &IoCtx, oid: &str, op: &PrepareOp) -> Result<()> {
+    call::exec(ioctx, oid, CLASS, "bucket_prepare_op", op)
+        .await
+        .map(drop)
+}
+
+/// See [`complete_op`].
+pub async fn complete(ioctx: &IoCtx, oid: &str, op: &CompleteOp) -> Result<()> {
+    call::exec(ioctx, oid, CLASS, "bucket_complete_op", op)
+        .await
+        .map(drop)
+}
+
+/// See [`list_op`]. When the class answers `EFBIG` (it read its limit of
+/// entries without finding one to return), this decodes the reply and
+/// sends again from its `marker`, as RGW does, up to 64 times before
+/// returning the `EFBIG`. One call reads at most eight times
+/// `num_entries` keys, so a small `num_entries` crosses at most
+/// `520 * num_entries` skipped entries.
+pub async fn list(ioctx: &IoCtx, oid: &str, op: &ListOp) -> Result<ListRet> {
+    let mut op = op.clone();
+    for _ in 0..=MAX_LIST_ADVANCES {
+        let built = rados::OpBuilder::new().op(list_op(&op)?).build();
+        let result = ioctx.execute_op_unchecked(oid, built).await?;
+        let reply = result.first_reply()?;
+        let code = if result.result < 0 {
+            result.result
+        } else {
+            reply.return_code
+        };
+        if code >= 0 {
+            return decode_list(reply);
+        }
+        if code != -EFBIG {
+            return Err(OSDClientError::OSDError {
+                code,
+                message: "rgw::bucket_list failed".to_owned(),
+            });
+        }
+        op.start_obj = decode_list(reply)?.marker;
+    }
+    Err(OSDClientError::OSDError {
+        code: -EFBIG,
+        message: format!("rgw::bucket_list found nothing in {MAX_LIST_ADVANCES} advances"),
+    })
+}
+
+/// See [`dir_header_op`].
+pub async fn dir_header(ioctx: &IoCtx, oid: &str) -> Result<DirHeader> {
+    let out = call::exec(ioctx, oid, CLASS, "bucket_list", &ListOp::default()).await?;
+    Ok(call::decode_bytes::<ListRet>(out)?.dir.header)
+}
+
+/// See [`check_index_op`].
+pub async fn check_index(ioctx: &IoCtx, oid: &str) -> Result<CheckIndexRet> {
+    let out = call::exec_raw(ioctx, oid, CLASS, "bucket_check_index", Bytes::new()).await?;
+    call::decode_bytes(out)
+}
+
+/// See [`rebuild_index_op`].
+pub async fn rebuild_index(ioctx: &IoCtx, oid: &str) -> Result<()> {
+    call::exec_raw(ioctx, oid, CLASS, "bucket_rebuild_index", Bytes::new())
+        .await
+        .map(drop)
+}
+
+/// See [`update_stats_op`].
+pub async fn update_stats(
+    ioctx: &IoCtx,
+    oid: &str,
+    absolute: bool,
+    stats: &BTreeMap<ObjCategory, CategoryStats>,
+) -> Result<()> {
+    let op = UpdateStatsOp {
+        absolute,
+        stats: stats.clone(),
+    };
+    call::exec(ioctx, oid, CLASS, "bucket_update_stats", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`suggest_changes_op`].
+pub async fn suggest_changes(ioctx: &IoCtx, oid: &str, suggestions: &[Suggestion]) -> Result<()> {
+    let indata = encode_suggestions(suggestions)?;
+    call::exec_raw(ioctx, oid, CLASS, "dir_suggest_changes", indata)
+        .await
+        .map(drop)
+}
+
+/// See [`remove_obj_op`].
+pub async fn remove_obj(ioctx: &IoCtx, oid: &str, keep_attr_prefixes: &[String]) -> Result<()> {
+    let op = RemoveObjOp {
+        keep_attr_prefixes: keep_attr_prefixes.to_vec(),
+    };
+    call::exec(ioctx, oid, CLASS, "obj_remove", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`store_pg_ver_op`].
+pub async fn store_pg_ver(ioctx: &IoCtx, oid: &str, attr: &str) -> Result<()> {
+    let op = StorePgVerOp {
+        attr: attr.to_owned(),
+    };
+    call::exec(ioctx, oid, CLASS, "obj_store_pg_ver", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`check_attrs_prefix_op`].
+pub async fn check_attrs_prefix(
+    ioctx: &IoCtx,
+    oid: &str,
+    prefix: &str,
+    fail_if_exist: bool,
+) -> Result<()> {
+    let op = CheckAttrsPrefixOp {
+        check_prefix: prefix.to_owned(),
+        fail_if_exist,
+    };
+    call::exec(ioctx, oid, CLASS, "obj_check_attrs_prefix", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`check_mtime_op`].
+pub async fn check_mtime(
+    ioctx: &IoCtx,
+    oid: &str,
+    mtime: UTime,
+    kind: CheckMtimeType,
+    high_precision_time: bool,
+) -> Result<()> {
+    let op = CheckMtimeOp {
+        mtime,
+        kind,
+        high_precision_time,
+    };
+    call::exec(ioctx, oid, CLASS, "obj_check_mtime", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`set_bucket_resharding_op`].
+pub async fn set_bucket_resharding(ioctx: &IoCtx, oid: &str, status: ReshardStatus) -> Result<()> {
+    let op = SetBucketReshardingOp {
+        entry: BucketInstanceEntry {
+            reshard_status: status,
+        },
+    };
+    call::exec(ioctx, oid, CLASS, "set_bucket_resharding", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`clear_bucket_resharding_op`].
+pub async fn clear_bucket_resharding(ioctx: &IoCtx, oid: &str) -> Result<()> {
+    let op = ClearBucketReshardingOp {};
+    call::exec(ioctx, oid, CLASS, "clear_bucket_resharding", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`guard_bucket_resharding_op`].
+pub async fn guard_bucket_resharding(ioctx: &IoCtx, oid: &str, ret_err: i32) -> Result<()> {
+    let op = GuardBucketReshardingOp { ret_err };
+    call::exec(ioctx, oid, CLASS, "guard_bucket_resharding", &op)
+        .await
+        .map(drop)
+}
+
+/// See [`get_bucket_resharding_op`].
+pub async fn get_bucket_resharding(ioctx: &IoCtx, oid: &str) -> Result<BucketInstanceEntry> {
+    let op = GetBucketReshardingOp {};
+    let out = call::exec(ioctx, oid, CLASS, "get_bucket_resharding", &op).await?;
+    Ok(call::decode_bytes::<GetBucketReshardingRet>(out)?.new_instance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2229,5 +2661,121 @@ mod tests {
             &want[..]
         );
         assert!(encode_suggestions(&[]).expect("encode").is_empty());
+    }
+
+    #[test]
+    fn ops_name_the_rgw_class_and_their_method() {
+        use rados::osdclient::types::OpData;
+
+        let stats = BTreeMap::new();
+        let cases = [
+            (init_index_op(), "bucket_init_index"),
+            (set_tag_timeout_op(1), "bucket_set_tag_timeout"),
+            (prepare_op(&PrepareOp::default()), "bucket_prepare_op"),
+            (complete_op(&CompleteOp::default()), "bucket_complete_op"),
+            (list_op(&ListOp::default()), "bucket_list"),
+            (dir_header_op(), "bucket_list"),
+            (check_index_op(), "bucket_check_index"),
+            (rebuild_index_op(), "bucket_rebuild_index"),
+            (update_stats_op(false, &stats), "bucket_update_stats"),
+            (suggest_changes_op(&[]), "dir_suggest_changes"),
+            (remove_obj_op(&[]), "obj_remove"),
+            (store_pg_ver_op("a"), "obj_store_pg_ver"),
+            (check_attrs_prefix_op("p", true), "obj_check_attrs_prefix"),
+            (
+                check_mtime_op(UTime::default(), CheckMtimeType::EQ, false),
+                "obj_check_mtime",
+            ),
+            (
+                set_bucket_resharding_op(ReshardStatus::IN_PROGRESS),
+                "set_bucket_resharding",
+            ),
+            (clear_bucket_resharding_op(), "clear_bucket_resharding"),
+            (guard_bucket_resharding_op(0), "guard_bucket_resharding"),
+            (guard_op(), "guard_bucket_resharding"),
+            (get_bucket_resharding_op(), "get_bucket_resharding"),
+        ];
+        for (op, method) in cases {
+            let op = op.expect("op");
+            assert!(op.indata.starts_with(format!("rgw{method}").as_bytes()));
+            assert!(matches!(
+                op.op_data,
+                OpData::Call { class_len: 3, method_len, .. } if usize::from(method_len) == method.len()
+            ));
+        }
+
+        // The raw methods carry no struct; the header read is a zero-entry list.
+        let op = init_index_op().expect("op");
+        assert!(matches!(op.op_data, OpData::Call { indata_len: 0, .. }));
+        let op = dir_header_op().expect("op");
+        assert!(op.indata.ends_with(&bytes(&ListOp::default())));
+        let op = set_bucket_resharding_op(ReshardStatus::IN_PROGRESS).expect("op");
+        assert!(
+            op.indata
+                .ends_with(&unhex("01010f0000000301090000000100000000ffffffff"))
+        );
+    }
+
+    #[test]
+    fn guard_op_fails_with_busy_resharding() {
+        let op = guard_op().expect("op");
+        assert!(op.indata.ends_with(&unhex("01010400000004f7ffff")));
+    }
+
+    #[test]
+    fn suggest_changes_op_carries_the_bare_concatenation() {
+        let s = Suggestion {
+            op: SuggestOp::Remove,
+            log: false,
+            entry: dir_entry_instance(),
+        };
+        let op = suggest_changes_op(std::slice::from_ref(&s)).expect("op");
+        let mut want = b"rgwdir_suggest_changes".to_vec();
+        want.push(b'r');
+        want.extend_from_slice(&bytes(&s.entry));
+        assert_eq!(op.indata.as_ref(), &want[..]);
+    }
+
+    fn reply<T: Denc>(v: &T) -> OpReply {
+        OpReply {
+            return_code: 0,
+            outdata: rados::encode_with_capacity(v, 0).expect("encode"),
+        }
+    }
+
+    #[test]
+    fn decoders_unwrap_the_replies() {
+        let mut dir = Dir {
+            header: dir_header_instance(),
+            entries: BTreeMap::new(),
+        };
+        dir.entries.insert("name".to_owned(), dir_entry_instance());
+        let ret = ListRet {
+            dir,
+            is_truncated: true,
+            marker: ObjKey {
+                name: "name".to_owned(),
+                instance: String::new(),
+            },
+        };
+        assert_eq!(decode_list(&reply(&ret)).expect("decode"), ret);
+        assert_eq!(
+            decode_dir_header(&reply(&ret)).expect("decode"),
+            dir_header_instance()
+        );
+
+        let check = CheckIndexRet {
+            existing_header: dir_header_instance(),
+            calculated_header: DirHeader::default(),
+        };
+        assert_eq!(decode_check_index(&reply(&check)).expect("decode"), check);
+
+        let get = GetBucketReshardingRet {
+            new_instance: bucket_instance_entry(),
+        };
+        assert_eq!(
+            decode_get_bucket_resharding(&reply(&get)).expect("decode"),
+            bucket_instance_entry()
+        );
     }
 }
