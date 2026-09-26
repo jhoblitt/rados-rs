@@ -156,6 +156,13 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("rgw_bucket_pending_info", None, false),
     TypeSpec::new("rgw_bucket_category_stats", None, false),
     TypeSpec::new("rgw_zone_set", None, false),
+    TypeSpec::new("rgw_bucket_dir_entry_meta", None, false),
+    TypeSpec::new("rgw_bucket_dir_entry", None, false),
+    TypeSpec::new("rgw_bucket_dir_header", None, false),
+    TypeSpec::new("rgw_bucket_dir", None, false),
+    TypeSpec::new("rgw_bi_log_entry", None, false),
+    TypeSpec::new("cls_rgw_bucket_instance_entry", None, false),
+    TypeSpec::new("cls_rgw_reshard_entry", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

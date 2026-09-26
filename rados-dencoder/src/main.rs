@@ -38,6 +38,11 @@ use rados_cls::rgw::gc::{
     DeferEntryOp as RgwGcDeferEntryOp, ListOp as RgwGcListOp, ListRet as RgwGcListRet,
     RemoveOp as RgwGcRemoveOp, SetEntryOp as RgwGcSetEntryOp,
 };
+use rados_cls::rgw::index::{
+    BiLogEntry as RgwBiLogEntry, BucketInstanceEntry as RgwBucketInstanceEntry, Dir as RgwDir,
+    DirEntry as RgwDirEntry, DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader,
+    ReshardEntry as RgwReshardEntry,
+};
 use rados_cls::rgw::types::{
     CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
     ObjChain as RgwObjChain, ObjKey as RgwObjKey, PendingInfo as RgwPendingInfo,
@@ -231,6 +236,13 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_bucket_pending_info" => Some(type_info_denc::<RgwPendingInfo>()),
         "rgw_bucket_category_stats" => Some(type_info_denc::<RgwCategoryStats>()),
         "rgw_zone_set" => Some(type_info_denc::<RgwZoneSet>()),
+        "rgw_bucket_dir_entry_meta" => Some(type_info_denc::<RgwDirEntryMeta>()),
+        "rgw_bucket_dir_entry" => Some(type_info_denc::<RgwDirEntry>()),
+        "rgw_bucket_dir_header" => Some(type_info_denc::<RgwDirHeader>()),
+        "rgw_bucket_dir" => Some(type_info_denc::<RgwDir>()),
+        "rgw_bi_log_entry" => Some(type_info_denc::<RgwBiLogEntry>()),
+        "cls_rgw_bucket_instance_entry" => Some(type_info_denc::<RgwBucketInstanceEntry>()),
+        "cls_rgw_reshard_entry" => Some(type_info_denc::<RgwReshardEntry>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
         "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
@@ -308,6 +320,13 @@ fn list_types() {
     println!("  cls_rgw_{{obj_key,obj,obj_chain,gc_obj_info}} [versioned]");
     println!(
         "  rgw_bucket_{{entry_ver,pending_info,category_stats}} / rgw_zone_set [versioned]"
+    );
+    println!(
+        "  rgw_bucket_dir_{{entry_meta,entry,header}} / rgw_bucket_dir / rgw_bi_log_entry \
+         [versioned]"
+    );
+    println!(
+        "  cls_rgw_{{bucket_instance_entry,reshard_entry}} [versioned]"
     );
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
