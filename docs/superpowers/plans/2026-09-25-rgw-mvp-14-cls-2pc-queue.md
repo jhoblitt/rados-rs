@@ -20,7 +20,8 @@ module reuses plan 5's `queue` types (`InitOp`, `ListOp`, `ListRet`,
 class forwards to `cls_queue`, and adds 2pc structs, `OSDOp`
 constructors naming class `2pc_queue`, and async free functions over
 `IoCtx`. `reserve` is a writing method that replies, so it goes through
-`call::exec_returnvec` (plan 4's `reset_stats2` precedent). `queue`
+`call::exec_returnvec` (plan 4's `reset_stats2` precedent,
+`user.rs:664-667`). `queue`
 gains the one `cls_queue` type the class adds (`cls_queue_get_stats_ret`)
 and the entry-overhead constant.
 
@@ -56,15 +57,18 @@ when green then an upstream PR; offline builds with the scratchpad
   (`cls-lock`) merges. Execution order is 11, 13, 14, 15, then 12. At
   that base `call::exec_returnvec` is gated `#[cfg(feature = "user")]`
   with the doc line "Only the `user` class has such a method so far";
-  `dump::real_time`/`iso_utc` are gated `feature = "rgw"`,
-  `civil_from_days` and the `use rados::UTime` line `any(feature =
-  "user", feature = "rgw")`, the `mod dump;` line `any(feature =
-  "refcount", feature = "rgw", feature = "user")`. Task 0 confirms; if
-  plan 13 changed any of them, widen what is there by
-  `feature = "two_pc_queue"`.
+  `dump::real_time` is gated `feature = "rgw"`, `dump::iso_utc`
+  `any(feature = "rgw", feature = "lock")`, `civil_from_days` and the
+  `use rados::UTime` line `any(feature = "user", feature = "rgw",
+  feature = "lock")`, the `pub(crate) mod dump;` line `any(feature =
+  "refcount", feature = "rgw", feature = "user", feature = "lock")`
+  (plan 13 added `lock` to the last three). This plan widens each by
+  `feature = "two_pc_queue"` and keeps `lock`; `dump::localtime` and
+  `utime_localtime` stay `#[cfg(feature = "lock")]`, since this plan
+  does not use them. Task 0 confirms.
 - Commit messages: subject `two_pc_queue: ...`, a body of what and why,
   then exactly these two trailers:
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and
   `Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s`.
 - Methods (`S:cls_2pc_queue_const.h:5-14`, registration
   `S:cls_2pc_queue.cc:664-675`; `main` has the same ten names and
@@ -115,7 +119,8 @@ when green then an upstream PR; offline builds with the scratchpad
   `bl_data_vec` dumps as base64 strings (`encode_json` of a
   `bufferlist`) through the workspace's existing `base64` crate (0.21,
   already compiled into every build through `rados`): no new crate,
-  download or lockfile entry.
+  download or package in the lockfile, though `Cargo.lock` changes
+  (`rados-cls`'s dependency list gains `"base64"`) and is committed.
 - The floor rule (plan 5): every hand-written `decode_content` calls
   `rados::check_min_version!` at the version v19 writes, except where a
   default corpus archive holds an older sample. Applied here, with the
@@ -234,7 +239,8 @@ containers up. Then the workspace and ledger as in plan 3's Task 0.
   `rados-cls/src/lib.rs` (`mod dump` gate; `#[cfg(feature =
   "two_pc_queue")] pub mod two_pc_queue;` after `rgw_gc`),
   `rados-cls/Cargo.toml` (`two_pc_queue = ["queue"]`, appended to
-  `default`; `base64 = { workspace = true }`),
+  `default`; `base64 = { workspace = true }`), `Cargo.lock`
+  (`"base64"` joins `rados-cls`'s dependency list; no new package),
   `.github/workflows/ci.yml` (`two_pc_queue` in the per-class loop,
   between `rgw_gc` and `user`), `README.md` (`two_pc_queue` in the
   `rados-cls` row's class list), `rados-dencoder/src/main.rs` (eight arms,
@@ -506,10 +512,13 @@ Expected: compile errors, the types do not exist.
 
 - [ ] **Step 3: Implement**
 
-`dump.rs`: widen `real_time`, `iso_utc` to `any(feature = "rgw",
+`dump.rs`: widen `real_time` to `any(feature = "rgw", feature =
+"two_pc_queue")`, `iso_utc` to `any(feature = "rgw", feature = "lock",
 feature = "two_pc_queue")`; `civil_from_days` and `use rados::UTime`
-to `any(feature = "user", feature = "rgw", feature = "two_pc_queue")`;
-add, gated `#[cfg(feature = "two_pc_queue")]` (with `use bytes::Bytes;`
+to `any(feature = "user", feature = "rgw", feature = "lock", feature =
+"two_pc_queue")` (dropping `lock` would break the `lock`-only build,
+whose `localtime` calls `iso_utc`); leave `localtime` and
+`utime_localtime` on `lock` alone; add, gated `#[cfg(feature = "two_pc_queue")]` (with `use bytes::Bytes;`
 under the same gate):
 
 ```rust
@@ -521,9 +530,9 @@ pub(crate) fn base64_vec<S: serde::Serializer>(v: &[Bytes], s: S) -> Result<S::O
 }
 ```
 
-`lib.rs`: the `mod dump;` gate gains `feature = "two_pc_queue"`; add the
-`two_pc_queue` module line (not yet the `mod call` gate: nothing calls
-a class until Task 2).
+`lib.rs`: the `pub(crate) mod dump;` gate becomes `any(feature =
+"refcount", feature = "rgw", feature = "user", feature = "lock",
+feature = "two_pc_queue")`; add the `two_pc_queue` module line.
 
 `queue.rs`, after `HEAD_SIZE_1K` and after `GetCapacityRet`:
 
@@ -589,7 +598,11 @@ pub struct Reservation {
 `rados::check_min_version!(struct_v, 1, "Reservation", "Pacific v16+")`,
 reads `size`, `timestamp`, then `entries` only when `struct_v >= 2`
 (else 0); `encoded_size_content` is `Some(20)`;
-`rados::impl_denc_for_versioned!(Reservation)`.
+`rados::impl_denc_for_versioned!(Reservation)`. Both hand-written impls
+spell `std::result::Result<_, RadosError>`, as `queue.rs` does: Task 2
+imports the one-parameter `rados::osdclient::error::Result` into this
+file, and a bare `Result<Self, RadosError>` would stop compiling
+there.
 
 ```rust
 /// `cls_2pc_urgent_data`: the class's bookkeeping, kept in the queue
@@ -776,7 +789,7 @@ pass; no warnings in either check.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rados-cls/Cargo.toml rados-cls/src/lib.rs rados-cls/src/dump.rs rados-cls/src/queue.rs rados-cls/src/two_pc_queue.rs .github/workflows/ci.yml README.md rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
+git add Cargo.lock rados-cls/Cargo.toml rados-cls/src/lib.rs rados-cls/src/dump.rs rados-cls/src/queue.rs rados-cls/src/two_pc_queue.rs .github/workflows/ci.yml README.md rados-dencoder/src/main.rs rados-dencoder/tests/dencoder_corpus_comparison_test.rs
 git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
 two_pc_queue: add the 2pc_queue class types
 
@@ -790,7 +803,7 @@ two dump types with a map are corpus exceptions: multi-entry samples
 differ in order only. The commit op dumps its payloads as base64 through
 the workspace's `base64` crate.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
@@ -801,8 +814,8 @@ EOF
 
 **Files:**
 - Modify: `rados-cls/src/two_pc_queue.rs`, `rados-cls/src/call.rs`
-  (`exec_returnvec` gate and doc), `rados-cls/src/lib.rs` (`mod call`
-  gate).
+  (`exec_returnvec` gate and doc). `lib.rs`'s `mod call` gate is left
+  alone: it already names `queue`, which `two_pc_queue` implies.
 
 **Interfaces:**
 - Consumes: `crate::call::{op, raw_op, exec, exec_raw, exec_returnvec,
@@ -942,8 +955,8 @@ Expected: compile errors, the functions do not exist.
 `call.rs`: `#[cfg(any(feature = "user", feature = "two_pc_queue"))]` on
 `exec_returnvec`, and its last doc sentence becomes "The `user` class's
 `reset_user_stats2` and the `2pc_queue` class's `2pc_queue_reserve` are
-such methods." `lib.rs`: `feature = "two_pc_queue"` joins the `mod call`
-gate.
+such methods." The `mod call` gate in `lib.rs` needs no edit: it
+already names `queue`, and `two_pc_queue = ["queue"]` turns that on.
 
 Replace the one-line module doc with:
 
@@ -1014,7 +1027,8 @@ Replace the one-line module doc with:
 Then the client (below the types, above the tests; imports gain
 `rados::osdclient::error::{OSDClientError, Result}`,
 `rados::osdclient::{IoCtx, OSDOp, OpReply}`, `crate::call`,
-`crate::queue::{GetStatsRet, Head, InitOp, ListOp, ListRet}`):
+`crate::queue::{GetCapacityRet, GetStatsRet, Head, InitOp, ListOp,
+ListRet}`):
 
 ```rust
 pub use crate::queue::{decode_get_capacity, decode_list};
@@ -1223,7 +1237,7 @@ any check.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rados-cls/src/two_pc_queue.rs rados-cls/src/call.rs rados-cls/src/lib.rs
+git add rados-cls/src/two_pc_queue.rs rados-cls/src/call.rs
 git -c user.name='Joshua Hoblitt' -c user.email='josh@hoblitt.com' commit -F- <<'EOF'
 two_pc_queue: add the 2pc_queue client
 
@@ -1237,7 +1251,7 @@ urgent data, the only view of reserved_size, which a Squid OSD leaks by
 ten bytes per reserved entry. The module doc records what radosgw does
 with the class, for a driver that must coexist with it.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
@@ -1282,7 +1296,6 @@ const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const EINVAL: i32 = 22;
 const ENOSPC: i32 = 28;
-const ENODATA: i32 = 61;
 
 /// 256 KiB: upstream ReserveError's queue.
 const CAPACITY: u64 = 256 * 1024;
@@ -1427,7 +1440,7 @@ the stale time on the OSD's clock; removal with no count makes the
 class count, including for a Reef client's request; and without
 RETURNVEC the reservation is made but its id is lost.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
@@ -1445,6 +1458,14 @@ EOF
 - Produces: two `#[ignore]` tests.
 
 - [ ] **Step 1: Write the tests**
+
+Add to the file head (declared here, at its first use, so Task 3's
+commit carries no unused constant under `-D warnings`), `use rados::Denc;`
+for `BTreeMap::<u32, Reservation>::decode`, and:
+
+```rust
+const ENODATA: i32 = 61;
+```
 
 10. `squid_leaks_the_entry_overhead`:
     - `oid = new_queue(CAPACITY)`; `v = read_head.urgent_data_version`;
@@ -1503,7 +1524,7 @@ writers of v19.2.4 and main. The head holds 784 reservations; the
 785th spills into the cls_queue_urgent_data xattr, where list, commit
 and abort still find it and has_xattrs stays set.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
@@ -1551,3 +1572,13 @@ build from `list_entries_op`. For the rgw-go coexistence document, the
 report's §0.5 corrections stand: radosgw takes no lock on
 `queues_list_object`, and it expires reservations only on queues it
 owns.
+
+## Pre-flight patches applied (2026-09-25)
+
+- Gates: `iso_utc` `any(rgw, lock, two_pc_queue)`, `civil_from_days`/`use rados::UTime` `any(user, rgw, lock, two_pc_queue)`, `pub(crate) mod dump` `any(refcount, rgw, user, lock, two_pc_queue)`; `localtime`/`utime_localtime` stay `lock` (Global Constraints, Task 1 Step 3).
+- Task 1 commits `Cargo.lock` (`rados-cls` gains `"base64"`, no new package); "no lockfile entry" corrected.
+- `const ENODATA` moved from Task 3's file head to Task 4, its first use; Task 4 adds `use rados::Denc;`.
+- Task 2 imports `GetCapacityRet`; its `mod call` gate edit dropped (`two_pc_queue` implies `queue`, already in the gate) and `lib.rs` left out of its `git add`.
+- Task 1's hand-written `VersionedEncode` impls use `std::result::Result`, as `queue.rs` does.
+- `reset_stats2` precedent cited as `user.rs:664-667`.
+- Commit trailers name `Claude Opus 5.5`.
