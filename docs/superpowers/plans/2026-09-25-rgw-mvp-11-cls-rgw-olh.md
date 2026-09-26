@@ -74,9 +74,9 @@ Plans 3 to 10's Global Constraints apply unchanged. Plus:
   `delete_marker` is set, and is `ECANCELED` when the OLH exists with a
   different tag and is not pending removal; with `unmod_since` set and an
   existing instance whose mtime is not older, it returns 0 without
-  linking (second resolution unless `high_precision_time`); a newer
-  epoch (or an equal one with a greater instance) promotes the instance
-  to current, demotes the previous one, and appends `LINK_OLH` (plus
+  linking (second resolution unless `high_precision_time`); a newer epoch (or an equal one whose instance does not sort
+  after the current one, `olh.key.instance >= op.key.instance`)
+  promotes the instance to current, demotes the previous one, and appends `LINK_OLH` (plus
   `REMOVE_INSTANCE` when replacing) to the OLH log keyed by the OLH
   epoch; `unlink_instance` is `ENOENT` for a missing instance, converts
   a plain entry to versioned when there is no OLH, promotes the next
@@ -133,8 +133,10 @@ As plan 3's Task 0; branch `cls-rgw-olh` off the fork's `main` after plan
   `dump::utime`, `bilog_flags` as a number, `zones_trace` bare);
   `UnlinkInstanceOp { key, op_tag, olh_epoch, log_op, bilog_flags,
   olh_tag, zones_trace }` (hand-written: encode v3/1; floor 3; `Serialize`
-  omits `olh_tag`); `ReadOlhLogOp {
-  olh: ObjKey, ver_marker: u64, olh_tag }` (v1, derived); `ReadOlhLogRet {
+  omits `olh_tag`); `ReadOlhLogOp { olh: ObjKey, ver_marker: u64, olh_tag }` (v1,
+  hand-written: it encodes version 1 and decodes `main`'s version 2 by
+  skipping the `get_stales` tail, which a derive capped at its own
+  version cannot); `ReadOlhLogRet {
   log: BTreeMap<u64, Vec<OlhLogEntry>>, is_truncated: bool }` (v1;
   `Serialize`: `log` via `dump::map_entries`, then `is_truncated`);
   `TrimOlhLogOp { olh, ver: u64, olh_tag }` (v1); `ClearOlhOp { key,
@@ -254,3 +256,7 @@ As plan 3's Task 6: corpus over the six names; cluster suites through
 `cls-lock` if the owner adds it; `watch-notify`. Deferred: `main`'s
 `get_stales`, `bucket_refresh_instance`, the `u64` epoch reply of `main`'s
 link and unlink (`RETURNVEC`), `OLHLogOp::STALE`.
+
+## Patched after execution (2026-09-25)
+
+- The equal-epoch promotion rule follows `cls_rgw.cc` (`>=` on the instance, not `>`); `ReadOlhLogOp` is hand-written so it can decode main's version 2; `index.rs`'s `DumpUtime` and `ZonesTraceBare` became `pub(super)` for `olh.rs`; the wrong-tag link in cluster test 1 uses epoch 30.
