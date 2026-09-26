@@ -53,7 +53,12 @@ use rados_cls::rgw::lc::{
     GetEntryRet as RgwLcGetEntryRet, LcEntry as RgwLcEntry, LcObjHead as RgwLcObjHead,
     SetEntryOp as RgwLcSetEntryOp,
 };
-use rados_cls::rgw::olh::{OlhEntry as RgwOlhEntry, OlhLogEntry as RgwOlhLogEntry};
+use rados_cls::rgw::olh::{
+    ClearOlhOp as RgwClearOlhOp, LinkOlhOp as RgwLinkOlhOp, OlhEntry as RgwOlhEntry,
+    OlhLogEntry as RgwOlhLogEntry, ReadOlhLogOp as RgwReadOlhLogOp,
+    ReadOlhLogRet as RgwReadOlhLogRet, TrimOlhLogOp as RgwTrimOlhLogOp,
+    UnlinkInstanceOp as RgwUnlinkInstanceOp,
+};
 use rados_cls::rgw::types::{
     CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
     ObjChain as RgwObjChain, ObjKey as RgwObjKey, PendingInfo as RgwPendingInfo,
@@ -299,6 +304,12 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_rgw_guard_bucket_resharding_op" => {
             Some(type_info_denc::<RgwGuardBucketReshardingOp>())
         }
+        "rgw_cls_link_olh_op" => Some(type_info_denc::<RgwLinkOlhOp>()),
+        "rgw_cls_unlink_instance_op" => Some(type_info_denc::<RgwUnlinkInstanceOp>()),
+        "rgw_cls_read_olh_log_op" => Some(type_info_denc::<RgwReadOlhLogOp>()),
+        "rgw_cls_read_olh_log_ret" => Some(type_info_denc::<RgwReadOlhLogRet>()),
+        "rgw_cls_trim_olh_log_op" => Some(type_info_denc::<RgwTrimOlhLogOp>()),
+        "rgw_cls_bucket_clear_olh_op" => Some(type_info_denc::<RgwClearOlhOp>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -389,6 +400,10 @@ fn list_types() {
          / rgw_cls_{{list,check_index}}_ret / rgw_cls_obj_check_attrs_prefix [versioned]"
     );
     println!("  cls_rgw_{{set,clear,guard}}_bucket_resharding_op [versioned]");
+    println!(
+        "  rgw_cls_{{link_olh,unlink_instance,read_olh_log,trim_olh_log,bucket_clear_olh}}_op \
+         / rgw_cls_read_olh_log_ret [versioned]"
+    );
     println!();
     println!("LEVEL 4: Top-level cluster structures");
     println!("  Test these ONLY after all lower levels are validated");
