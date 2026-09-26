@@ -152,6 +152,20 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_gc_remove_op", None, false),
     TypeSpec::new("cls_rgw_gc_urgent_data", None, false),
     TypeSpec::new("cls_rgw_gc_queue_init_op", None, false),
+    // cls_2pc_queue_remove_op and cls_queue_get_stats_ret have 19.2.0
+    // corpus directories but v19.2.2's ceph-dencoder does not register
+    // them; their unit tests pin the corpus bytes instead.
+    TypeSpec::new("cls_2pc_reservation", None, false),
+    // ceph-dencoder dumps the reservation map in libstdc++ unordered_map
+    // order and the Rust BTreeMap dumps ascending, so samples with two or
+    // more reservations differ in order only.
+    TypeSpec::new("cls_2pc_urgent_data", None, true),
+    TypeSpec::new("cls_2pc_queue_reserve_op", None, false),
+    TypeSpec::new("cls_2pc_queue_reserve_ret", None, false),
+    TypeSpec::new("cls_2pc_queue_commit_op", None, false),
+    TypeSpec::new("cls_2pc_queue_abort_op", None, false),
+    TypeSpec::new("cls_2pc_queue_expire_op", None, false),
+    TypeSpec::new("cls_2pc_queue_reservations_ret", None, true), // as cls_2pc_urgent_data
     TypeSpec::new("rgw_bucket_entry_ver", None, false),
     TypeSpec::new("rgw_bucket_pending_info", None, false),
     TypeSpec::new("rgw_bucket_category_stats", None, false),

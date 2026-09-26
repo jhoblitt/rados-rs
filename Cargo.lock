@@ -1410,6 +1410,7 @@ dependencies = [
 name = "rados-cls"
 version = "0.1.4"
 dependencies = [
+ "base64",
  "bytes",
  "rados",
  "serde",
