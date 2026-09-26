@@ -283,9 +283,9 @@ Test helper (copy into each test module that pins oracle bytes):
         assert_eq!(json(&z), r#"{"entries":[{"entry":"zone1:loc_key"},{"entry":"zone2:loc_key"},{"entry":"zone3:loc_key"}]}"#);
         assert_eq!(ZoneSet::decode(&mut &bytes(&z)[..], 0).expect("decode"), z);
         // A key-less zone sorts before the same zone with a key; the split is at the first colon.
-        let e = ZoneSetEntry::from_str("z:a:b");
+        let e = "z:a:b".parse::<ZoneSetEntry>().expect("infallible");
         assert_eq!((e.zone.as_str(), e.location_key.as_deref()), ("z", Some("a:b")));
-        assert!(ZoneSetEntry::from_str("z") < e);
+        assert!("z".parse::<ZoneSetEntry>().expect("infallible") < e);
         assert!(z.exists("zone2", Some("loc_key")) && !z.exists("zone2", None));
     }
 
@@ -557,10 +557,11 @@ pub struct ZoneSetEntry {
 }
 
 impl ZoneSetEntry {
-    pub fn from_str(s: &str) -> Self { /* split_once(':') */ }
     pub fn to_str(&self) -> String { /* zone or zone:key */ }
 }
-// Denc: encode to_str() as a String; decode a String and from_str; size = 4 + len. No header.
+// FromStr (Err = Infallible; clippy's should_implement_trait forbids an inherent from_str):
+// split_once(':'), so "z:a:b" is zone "z" with key "a:b".
+// Denc: encode to_str() as a String; decode a String and parse it; size = 4 + len. No header.
 // Serialize: {"entry": to_str()}.
 
 /// `rgw_zone_set`: the zones a change has passed through. No header; a
@@ -785,7 +786,11 @@ Facts:
   Add a test with one `pending_log` entry: JSON
   `"pending_log":[{"key":5,"val":[{...}]}]`.
 - `BiEntry` (`rgw_cls_bi_entry`): version 1. Fields `kind: BiIndexType`
-  (`type`), `idx: String`, `data: Bytes`. Dump: `type` (name), `idx`,
+  (`type`), `idx: OmapKey`, `data: Bytes`. `idx` is bytes, not a
+  `String`: instance and OLH keys start with the `0x80` namespace byte
+  (both corpus archives carry such samples), so the dump renders it
+  with `from_utf8_lossy`, which matches the oracle's raw bytes after the
+  harness's lossy read. Dump: `type` (name), `idx`,
   then `entry`: `data` decoded as a `DirEntry` for `PLAIN`/`INSTANCE`, an
   `OlhEntry` for `OLH`, and no `entry` key otherwise; a payload that
   fails to decode is a serialization error. `get_info(&self) ->
@@ -797,7 +802,10 @@ Facts:
   false). Oracle instance 1 (80 bytes):
   `01014a00000003030000006964783e00000001013800000001011c000000080000006b65792e6e616d650c0000006b65792e696e7374616e636501d20400000000000000000000030000007461670101`
   = `{"type":"olh","idx":"idx","entry":{...the OLH entry above...}}`;
-  instance 0 = `{"type":"invalid","idx":""}`.
+  instance 0 = `{"type":"invalid","idx":""}`; an `INVALID` entry whose
+  key is `\x801000_obj` encodes as
+  `010112000000000900000080313030305f6f626a00000000` and dumps as
+  `{"type":"invalid","idx":"\u{fffd}1000_obj"}`.
 
 Commit:
 
