@@ -25,6 +25,12 @@ use rados::{
     Denc, EVersion, EntityAddr, HObject, ListWatchersReply, MonInfo, MonMap, PgNlsResponse,
     PoolSnapInfo, RadosError, UTime, UuidD, VersionedEncode, WatchItem,
 };
+use rados_cls::lock::{
+    AssertOp as LockAssertOp, BreakOp as LockBreakOp, GetInfoOp as LockGetInfoOp,
+    GetInfoReply as LockGetInfoReply, ListLocksReply as LockListLocksReply, LockInfo,
+    LockOp as LockLockOp, LockerId as LockLockerId, LockerInfo as LockLockerInfo,
+    SetCookieOp as LockSetCookieOp, UnlockOp as LockUnlockOp,
+};
 use rados_cls::queue::{
     EnqueueOp as QueueEnqueueOp, Entry as QueueEntry, GetCapacityRet as QueueGetCapacityRet,
     Head as QueueHead, InitOp as QueueInitOp, ListOp as QueueListOp, ListRet as QueueListRet,
@@ -310,6 +316,19 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_cls_read_olh_log_ret" => Some(type_info_denc::<RgwReadOlhLogRet>()),
         "rgw_cls_trim_olh_log_op" => Some(type_info_denc::<RgwTrimOlhLogOp>()),
         "rgw_cls_bucket_clear_olh_op" => Some(type_info_denc::<RgwClearOlhOp>()),
+        "locker_id_t" | "rados::cls::lock::locker_id_t" => Some(type_info_denc::<LockLockerId>()),
+        "locker_info_t" | "rados::cls::lock::locker_info_t" => {
+            Some(type_info_denc::<LockLockerInfo>())
+        }
+        "lock_info_t" | "rados::cls::lock::lock_info_t" => Some(type_info_denc::<LockInfo>()),
+        "cls_lock_lock_op" => Some(type_info_denc::<LockLockOp>()),
+        "cls_lock_unlock_op" => Some(type_info_denc::<LockUnlockOp>()),
+        "cls_lock_break_op" => Some(type_info_denc::<LockBreakOp>()),
+        "cls_lock_get_info_op" => Some(type_info_denc::<LockGetInfoOp>()),
+        "cls_lock_get_info_reply" => Some(type_info_denc::<LockGetInfoReply>()),
+        "cls_lock_list_locks_reply" => Some(type_info_denc::<LockListLocksReply>()),
+        "cls_lock_assert_op" => Some(type_info_denc::<LockAssertOp>()),
+        "cls_lock_set_cookie_op" => Some(type_info_denc::<LockSetCookieOp>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -403,6 +422,11 @@ fn list_types() {
     println!(
         "  rgw_cls_{{link_olh,unlink_instance,read_olh_log,trim_olh_log,bucket_clear_olh}}_op \
          / rgw_cls_read_olh_log_ret [versioned]"
+    );
+    println!(
+        "  [rados::cls::lock::]{{locker_id,locker_info,lock_info}}_t / \
+         cls_lock_{{lock,unlock,break,get_info,assert,set_cookie}}_op / \
+         cls_lock_{{get_info,list_locks}}_reply [versioned]"
     );
     println!();
     println!("LEVEL 4: Top-level cluster structures");

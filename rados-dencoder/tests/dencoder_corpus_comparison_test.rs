@@ -199,6 +199,20 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("rgw_cls_read_olh_log_ret", None, false),
     TypeSpec::new("rgw_cls_trim_olh_log_op", None, false),
     TypeSpec::new("rgw_cls_bucket_clear_olh_op", None, false),
+    TypeSpec::new("locker_id_t", None, false),
+    TypeSpec::new("rados::cls::lock::locker_id_t", None, false),
+    TypeSpec::new("locker_info_t", None, false),
+    TypeSpec::new("rados::cls::lock::locker_info_t", None, false),
+    TypeSpec::new("lock_info_t", None, false),
+    TypeSpec::new("rados::cls::lock::lock_info_t", None, false),
+    TypeSpec::new("cls_lock_lock_op", None, false),
+    TypeSpec::new("cls_lock_unlock_op", None, false),
+    TypeSpec::new("cls_lock_break_op", None, false),
+    TypeSpec::new("cls_lock_get_info_op", None, false),
+    TypeSpec::new("cls_lock_get_info_reply", None, false),
+    TypeSpec::new("cls_lock_list_locks_reply", None, false),
+    TypeSpec::new("cls_lock_assert_op", None, false),
+    TypeSpec::new("cls_lock_set_cookie_op", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];
