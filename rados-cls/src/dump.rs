@@ -3,11 +3,15 @@
 
 #[cfg(any(feature = "user", feature = "rgw"))]
 use rados::UTime;
+#[cfg(feature = "rgw")]
+use serde::Serialize;
+#[cfg(feature = "rgw")]
+use serde::ser::SerializeSeq;
 
 /// `encode_json` of a `utime_t` streams `utime_t::gmtime`: a count of
 /// seconds below ten years prints as `<sec>.<usec>`, anything later as
 /// ISO 8601 with six microsecond digits and a `Z`.
-#[cfg(feature = "user")]
+#[cfg(any(feature = "user", feature = "rgw"))]
 pub(crate) fn utime<S: serde::Serializer>(
     t: &UTime,
     serializer: S,
@@ -16,7 +20,7 @@ pub(crate) fn utime<S: serde::Serializer>(
 }
 
 /// `utime_t::gmtime` with `legacy_form` false.
-#[cfg(feature = "user")]
+#[cfg(any(feature = "user", feature = "rgw"))]
 pub(crate) fn gmtime(t: &UTime) -> String {
     let usec = t.nsec / 1000;
     if t.sec < 315_360_000 {
@@ -53,6 +57,59 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(any(feature = "refcount", feature = "rgw"))]
 pub(crate) fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_u8(u8::from(*b))
+}
+
+/// `utime_t::gmtime_nsec`: as [`gmtime`], with nine fraction digits in
+/// the calendar form (the below-ten-years form keeps six, as `gmtime`
+/// prints it). `rgw_bi_log_entry::timestamp` is the one field in this
+/// header that streams a `utime_t` this way rather than through
+/// [`utime`].
+#[cfg(feature = "rgw")]
+pub(crate) fn gmtime_nsec(t: &UTime) -> String {
+    if t.sec < 315_360_000 {
+        return format!("{}.{:06}", t.sec, t.nsec / 1000);
+    }
+    let days = i64::from(t.sec / 86_400);
+    let secs = t.sec % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        t.nsec
+    )
+}
+
+#[cfg(feature = "rgw")]
+pub(crate) fn utime_nsec<S: serde::Serializer>(
+    t: &UTime,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&gmtime_nsec(t))
+}
+
+/// `encode_json` of a `std::map`/`std::multimap`: an array of
+/// `{"key": k, "val": v}` objects, in iteration order.
+#[cfg(feature = "rgw")]
+pub(crate) fn map_entries<'a, K, V, I, S>(entries: I, s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    K: Serialize + 'a,
+    V: Serialize + 'a,
+    I: IntoIterator<Item = (&'a K, &'a V)>,
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct Entry<'a, K, V> {
+        key: &'a K,
+        val: &'a V,
+    }
+
+    let mut seq = s.serialize_seq(None)?;
+    for (key, val) in entries {
+        seq.serialize_element(&Entry { key, val })?;
+    }
+    seq.end()
 }
 
 /// A `real_time` that `dump` streams with `operator<<`: the calendar form
@@ -186,6 +243,40 @@ mod tests {
                 nsec: 747_275_000
             }),
             "2024-09-29T12:00:05.747275+0000"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rgw")]
+    fn gmtime_nsec_keeps_six_digits_below_ten_years_and_nine_past_it() {
+        // rgw_bi_log_entry's oracle instance: {2 s, 3 ns}.
+        assert_eq!(gmtime_nsec(&UTime { sec: 2, nsec: 3 }), "2.000000");
+        assert_eq!(
+            gmtime_nsec(&UTime {
+                sec: 1_727_611_205,
+                nsec: 747_275_123
+            }),
+            "2024-09-29T12:00:05.747275123Z"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rgw")]
+    fn map_entries_dumps_key_val_objects() {
+        #[derive(Serialize)]
+        struct Wrapper<'a>(#[serde(serialize_with = "map_entries_field")] &'a [(String, u32)]);
+
+        fn map_entries_field<S: serde::Serializer>(
+            m: &[(String, u32)],
+            s: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            map_entries(m.iter().map(|(k, v)| (k, v)), s)
+        }
+
+        let w = Wrapper(&[("a".to_owned(), 1), ("b".to_owned(), 2)]);
+        assert_eq!(
+            serde_json::to_string(&w).expect("json"),
+            r#"[{"key":"a","val":1},{"key":"b","val":2}]"#
         );
     }
 }

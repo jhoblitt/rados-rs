@@ -152,6 +152,29 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_gc_remove_op", None, false),
     TypeSpec::new("cls_rgw_gc_urgent_data", None, false),
     TypeSpec::new("cls_rgw_gc_queue_init_op", None, false),
+    TypeSpec::new("rgw_bucket_entry_ver", None, false),
+    TypeSpec::new("rgw_bucket_pending_info", None, false),
+    TypeSpec::new("rgw_bucket_category_stats", None, false),
+    TypeSpec::new("rgw_zone_set", None, false),
+    TypeSpec::new("rgw_bucket_dir_entry_meta", None, false),
+    TypeSpec::new("rgw_bucket_dir_entry", None, false),
+    TypeSpec::new("rgw_bucket_dir_header", None, false),
+    TypeSpec::new("rgw_bucket_dir", None, false),
+    TypeSpec::new("rgw_bi_log_entry", None, false),
+    TypeSpec::new("cls_rgw_bucket_instance_entry", None, false),
+    TypeSpec::new("cls_rgw_reshard_entry", None, false),
+    TypeSpec::new("rgw_bucket_olh_log_entry", None, false),
+    TypeSpec::new("rgw_bucket_olh_entry", None, false),
+    TypeSpec::new("rgw_cls_bi_entry", None, false),
+    TypeSpec::new("rgw_usage_data", None, false),
+    // No corpus directory in either archive.
+    TypeSpec::new("rgw_s3select_usage_data", None, false),
+    TypeSpec::new("rgw_usage_log_entry", None, false),
+    TypeSpec::new("rgw_usage_log_info", None, false),
+    TypeSpec::new("rgw_user_bucket", None, false),
+    TypeSpec::new("cls_rgw_lc_entry", None, false),
+    // No corpus directory and no test instances.
+    TypeSpec::new("cls_rgw_lc_obj_head", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];
