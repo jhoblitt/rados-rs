@@ -57,10 +57,15 @@ Plans 3 to 8's Global Constraints apply unchanged. Plus:
   `usage` merges every hour of a (payer-or-owner, bucket) pair into one
   value; `next_iter` is the last key scanned and is set only when
   `truncated`, so resumption is exclusive; a trim stats the object
-  first (`ENOENT` when missing), removes up to a thousand keys of the
-  range (v19 derives the keys from the owner, so requester-pays records
-  written under a payer are never trimmed), and returns `ENODATA` once
-  nothing is left, which the client loops on; a clear empties the omap
+  first (`ENOENT` when missing), scans up to a thousand omap keys of the
+  range and removes both keys of each entry found (v19 derives the keys
+  to remove from the owner, so a requester-pays record stored under a
+  payer is found but never removed), and returns `ENODATA` only when the
+  scan found no entry and was not truncated; two v19 states therefore
+  answer 0 forever without progress (a payer-keyed entry in range; more
+  than a thousand keys in range all skipped by `bucket`, since the trim
+  carries no iter), which is why the client bounds its loop where
+  `cls_rgw_client.cc` does not; a clear empties the omap
   and treats a missing object as success; a read on a missing object is
   `ENOENT` (RGW moves to the next shard).
 - `rgw_cls_usage_log_add_op.user` is never set by the C++ client and
@@ -75,8 +80,9 @@ Plans 3 to 8's Global Constraints apply unchanged. Plus:
 3. `iter` paging: `max_entries` counts keys, `next_iter` is the last key
    scanned, the walk resumes after it; a page can be shorter than
    `max_entries` when keys are skipped. Pinned in Task 2.
-4. `trim` loops until `ENODATA` and is `ENOENT` on a missing shard;
-   `clear` on a missing shard succeeds. Pinned in Task 2.
+4. `trim` loops until `ENODATA`, bounded, and is `ENOENT` on a missing
+   shard; `clear` on a missing shard succeeds; a trim by time over a
+   payer-keyed entry gives up. Pinned in Task 2.
 
 ---
 
@@ -109,8 +115,9 @@ plan 8 merges; the cluster up.
   &str, start_epoch: u64, end_epoch: u64, max_entries: u32, iter: &str)`,
   `decode_read(&OpReply) -> Result<ReadRet>`, `trim_op(user, bucket,
   start_epoch, end_epoch)`, `clear_op()` (raw, empty).
-- Async: `add`, `read -> Result<ReadRet>`, `trim` (loops the op until
-  the OSD answers `ENODATA`, then `Ok(())`; any other error returns),
+- Async: `add`, `read -> Result<ReadRet>`, `trim` (sends the op until the OSD answers `ENODATA`, then `Ok(())`,
+  at most `MAX_TRIM_ROUNDS` = 1000 times, then `OSDClientError::Other`
+  naming the count; any other error returns),
   `clear`.
 
 Unit tests pin the four oracle vectors and JSON above, plus a
@@ -168,6 +175,11 @@ boundary, as RGW rounds); `key(user, bucket) -> UserBucket`.
    + 60)` then `read("u1", "", 0, E + 7200, ..)` returns only the second
    hour; `trim("", "", 0, u64::MAX)` (by time) empties it; add again,
    `clear`, `read` returns nothing.
+5. `usage_trim_gives_up_on_a_payer_keyed_entry`: add an entry with
+   `payer = "p4"`; `trim("", "", 0, u64::MAX)` fails with
+   `OSDClientError::Other` after `MAX_TRIM_ROUNDS` (the class finds the
+   entry each round and removes nothing); `trim("u4", "", 0, u64::MAX)`
+   succeeds at once; `read("p4", ..)` still returns the entry.
 
 Commit:
 
