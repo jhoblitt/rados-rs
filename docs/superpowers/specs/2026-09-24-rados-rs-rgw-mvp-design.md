@@ -25,7 +25,10 @@ expressed against the fork.
 - Resharding as an action: the reshard queue ops are out. The resharding
   guard and `get_bucket_resharding` are in, because C++ RGW attaches the
   guard to every bucket-index write and a compatible client must too.
-- `cls_otp` (MFA), `copy_from2` (the MVP copies by read and write),
+- `cls_otp` (MFA), `copy_from2` (radosgw does not use it: a copy shares
+  the source's tails through `cls_refcount` under a new tag and streams
+  data only when placement, storage class, encryption or head geometry
+  force it, which the `refcount` module supports),
   `rgw_s3select` usage data beyond what the usage-log types carry.
 - RGW features excluded from the MVP driver for the time being, listed
   here so that nothing in this fork is sized or tested for them, and
