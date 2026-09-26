@@ -63,11 +63,26 @@ maintain a list of its own.
   this fork lacked, the roadmap now carries: `cls_lock` (the GC,
   lifecycle and reshard workers and the notification queues take
   radosgw's locks by name), `cls_2pc_queue` (persistent notifications)
-  and `cls_otp` (MFA). Feature level is a separate axis: rgw-go targets
-  Tentacle radosgw gateway-side on a Squid floor; this fork's class
-  bindings encode what Squid's OSD accepts and decode what `main`
-  writes, and Tentacle-only replies (the OLH epoch, `get_stales`) are
-  follow-ups, not exclusions.
+  and `cls_otp` (MFA). Feature level follows rgw-go's encoding rule, which the owner
+  adopted for rgw-rs on 2026-09-25: a gateway decodes every struct
+  version the C++ decoders accept (no release floor for stored
+  metadata, since never-rewritten users and buckets keep their original
+  encoding) and encodes each persistent type at the version the
+  cluster's own radosgw release writes, detected once from the OSD map's
+  required OSD release and overridable for testing. At this fork's
+  layer that rule splits by who writes the bytes: the bucket-index, OLH,
+  GC, usage and lifecycle records are written and re-encoded by the
+  OSD's object class at that OSD's version, so `rados-cls` encodes
+  requests at the versions Squid's radosgw sends, decodes replies up to
+  what `main` writes, and floors its decoders at Squid (every reply is
+  re-encoded by the OSD; the raw-omap readers that would see older
+  stored bytes, `bi_get` and `bi_list`, are out); where Tentacle changed
+  a request or reply shape (the OLH epoch reply on link and unlink,
+  `get_stales` on `read_olh_log`, `update_stats` version 2), the
+  `release-shapes` package offers both shapes, selectable by release,
+  and the `rados` crate exposes the cluster's required OSD release for
+  the driver's detection seam. The driver-level types the gateway
+  writes itself are rgw-rs's, and there the rule applies in full.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
 
@@ -199,6 +214,13 @@ land last.
   reservations, remove entries, expire reservations; what
   `rgw_notify.cc` does with them.
 - `cls-otp`: create, remove, set, check and get, and the MFA seed types.
+- `release-shapes` (after `watch-notify`): the cluster's required OSD
+  release exposed from the OSD map (and kept through incrementals,
+  which today discard it), and the Tentacle request and reply shapes of
+  the `rgw` class selectable by release: the OLH epoch reply on link and
+  unlink (a writing method that replies, so `RETURNVEC`), `get_stales`
+  on `read_olh_log`, `update_stats` version 2, and whatever else the
+  package's research finds changed between v19.2.2 and `main`.
 
 Every struct records the `ENCODE_START` version and compat it mirrors, and
 its floor is what C++ RGW on Squid writes.
