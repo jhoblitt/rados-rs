@@ -26,8 +26,15 @@ maintain a list of its own.
 ## Non-goals
 
 - Multisite: no `cls_log`, `cls_timeindex`, `cls_fifo`, `cls_cmpomap`, no
-  bucket-index log (`bilog`) or `bi_*` repair ops, no data or metadata
-  log, no sync of any kind.
+  bucket-index log (`bilog`; a single-zone zonegroup leaves `log_data`
+  off, so radosgw writes none either), no data or metadata log, no sync
+  of any kind.
+- The `bi_get`, `bi_put` and `bi_list` index methods: `bi_get` backs
+  radosgw's index-repair readers and `bi_put`/`bi_list` its resharding
+  and admin-tool paths, so they are out only while no path in scope
+  needs them, not because of the multisite entry (rgw-go's document says
+  the same). A later package can add them without touching this spec's
+  goals.
 - Persistent bucket notifications are in scope at the RADOS layer
   (`cls_2pc_queue` and the queue locks, package `cls-2pc-queue`); only
   Kafka and AMQP delivery are out, and delivery of any kind is RGW-level.
