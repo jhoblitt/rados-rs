@@ -68,10 +68,12 @@ Plans 3 to 6's Global Constraints apply unchanged. Plus:
   separate method. With `num_entries > 0`, a reply that is truncated with
   no entries comes back with result `EFBIG` (27) and a valid encoded
   reply whose `marker` is where to resume; the async `list` loops on
-  it. Whether the OSD ships the reply payload alongside a negative op
-  result is a research gap; Task 4's `index_list_advances_past_invalid_entries`
-  settles it, and if the payload is missing the loop must be rewritten
-  to page by the caller's own last key (report, do not guess).
+  it. The OSD ships the reply payload alongside the negative result
+  (verified on v19.2.2: result -27, the op's return code -27, and an
+  encoded reply with no entries and an advanced marker). One call scans
+  at most eight times `num_entries` keys (`max_attempts` in
+  `cls_rgw.cc`) before answering, so 64 resends cross at most
+  `520 * num_entries` skipped entries.
 - Suggestions are a raw concatenation of `u8 op` and an encoded
   `rgw_bucket_dir_entry`: `op` is `b'r'` (114) or `b'u'` (117), or'ed
   with `0x80` when the change should be bilogged.
@@ -149,7 +151,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 
 **Files:**
 - Modify: `rados-cls/src/rgw/index.rs`, `rados-cls/src/rgw/types.rs`
-  (`CheckMtimeType`), dencoder (eleven arms), corpus table (eleven:
+  (`CheckMtimeType`), dencoder (twelve arms), corpus table (twelve:
   `rgw_cls_tag_timeout_op`, `rgw_cls_obj_prepare_op`,
   `rgw_cls_obj_complete_op`, `rgw_cls_list_op`, `rgw_cls_list_ret`,
   `rgw_cls_check_index_ret`, `rgw_cls_obj_remove_op`,
@@ -169,7 +171,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
   `GuardBucketReshardingOp`, `GetBucketReshardingOp`,
   `GetBucketReshardingRet`; `Suggestion { op: SuggestOp, log: bool,
   entry: DirEntry }` with `SuggestOp { Remove, Update }` and
-  `encode_suggestions(&[Suggestion]) -> Bytes`.
+  `encode_suggestions(&[Suggestion]) -> Result<Bytes>` (a string encode
+  can fail; library code does not panic).
 
 Facts and pins (oracle instances; `unhex` helper as plan 6):
 
@@ -381,14 +384,18 @@ Tests (all `#[ignore]`):
    tag that was never prepared is `EINVAL`.
 3. `index_stale_epoch_is_a_cancel`: ten prepares with tags `t0..t9` on
    one name; completes in the order epoch 10, 9, ..., 1 with sizes
-   `1024 * epoch`: after all, `num_entries == 1` and `total_size == 10240`
-   (only the first, highest epoch counted); `list` shows one entry whose
-   `ver.epoch == 10`.
+   `1024 * epoch`: after all, `num_entries == 1` and `total_size == 10240` (only the
+   first, highest epoch counted); `list` shows one entry whose
+   `ver.epoch == 1`: `rgw_bucket_complete_op` stores `op.ver` on the
+   entry before its cancel branch, so each cancelled complete rewrites
+   it.
 4. `index_delete_with_a_pending_tag_keeps_the_key`: add `x` (prepare +
    complete, epoch 1); `prepare(DEL, "d")` and `prepare(ADD, "a")` on `x`;
    `complete(DEL, "d", epoch 2)`: stats `num_entries == 0`, and `list`
    with `list_versions` still returns `x` with `exists == false` (the
-   pending `a` keeps the key; plain `list` hides it); `complete(ADD, "a",
+   pending `a` keeps the key), as does a plain `list`: `bucket_list`
+   filters on `is_valid()`/`is_visible()` only, never on `exists`,
+   leaving that to RGW; `complete(ADD, "a",
    epoch 3, 2048)`: `num_entries == 1`, `total_size == 2048`, `x` visible.
 5. `index_list_pages_and_delimits`: add `a/1`, `a/2`, `b`, `c/1`, `d`;
    `list(num_entries 2)` returns `[a/1, a/2]` truncated with a non-empty
@@ -404,18 +411,19 @@ Tests (all `#[ignore]`):
 7. `index_list_advances_past_invalid_entries`: `omap_set` 9000 entries
    `inv-00000..inv-08999` whose value is an encoded `DirEntry` with
    `flags = FLAG_VER_MARKER`, `exists = true`, `meta(1)`, plus one real
-   entry `z` added through prepare/complete; `list(num_entries 1)` returns
-   `[z]`. This is the `EFBIG` path (the class gives up after eight
-   attempts with nothing to return and asks the client to advance); if
-   the async `list` fails with -27 instead, the OSD does not ship the
-   reply with the error and the loop must page by the last key seen:
-   report it rather than weakening the test.
+   entry `z` added through prepare/complete; `list(num_entries 1000)` returns
+   `[z]`: the first call scans 8000 keys and answers `EFBIG` with its
+   marker, and the loop's second call finds `z` (with `num_entries 1`
+   the 64 resends cross only 520 entries, so that form cannot pass).
 8. `index_suggest_after_the_tag_expires`: `set_tag_timeout(1)`;
    `prepare(ADD, "p", "s")` without completing; a `Suggestion { Update,
    entry: DirEntry { key s, exists true, meta(512), .. } }` sent at once
    is ignored (`num_entries == 0`); after `sleep(2 s)` the same suggestion
    is applied (`num_entries == 1`, `total_size == 512`) and `list` shows
-   `s`; a `Remove` suggestion for `s` (same entry) then removes it
+   `s`; a `Remove` suggestion built from `s` as listed (the applied
+   update stamped `index_ver` with the header's `ver`, and
+   `rgw_dir_suggest_changes` ignores a suggestion whose `index_ver` is
+   older than the stored entry's) then removes it
    (`num_entries == 0`); repeating the remove is a no-op success.
 9. `index_check_and_rebuild`: add two objects; `update_stats(absolute
    true, {MAIN: {1, 4096, 1, 1}})` corrupts the header; `check_index`
@@ -426,7 +434,8 @@ Tests (all `#[ignore]`):
     a compound `guard_op() + prepare_op(..)` succeeds; `set_bucket_resharding(IN_PROGRESS)`;
     `get_bucket_resharding` is `IN_PROGRESS`; the same compound fails with
     `OSDError { code: -2300 }` and `dir_header` shows no pending entry
-    (stats unchanged, `list` with `list_versions` empty);
+    (stats unchanged, `list` with `list_versions` shows only the entry
+    the earlier guarded prepare created);
     `guard_bucket_resharding(-2300)` alone fails the same way;
     `clear_bucket_resharding`; the compound succeeds again.
 11. `head_object_helpers`: `write_full` an object and `setxattr`
