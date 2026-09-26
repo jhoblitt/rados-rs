@@ -43,8 +43,9 @@ pub(crate) async fn exec_raw(
 /// `OpBuilder::returnvec` keeps the method's output data, which the OSD
 /// otherwise clears on a successful write, up to
 /// `osd_max_write_op_reply_len` (64 bytes by default; more is
-/// `EOVERFLOW`). Only the `user` class has such a method so far.
-#[cfg(feature = "user")]
+/// `EOVERFLOW`). The `user` class's `reset_user_stats2` and the
+/// `2pc_queue` class's `2pc_queue_reserve` are such methods.
+#[cfg(any(feature = "user", feature = "two_pc_queue"))]
 pub(crate) async fn exec_returnvec<R: Denc>(
     ioctx: &IoCtx,
     oid: &str,
