@@ -862,9 +862,16 @@ model. The PR body:
   `rgw_usage_log_entry`'s usage map. When both key and value have denc
   traits (integers, strings, bufferlists) the denc path uses
   `emplace_hint` and the FIRST value wins (for example `RGWUserCaps`'s
-  `map<string, uint32>`). The crate's `BTreeMap` decode keeps the last,
-  which matches every struct-valued map the classes return; document
-  the first-wins case on the map decode (well-formed replies never
+  `map<string, uint32>`). `std::unordered_map` is the exception: its
+  constrained `emplace` overload is selected for move-constructible K and
+  V, so the FIRST value wins regardless of traits (verified with
+  `cls_rgw_gc_urgent_data`'s `unordered_map<string, real_time>`); that
+  covers `rgw_gc::UrgentData`'s map and the 2pc queue's reservation map,
+  which the crate decodes last-wins. `multimap` keeps every entry. The
+  crate's `BTreeMap` decode keeps the last, which matches every
+  struct-valued `std::map`/`flat_map` the classes return; document
+  the first-wins cases (denc-traits maps and every `unordered_map`) on
+  the map decode and on those two types (well-formed replies never
   repeat a key, so this is a parity note, not a behaviour change).
 - Two writing class calls in one compound op both read the pre-op
   object state, so the later write wins (two `rgw_gc` enqueues in one op
