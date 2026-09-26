@@ -57,8 +57,9 @@ use rados_cls::rgw::types::{
     ZoneSet as RgwZoneSet,
 };
 use rados_cls::rgw::usage::{
-    S3selectUsageData as RgwS3selectUsageData, UsageData as RgwUsageData,
-    UsageLogEntry as RgwUsageLogEntry, UsageLogInfo as RgwUsageLogInfo,
+    AddOp as RgwUsageLogAddOp, ReadOp as RgwUsageLogReadOp, ReadRet as RgwUsageLogReadRet,
+    S3selectUsageData as RgwS3selectUsageData, TrimOp as RgwUsageLogTrimOp,
+    UsageData as RgwUsageData, UsageLogEntry as RgwUsageLogEntry, UsageLogInfo as RgwUsageLogInfo,
     UserBucket as RgwUserBucket,
 };
 use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
@@ -264,6 +265,10 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_usage_log_entry" => Some(type_info_denc::<RgwUsageLogEntry>()),
         "rgw_usage_log_info" => Some(type_info_denc::<RgwUsageLogInfo>()),
         "rgw_user_bucket" => Some(type_info_denc::<RgwUserBucket>()),
+        "rgw_cls_usage_log_add_op" => Some(type_info_denc::<RgwUsageLogAddOp>()),
+        "rgw_cls_usage_log_read_op" => Some(type_info_denc::<RgwUsageLogReadOp>()),
+        "rgw_cls_usage_log_read_ret" => Some(type_info_denc::<RgwUsageLogReadRet>()),
+        "rgw_cls_usage_log_trim_op" => Some(type_info_denc::<RgwUsageLogTrimOp>()),
         "cls_rgw_lc_entry" => Some(type_info_denc::<RgwLcEntry>()),
         "cls_rgw_lc_obj_head" => Some(type_info_denc::<RgwLcObjHead>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
@@ -368,6 +373,7 @@ fn list_types() {
         "  rgw_usage_{{data,log_entry,log_info}} / rgw_s3select_usage_data / \
          rgw_user_bucket [versioned]"
     );
+    println!("  rgw_cls_usage_log_{{add,read,trim}}_op / rgw_cls_usage_log_read_ret [versioned]");
     println!("  cls_rgw_lc_{{entry,obj_head}} [versioned]");
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
