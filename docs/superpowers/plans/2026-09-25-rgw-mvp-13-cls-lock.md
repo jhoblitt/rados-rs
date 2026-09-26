@@ -75,7 +75,7 @@ dependencies). Plus:
 - Oracle: `ceph-dencoder` from `quay.io/ceph/ceph:v19.2.2`
   (`/tmp/claude/ceph-dencoder`); raw captures and the script that made
   them are in `/tmp/claude/cls-lock-oracle/` (`run.sh`, `<type>.<N>.bin`,
-  `ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file) for `entity_addr_t`). **`select_test` counts from 1** and
+  `ea.<N>.bin` for `entity_addr_t`). **`select_test` counts from 1** and
   `0` wraps to the last instance: `select_test 1` is the populated
   instance, `select_test 2` the default-constructed one (§2.12). Every
   pin below says which.
@@ -173,7 +173,7 @@ are not touched.
   Today family 0 gives 0 and other families 128 (`STORAGE_SIZE`). The doc
   comment says it mirrors `entity_addr_t::get_sockaddr_len`.
   `encoded_size` follows.
-- Pins (from `/tmp/claude/cls-lock-oracle/ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)``, 47 bytes each):
+- Pins (from `/tmp/claude/cls-lock-oracle/ea.<N>.bin```, 47 bytes each):
   `entity_addr_t` `select_test 1` = `EntityAddr { addr_type: None, nonce:
   0, sockaddr_data: zeros }` =
   `0101012800000000000000000000001c000000` + 56 hex zeros;
@@ -258,7 +258,7 @@ Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
   `entity_addr_t` encodings (Legacy, `sockaddr_in6` = family 10 LE, port
   BE, flowinfo, 16 address bytes, scope id) to
   `/tmp/claude/cls-lock-oracle/ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)`` and run `ceph-dencoder type
-  entity_addr_t import ea.<N>.bin` (N from 4 to 8, so `ea.1`-`ea.3` stay; `run.sh` writes no `ea.*` file)` decode dump_json` (unsandboxed); the
+  entity_addr_t import ea.<N>.bin`` decode dump_json` (unsandboxed); the
   `addr` field is the pin's `<sockaddr>` part, with `/<nonce>` appended:
   - `::1.2.3.4` port 1 nonce 0:
     `0101012800000001000000000000001c0000000a000001000000000000000000000000000000000102030400000000`
