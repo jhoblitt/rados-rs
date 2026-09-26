@@ -1,7 +1,14 @@
 //! Renderings that match `ceph-dencoder`'s `dump_json` where `serde`'s
 //! defaults do not.
 
-#[cfg(any(feature = "user", feature = "rgw", feature = "lock"))]
+#[cfg(feature = "two_pc_queue")]
+use bytes::Bytes;
+#[cfg(any(
+    feature = "user",
+    feature = "rgw",
+    feature = "lock",
+    feature = "two_pc_queue"
+))]
 use rados::UTime;
 #[cfg(feature = "rgw")]
 use serde::Serialize;
@@ -39,7 +46,12 @@ pub(crate) fn gmtime(t: &UTime) -> String {
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`;
 /// Howard Hinnant's `civil_from_days`.
-#[cfg(any(feature = "user", feature = "rgw", feature = "lock"))]
+#[cfg(any(
+    feature = "user",
+    feature = "rgw",
+    feature = "lock",
+    feature = "two_pc_queue"
+))]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -115,12 +127,12 @@ where
 /// A `real_time` that `dump` streams with `operator<<`: the calendar form
 /// with microseconds and the zone offset, which is `+0000` where
 /// `ceph-dencoder` runs.
-#[cfg(feature = "rgw")]
+#[cfg(any(feature = "rgw", feature = "two_pc_queue"))]
 pub(crate) fn real_time<S: serde::Serializer>(t: &UTime, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&iso_utc(t))
 }
 
-#[cfg(any(feature = "rgw", feature = "lock"))]
+#[cfg(any(feature = "rgw", feature = "lock", feature = "two_pc_queue"))]
 pub(crate) fn iso_utc(t: &UTime) -> String {
     let usec = t.nsec / 1000;
     let (year, month, day) = civil_from_days(i64::from(t.sec / 86_400));
@@ -130,6 +142,17 @@ pub(crate) fn iso_utc(t: &UTime) -> String {
         secs / 3600,
         (secs % 3600) / 60,
         secs % 60
+    )
+}
+
+/// A `vector<bufferlist>` dumped with `encode_json`: `bufferlist::encode_base64`
+/// strings, the padded standard alphabet with no line breaks.
+#[cfg(feature = "two_pc_queue")]
+pub(crate) fn base64_vec<S: serde::Serializer>(v: &[Bytes], s: S) -> Result<S::Ok, S::Error> {
+    use base64::Engine as _;
+    s.collect_seq(
+        v.iter()
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
     )
 }
 
@@ -245,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rgw")]
+    #[cfg(any(feature = "rgw", feature = "two_pc_queue"))]
     fn streamed_real_time_is_iso_with_a_numeric_offset() {
         // operator<<(ostream&, real_time): calendar form even at the epoch,
         // microseconds, and the zone's %z, which is +0000 where dencoder runs.
@@ -316,6 +339,23 @@ mod tests {
         assert_eq!(
             localtime(&UTime::new(1_727_604_086, 460_555_954)),
             "2024-09-29T10:01:26.460555+0000"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "two_pc_queue")]
+    fn commit_op_dumps_payloads_as_padded_base64() {
+        // bufferlist::encode_base64: RFC 4648 alphabet, '=' padding, no breaks.
+        let op = crate::two_pc_queue::CommitOp {
+            id: 1,
+            data: [&b"a"[..], b"ab", b"foo", b"\xff\xfe"]
+                .into_iter()
+                .map(Bytes::copy_from_slice)
+                .collect(),
+        };
+        assert_eq!(
+            serde_json::to_string(&op).expect("json"),
+            r#"{"id":1,"bl_data_vec":["YQ==","YWI=","Zm9v","//4="]}"#
         );
     }
 }
