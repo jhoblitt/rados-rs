@@ -25,18 +25,14 @@ pub const CEPH_MSG_OSD_OPREPLY: u16 = 43;
 pub const CEPH_MSG_OSD_BACKOFF: u16 = 61;
 
 /// Message type for MWatchNotify (OSD to Client)
-#[allow(dead_code)] // the session dispatches it from the next commit
 pub const CEPH_MSG_WATCH_NOTIFY: u16 = 44;
 
 /// `CEPH_WATCH_EVENT_*` (`include/ceph_fs.h`): an `MWatchNotify`'s opcode.
 /// A notify to a watcher: its watch cookie, the notify id and the payload.
-#[allow(dead_code)] // the session dispatches it from the next commit
 pub const CEPH_WATCH_EVENT_NOTIFY: u8 = 1;
 /// A notify's completion to its notifier: the reply map is the data segment.
-#[allow(dead_code)] // the session dispatches it from the next commit
 pub const CEPH_WATCH_EVENT_NOTIFY_COMPLETE: u8 = 2;
 /// The OSD dropped a watch while the session was up.
-#[allow(dead_code)] // the session dispatches it from the next commit
 pub const CEPH_WATCH_EVENT_DISCONNECT: u8 = 3;
 
 /// Backoff operation codes
@@ -251,7 +247,6 @@ impl MOSDBackoff {
 /// The front has no `ENCODE_START` envelope: a leading `msg_ver` byte
 /// gates `bl`, and the messenger header version gates `return_code` (v2)
 /// and `notifier_gid` (v3); Squid sends v3.
-#[allow(dead_code)] // the session dispatches it from the next commit
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MWatchNotify {
     /// `CEPH_WATCH_EVENT_*`
@@ -269,7 +264,6 @@ pub struct MWatchNotify {
     pub notifier_gid: u64,
 }
 
-#[allow(dead_code)] // the session dispatches it from the next commit
 impl MWatchNotify {
     /// Decode the front segment; `header_version` is the messenger
     /// header's version, which gates the last two fields.

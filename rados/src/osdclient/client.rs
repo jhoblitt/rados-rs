@@ -116,6 +116,14 @@ pub struct OSDClient {
     /// the new session's tid to fall below the highest tid the OSD had
     /// already seen for the same object.  Mirrors `Objecter::last_tid`.
     next_tid: Arc<AtomicU64>,
+    /// Watches and in-flight notifies, keyed by cookie: Objecter's
+    /// `linger_ops`. Every `MWatchNotify` is routed through it.
+    lingers: dashmap::DashMap<u64, Arc<crate::osdclient::watch::Linger>>,
+    /// Linger cookie source. Starts above 1000, as librados's cookies do
+    /// (its tests assert `cookie > 1000`), and never reuses a value, since
+    /// the OSD keys a watch by `(cookie, client gid)`.
+    #[allow(dead_code)] // lingers are registered from the next commit
+    next_cookie: AtomicU64,
 }
 
 /// Await an OSD operation result with a timeout, mapping all error layers to `OSDClientError`.
@@ -238,6 +246,8 @@ impl OSDClient {
                 blocklisted: AtomicBool::new(false),
                 epoch_barrier: AtomicU32::new(0),
                 next_tid: Arc::new(AtomicU64::new(1)),
+                lingers: dashmap::DashMap::new(),
+                next_cookie: AtomicU64::new(1001),
             }
         });
 
@@ -300,6 +310,9 @@ impl OSDClient {
             crate::osdclient::messages::CEPH_MSG_OSD_BACKOFF => {
                 self.handle_backoff_from_osd(osd_id, msg).await
             }
+            crate::osdclient::messages::CEPH_MSG_WATCH_NOTIFY => {
+                self.handle_watch_notify(osd_id, msg)
+            }
             _ => {
                 warn!(
                     "Unexpected session-specific message type 0x{:04x} from OSD {}",
@@ -308,6 +321,49 @@ impl OSDClient {
                 Ok(())
             }
         }
+    }
+
+    /// Decode an `MWatchNotify` and route it to its linger by cookie.
+    /// Synchronous: it runs inside the session's I/O loop.
+    fn handle_watch_notify(&self, osd_id: i32, msg: crate::msgr2::message::Message) -> Result<()> {
+        let event =
+            crate::osdclient::messages::MWatchNotify::decode(msg.header.version.get(), &msg.front)?;
+        debug!(
+            "watch-notify from OSD {}: opcode {} cookie {} notify_id {} rc {}",
+            osd_id, event.opcode, event.cookie, event.notify_id, event.return_code
+        );
+        crate::osdclient::watch::route_watch_notify(&self.lingers, event, msg.data);
+        Ok(())
+    }
+
+    /// The session to `osd_id` ended: its I/O task exited, whether the
+    /// connection dropped or the session was closed on purpose. Returns
+    /// at once; the lingers on that OSD are re-sent from a spawned task,
+    /// since the caller is the dying I/O task and `OSDSession::close()`
+    /// awaits it.
+    /// Returns whether it spawned the re-send.
+    pub(crate) fn on_session_reset(self: &Arc<Self>, osd_id: i32) -> bool {
+        // Client shutdown ends every I/O task through the same path.
+        if self.shutdown_token.is_cancelled() {
+            return false;
+        }
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            client.relinger_after_reset(osd_id).await;
+        });
+        true
+    }
+
+    async fn relinger_after_reset(&self, osd_id: i32) {
+        let affected = self
+            .lingers
+            .iter()
+            .filter(|l| l.lock_state().osd == Some(osd_id))
+            .count();
+        debug!(
+            "session to OSD {} reset with {} linger(s) on it",
+            osd_id, affected
+        );
     }
 
     /// Get the current OSDMap
@@ -486,6 +542,7 @@ impl OSDClient {
 
             // Insert the new session, replacing any disconnected session.
             // insert() returns the old value so we can kick its pending ops.
+            session.mark_published();
             sessions.insert(osd_id, Arc::clone(&session))
         };
 
@@ -2622,10 +2679,12 @@ impl OSDClient {
 
 #[cfg(test)]
 mod tests {
-    use super::OSDClient;
+    use super::{OSDClient, OSDClientConfig};
     use crate::osdclient::error::OSDClientError;
+    use crate::osdclient::types::ObjectId;
     use crate::osdclient::types::{OpReply, OpResult};
     use bytes::Bytes;
+    use std::sync::Arc;
 
     fn result(overall: i32, first: i32) -> OpResult {
         OpResult {
@@ -2654,5 +2713,86 @@ mod tests {
         assert!(matches!(err, OSDClientError::OSDError { code: -2, .. }));
         let err = OSDClient::check_op_result(&result(0, -125), "t").expect_err("per-op");
         assert!(matches!(err, OSDClientError::OSDError { code: -125, .. }));
+    }
+
+    /// An `OSDClient` whose MonClient never connects: enough for the
+    /// paths that need no cluster.
+    pub(crate) async fn offline_client() -> Arc<OSDClient> {
+        let auth = crate::monclient::auth_config::AuthConfig::no_auth("client.test".to_string());
+        let mon_config = crate::monclient::MonClientConfig {
+            mon_addrs: vec!["v2:127.0.0.1:3300".to_string()],
+            auth: Some(auth),
+            ..Default::default()
+        };
+        let mon = crate::monclient::MonClient::new(mon_config, None)
+            .await
+            .expect("monclient");
+        let (tx, rx) = crate::msgr2::map_channel(8);
+        OSDClient::new(
+            OSDClientConfig::default(),
+            crate::UuidD::default(),
+            mon,
+            tx,
+            rx,
+        )
+        .await
+        .expect("osdclient")
+    }
+
+    #[tokio::test]
+    async fn watch_notify_messages_are_routed_by_cookie() {
+        use crate::osdclient::messages::{CEPH_MSG_WATCH_NOTIFY, CEPH_WATCH_EVENT_NOTIFY};
+        use crate::osdclient::watch::{Linger, LingerKind, WatchEvent};
+
+        let client = offline_client().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.lingers.insert(
+            1001,
+            Arc::new(Linger::new(
+                1001,
+                ObjectId::new(1, "o"),
+                LingerKind::Watch { timeout: 0 },
+                tx,
+            )),
+        );
+
+        let mut front = vec![1, CEPH_WATCH_EVENT_NOTIFY];
+        front.extend_from_slice(&1001u64.to_le_bytes());
+        front.extend_from_slice(&0u64.to_le_bytes());
+        front.extend_from_slice(&55u64.to_le_bytes());
+        front.extend_from_slice(&[2, 0, 0, 0, b'h', b'i']);
+        front.extend_from_slice(&0i32.to_le_bytes());
+        front.extend_from_slice(&4242u64.to_le_bytes());
+        let mut msg = crate::msgr2::message::Message::new(CEPH_MSG_WATCH_NOTIFY, front.into());
+        msg.header.version = crate::denc::zerocopy::little_endian::U16::new(3);
+
+        client.dispatch_from_osd(0, msg).await.expect("dispatch");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(WatchEvent::Notify {
+                notify_id: 55,
+                notifier_gid: 4242,
+                payload: Bytes::from_static(b"hi"),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reset_hook_does_nothing_after_shutdown() {
+        let client = offline_client().await;
+        assert!(client.on_session_reset(3));
+        client.shutdown().await;
+        assert!(!client.on_session_reset(3));
+    }
+
+    #[tokio::test]
+    async fn only_a_published_session_reports_its_reset() {
+        use crate::osdclient::session::report_reset;
+        use std::sync::atomic::AtomicBool;
+
+        let client = offline_client().await;
+        let weak = Arc::downgrade(&client);
+        assert!(!report_reset(&AtomicBool::new(false), &weak, 3));
+        assert!(report_reset(&AtomicBool::new(true), &weak, 3));
     }
 }

@@ -12,6 +12,8 @@ pub const EACCES: i32 = -13; // Permission denied
 pub const EEXIST: i32 = -17; // File exists
 pub const EINVAL: i32 = -22; // Invalid argument
 pub const ENOSPC: i32 = -28; // No space left on device
+pub const ENOTCONN: i32 = -107; // Transport endpoint is not connected (a lost watch)
+pub const ETIMEDOUT: i32 = -110; // Connection timed out (a notify's timeout; a watch to reconnect)
 
 /// Errors that can occur during OSD client operations.
 ///
