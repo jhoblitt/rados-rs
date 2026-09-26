@@ -307,6 +307,7 @@ impl StripedPgId {
     Clone,
     PartialEq,
     Eq,
+    Hash,
     crate::ZeroCopyDencode,
     zerocopy::FromBytes,
     zerocopy::IntoBytes,
@@ -330,6 +331,44 @@ impl PackedEntityName {
         Self {
             entity_type,
             num: crate::denc::zerocopy::little_endian::U64::new(num),
+        }
+    }
+}
+
+impl Default for PackedEntityName {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+/// As C++ `entity_name_t`'s `operator<`: the type, then the number as an
+/// `int64_t`, so `client.?` (`-1`) sorts before `client.0`.
+impl Ord for PackedEntityName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.entity_type, self.num.get() as i64).cmp(&(other.entity_type, other.num.get() as i64))
+    }
+}
+
+impl PartialOrd for PackedEntityName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// As C++ `entity_name_t`'s `operator<<`: `client.4242`, `unknown.<n>`
+/// for a type that is not exactly one known bit, and `<type>.?` when the
+/// number is negative as an `int64_t`.
+impl std::fmt::Display for PackedEntityName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entity_type = match EntityType::from_bits(u32::from(self.entity_type)) {
+            Some(t) => t.to_string(),
+            None => "unknown".to_owned(),
+        };
+        let num = self.num.get() as i64;
+        if num < 0 {
+            write!(f, "{entity_type}.?")
+        } else {
+            write!(f, "{entity_type}.{num}")
         }
     }
 }
@@ -1836,5 +1875,25 @@ mod tests {
         assert_eq!(OpCode::Zero as u16, 0x2204); // (WR, DATA, 4)
         assert_eq!(OpCode::SetAllocHint as u16, 0x2223); // (WR, DATA, 35)
         assert_eq!(OpCode::ListWatchers as u16, 0x1209); // (RD, DATA, 9)
+    }
+
+    #[test]
+    fn packed_entity_name_prints_as_entity_name_t() {
+        assert_eq!(PackedEntityName::new(0x08, 1).to_string(), "client.1");
+        assert_eq!(PackedEntityName::default().to_string(), "unknown.0");
+        assert_eq!(PackedEntityName::new(0x04, 3).to_string(), "osd.3");
+        assert_eq!(
+            PackedEntityName::new(0x08, u64::MAX).to_string(),
+            "client.?"
+        );
+        assert_eq!(PackedEntityName::new(0x03, 1).to_string(), "unknown.1");
+        assert_eq!(PackedEntityName::new(0x48, 1).to_string(), "unknown.1");
+    }
+
+    #[test]
+    fn packed_entity_name_orders_as_entity_name_t() {
+        assert!(PackedEntityName::new(0x08, 1) < PackedEntityName::new(0x08, 2));
+        assert!(PackedEntityName::new(0x01, 9) < PackedEntityName::new(0x08, 0));
+        assert!(PackedEntityName::new(0x08, u64::MAX) < PackedEntityName::new(0x08, 0));
     }
 }
