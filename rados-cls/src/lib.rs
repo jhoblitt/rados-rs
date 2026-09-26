@@ -15,7 +15,8 @@
     feature = "user",
     feature = "queue",
     feature = "rgw",
-    feature = "rgw_gc"
+    feature = "rgw_gc",
+    feature = "lock"
 ))]
 mod call;
 #[cfg(any(
