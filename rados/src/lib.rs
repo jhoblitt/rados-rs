@@ -40,10 +40,10 @@ pub use msgr2::{
 };
 pub use osdclient::{
     AllocHintFlags, BuiltOp, CmpOp, IoCtx, ListWatchersReply, LockFlags, LockRequest, LockType,
-    OSDClient, OSDClientConfig, OSDClientError, OSDMap, OSDMapIncremental, ObjectId, ObjectLocator,
-    ObjectstorePerfStat, OmapAssertion, OmapKey, OmapKeySet, OmapKeys, OmapMap, OmapVals,
-    OpBuilder, OpCode, OpReply, OpResult, OpState, OpTarget, OsdOpFlags, PgMergeMeta,
-    PgNlsResponse, PgPool, PoolInfo, PoolSnapInfo, PoolStat, RadosObject, ReadResult, SnapId,
-    SparseExtent, SparseReadResult, StatResult, StripedPgId, UnlockRequest, WatchItem, WriteResult,
-    list_objects_stream,
+    NotifyAck, NotifyResult, NotifyTimeout, OSDClient, OSDClientConfig, OSDClientError, OSDMap,
+    OSDMapIncremental, ObjectId, ObjectLocator, ObjectstorePerfStat, OmapAssertion, OmapKey,
+    OmapKeySet, OmapKeys, OmapMap, OmapVals, OpBuilder, OpCode, OpReply, OpResult, OpState,
+    OpTarget, OsdOpFlags, PgMergeMeta, PgNlsResponse, PgPool, PoolInfo, PoolSnapInfo, PoolStat,
+    RadosObject, ReadResult, SnapId, SparseExtent, SparseReadResult, StatResult, StripedPgId,
+    UnlockRequest, WatchItem, WatchOp, WriteResult, list_objects_stream,
 };

@@ -238,6 +238,29 @@ impl Denc for OSDOp {
                 // Pad to CEPH_OSD_OP_UNION_SIZE: 8 + 8 + 4 = 20, need 8 more
                 buf.put_u64_le(0);
             }
+            OpData::Watch {
+                cookie,
+                ver,
+                op,
+                generation,
+                timeout,
+            } => {
+                // 8 + 8 + 1 + 4 + 4 = 25, need 3 more
+                buf.put_u64_le(*cookie);
+                buf.put_u64_le(*ver);
+                buf.put_u8(*op);
+                buf.put_u32_le(*generation);
+                buf.put_u32_le(*timeout);
+                buf.put_u16_le(0);
+                buf.put_u8(0);
+            }
+            OpData::Notify { cookie } => {
+                // 8, need 20 more
+                buf.put_u64_le(*cookie);
+                buf.put_u64_le(0);
+                buf.put_u64_le(0);
+                buf.put_u32_le(0);
+            }
             OpData::None => {
                 // Empty union - CEPH_OSD_OP_UNION_SIZE bytes of zeros
                 buf.put_u64_le(0);
@@ -339,6 +362,26 @@ impl Denc for OSDOp {
                     expected_write_size,
                     flags,
                 }
+            }
+            OpCode::Watch => {
+                let cookie = buf.get_u64_le();
+                let ver = buf.get_u64_le();
+                let op = buf.get_u8();
+                let generation = buf.get_u32_le();
+                let timeout = buf.get_u32_le();
+                buf.advance(3);
+                OpData::Watch {
+                    cookie,
+                    ver,
+                    op,
+                    generation,
+                    timeout,
+                }
+            }
+            OpCode::Notify => {
+                let cookie = buf.get_u64_le();
+                buf.advance(20);
+                OpData::Notify { cookie }
             }
             _ => {
                 // Other operations (including ListSnaps) - skip CEPH_OSD_OP_UNION_SIZE bytes
@@ -855,5 +898,80 @@ mod tests {
                 flags: 512
             }
         ));
+    }
+
+    fn union_of(op: &crate::osdclient::types::OSDOp) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        op.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), CEPH_OSD_OP_SIZE);
+        buf[6..6 + CEPH_OSD_OP_UNION_SIZE].to_vec()
+    }
+
+    #[test]
+    fn watch_union_is_byte_exact() {
+        use crate::osdclient::types::{OSDOp, WatchOp};
+
+        let mut want = 0x1234u64.to_le_bytes().to_vec();
+        want.extend_from_slice(&[0; 8]); // ver
+        want.push(0x03); // op WATCH
+        want.extend_from_slice(&[0; 4]); // generation
+        want.extend_from_slice(&[0; 4]); // timeout
+        want.extend_from_slice(&[0; 3]); // padding
+        assert_eq!(union_of(&OSDOp::watch(0x1234, WatchOp::Watch, 0)), want);
+
+        let ping = union_of(&OSDOp::watch_ping(0x1234, 7));
+        assert_eq!(ping[16], 0x07);
+        assert_eq!(&ping[17..21], &7u32.to_le_bytes());
+        assert_eq!(&ping[21..25], &[0; 4]);
+
+        let reg = union_of(&OSDOp::watch(1, WatchOp::Watch, 30));
+        assert_eq!(&reg[21..25], &30u32.to_le_bytes());
+    }
+
+    #[test]
+    fn notify_and_ack_unions_are_byte_exact() {
+        use crate::osdclient::types::OSDOp;
+
+        let mut want = 0xabcdu64.to_le_bytes().to_vec();
+        want.extend_from_slice(&[0; 20]);
+        assert_eq!(
+            union_of(&OSDOp::notify(0xabcd, 10, bytes::Bytes::from_static(b"hi"))),
+            want
+        );
+        assert_eq!(
+            union_of(&OSDOp::notify_ack(5, 6, bytes::Bytes::from_static(b"r"))),
+            vec![0; CEPH_OSD_OP_UNION_SIZE]
+        );
+    }
+
+    #[test]
+    fn watch_and_notify_unions_roundtrip() {
+        use crate::osdclient::types::{OSDOp, OpCode, OpData};
+
+        let mut buf = BytesMut::new();
+        OSDOp::watch_reconnect(99, 4).encode(&mut buf, 0).unwrap();
+        let decoded = OSDOp::decode(&mut buf, 0).unwrap();
+        assert_eq!(decoded.op, OpCode::Watch);
+        assert!(matches!(
+            decoded.op_data,
+            OpData::Watch {
+                cookie: 99,
+                ver: 0,
+                op: 5,
+                generation: 4,
+                timeout: 0
+            }
+        ));
+        assert!(buf.is_empty());
+
+        let mut buf = BytesMut::new();
+        OSDOp::notify(77, 3, bytes::Bytes::from_static(b"xyz"))
+            .encode(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf[34..], &15u32.to_le_bytes()); // payload_len: 12 + 3
+        let decoded = OSDOp::decode(&mut buf, 0).unwrap();
+        assert_eq!(decoded.op, OpCode::Notify);
+        assert!(matches!(decoded.op_data, OpData::Notify { cookie: 77 }));
+        assert!(buf.is_empty());
     }
 }
