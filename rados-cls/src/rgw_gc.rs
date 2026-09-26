@@ -115,11 +115,18 @@ pub struct DeferEntryOp {
 /// `num_deferred_entries` deferrals. `EEXIST` if the object already
 /// holds a ring.
 ///
-/// The object must already exist: the class reads the head first, so a
-/// missing object returns `ENOENT`. C++ callers put a create in front of
-/// the init in one compound op (`RGWGC::initialize` does `op.create(false)`
-/// before `gc_log_init2`; the upstream tests use `op.create(true)`), which
-/// here is `OpBuilder::new().create(false).op(init_op(..)?)`.
+/// A missing object is created: a writing class call on a missing object
+/// reads zero bytes, which `queue_read_head` answers with `EINVAL` (the
+/// `ret == 0` branch, `cls_queue_src.cc:57-60` at v19.2.2) and
+/// `queue_init` takes as uninitialised. `queue_init` already answers
+/// `EEXIST` for an object holding a queue head; what `create(true)` in
+/// front of the init in one compound op adds is `EEXIST` for an existing
+/// object that is not a queue, which init would otherwise overwrite (its
+/// head read answers `EINVAL` on bad magic or a failed decode, and init
+/// treats that as uninitialised). The upstream tests use
+/// `op.create(true)`, here `OpBuilder::new().create(true).op(init_op(..)?)`;
+/// `RGWGC::initialize` puts `op.create(false)` before `gc_log_init2`,
+/// which adds neither.
 pub fn init_op(size: u64, num_deferred_entries: u64) -> Result<OSDOp> {
     call::op(
         CLASS,
@@ -193,11 +200,18 @@ pub fn defer_entry_op(expiration_secs: u32, info: &GcObjInfo) -> Result<OSDOp> {
 
 /// Lay out the GC ring on `oid`; see [`init_op`].
 ///
-/// The object must already exist: the class reads the head first, so a
-/// missing object returns `ENOENT`. C++ callers put a create in front of
-/// the init in one compound op (`RGWGC::initialize` does `op.create(false)`
-/// before `gc_log_init2`; the upstream tests use `op.create(true)`), which
-/// here is `OpBuilder::new().create(false).op(init_op(..)?)`.
+/// A missing object is created: a writing class call on a missing object
+/// reads zero bytes, which `queue_read_head` answers with `EINVAL` (the
+/// `ret == 0` branch, `cls_queue_src.cc:57-60` at v19.2.2) and
+/// `queue_init` takes as uninitialised. `queue_init` already answers
+/// `EEXIST` for an object holding a queue head; what `create(true)` in
+/// front of the init in one compound op adds is `EEXIST` for an existing
+/// object that is not a queue, which init would otherwise overwrite (its
+/// head read answers `EINVAL` on bad magic or a failed decode, and init
+/// treats that as uninitialised). The upstream tests use
+/// `op.create(true)`, here `OpBuilder::new().create(true).op(init_op(..)?)`;
+/// `RGWGC::initialize` puts `op.create(false)` before `gc_log_init2`,
+/// which adds neither.
 pub async fn init(ioctx: &IoCtx, oid: &str, size: u64, num_deferred_entries: u64) -> Result<()> {
     call::exec(
         ioctx,
