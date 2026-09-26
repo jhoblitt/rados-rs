@@ -166,6 +166,12 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("rgw_bucket_olh_log_entry", None, false),
     TypeSpec::new("rgw_bucket_olh_entry", None, false),
     TypeSpec::new("rgw_cls_bi_entry", None, false),
+    TypeSpec::new("rgw_usage_data", None, false),
+    // No corpus directory in either archive.
+    TypeSpec::new("rgw_s3select_usage_data", None, false),
+    TypeSpec::new("rgw_usage_log_entry", None, false),
+    TypeSpec::new("rgw_usage_log_info", None, false),
+    TypeSpec::new("rgw_user_bucket", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];
