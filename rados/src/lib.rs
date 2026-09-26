@@ -45,5 +45,5 @@ pub use osdclient::{
     OmapKeySet, OmapKeys, OmapMap, OmapVals, OpBuilder, OpCode, OpReply, OpResult, OpState,
     OpTarget, OsdOpFlags, PgMergeMeta, PgNlsResponse, PgPool, PoolInfo, PoolSnapInfo, PoolStat,
     RadosObject, ReadResult, SnapId, SparseExtent, SparseReadResult, StatResult, StripedPgId,
-    UnlockRequest, WatchItem, WatchOp, WriteResult, list_objects_stream,
+    UnlockRequest, WatchEvent, WatchItem, WatchOp, Watcher, WriteResult, list_objects_stream,
 };

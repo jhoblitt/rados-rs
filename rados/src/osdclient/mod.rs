@@ -50,7 +50,7 @@ pub use types::{
     OsdOpFlags, PoolInfo, ReadResult, SparseExtent, SparseReadResult, StatResult, StripedPgId,
     WatchOp, WriteResult,
 };
-pub use watch::{NotifyAck, NotifyResult, NotifyTimeout, decode_notify_reply};
+pub use watch::{NotifyAck, NotifyResult, NotifyTimeout, WatchEvent, Watcher, decode_notify_reply};
 pub use watchers::{ListWatchersReply, WatchItem};
 
 pub use messages::MOSDOp;

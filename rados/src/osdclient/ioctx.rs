@@ -21,6 +21,7 @@ use crate::osdclient::types::{
     AllocHintFlags, OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult,
     WriteResult,
 };
+use crate::osdclient::watch::{NotifyResult, Watcher};
 use crate::osdclient::watchers::{WatchItem, decode_list_watchers};
 
 /// Maximum entries per PGLS request for object listing pagination
@@ -738,6 +739,65 @@ impl IoCtx {
         let result = self.execute(&oid, op).await?;
         OSDClient::check_op_result(&result, "list_watchers")?;
         decode_list_watchers(result.first_reply()?)
+    }
+
+    /// Watch `oid` with the OSD's default watch timeout
+    /// (`osd_client_watch_timeout`, 30 s), as `rados_watch2` does.
+    /// `ENOENT` if the object does not exist.
+    pub async fn watch(&self, oid: impl Into<String>) -> Result<Watcher> {
+        self.watch_with_timeout(oid, 0).await
+    }
+
+    /// Watch `oid`; the OSD drops the watch if it goes `timeout_secs`
+    /// without a ping (0 for the OSD's default), as `rados_watch3` does.
+    pub async fn watch_with_timeout(
+        &self,
+        oid: impl Into<String>,
+        timeout_secs: u32,
+    ) -> Result<Watcher> {
+        let oid = oid.into();
+        debug!("Watching object '{}' in pool {}", oid, self.pool_id);
+        let (linger, events) = self
+            .client
+            .linger_watch(self.object_id(&oid), timeout_secs)
+            .await?;
+        Ok(Watcher::new(Arc::clone(&self.client), linger, events))
+    }
+
+    /// Notify `oid`'s watchers with `payload` and wait until each acks or
+    /// the notify times out: `timeout_ms` of 0 means librados's default of
+    /// ten seconds. A timed-out notify is `Ok` with `timed_out` set and the
+    /// watchers that missed it, as librados hands back the reply whatever
+    /// the code. `ENOENT` if the object does not exist.
+    pub async fn notify(
+        &self,
+        oid: impl Into<String>,
+        payload: Bytes,
+        timeout_ms: u64,
+    ) -> Result<NotifyResult> {
+        let oid = oid.into();
+        debug!("Notifying object '{}' in pool {}", oid, self.pool_id);
+        self.client
+            .notify(self.object_id(&oid), payload, timeout_ms)
+            .await
+    }
+
+    /// This client's global id, which watchers see as a notify's
+    /// `notifier_gid` and notifiers as an ack's `gid`
+    /// (`rados_get_instance_id`).
+    pub fn instance_id(&self) -> u64 {
+        self.client.global_id()
+    }
+
+    /// Close this client's session to `oid`'s current primary, as a
+    /// connection reset would. A test aid for the watch reconnect path.
+    pub async fn close_primary_session_for_test(&self, oid: impl Into<String>) -> Result<()> {
+        let osd = self
+            .client
+            .primary_osd(&self.object_id(&oid.into()))
+            .await?;
+        self.client.close_session_for_test(osd).await;
+        Ok(())
     }
 
     /// List omap keys after `start_after`.
