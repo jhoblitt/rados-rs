@@ -49,7 +49,10 @@ use rados_cls::rgw::index::{
     ReshardEntry as RgwReshardEntry, SetBucketReshardingOp as RgwSetBucketReshardingOp,
     StorePgVerOp as RgwStorePgVerOp, TagTimeoutOp as RgwTagTimeoutOp,
 };
-use rados_cls::rgw::lc::{LcEntry as RgwLcEntry, LcObjHead as RgwLcObjHead};
+use rados_cls::rgw::lc::{
+    GetEntryRet as RgwLcGetEntryRet, LcEntry as RgwLcEntry, LcObjHead as RgwLcObjHead,
+    SetEntryOp as RgwLcSetEntryOp,
+};
 use rados_cls::rgw::olh::{OlhEntry as RgwOlhEntry, OlhLogEntry as RgwOlhLogEntry};
 use rados_cls::rgw::types::{
     CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
@@ -271,6 +274,8 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_cls_usage_log_trim_op" => Some(type_info_denc::<RgwUsageLogTrimOp>()),
         "cls_rgw_lc_entry" => Some(type_info_denc::<RgwLcEntry>()),
         "cls_rgw_lc_obj_head" => Some(type_info_denc::<RgwLcObjHead>()),
+        "cls_rgw_lc_get_entry_ret" => Some(type_info_denc::<RgwLcGetEntryRet>()),
+        "cls_rgw_lc_set_entry_op" => Some(type_info_denc::<RgwLcSetEntryOp>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
         "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
@@ -374,7 +379,7 @@ fn list_types() {
          rgw_user_bucket [versioned]"
     );
     println!("  rgw_cls_usage_log_{{add,read,trim}}_op / rgw_cls_usage_log_read_ret [versioned]");
-    println!("  cls_rgw_lc_{{entry,obj_head}} [versioned]");
+    println!("  cls_rgw_lc_{{entry,obj_head,get_entry_ret,set_entry_op}} [versioned]");
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );
