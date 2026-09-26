@@ -24,6 +24,10 @@ pub const CLASS: &str = "queue";
 /// (the class adds `max_urgent_data_size` on top).
 pub const HEAD_SIZE_1K: u64 = 1024;
 
+/// `QUEUE_ENTRY_OVERHEAD`: the `u16` magic and `u64` length ahead of
+/// every payload in the ring.
+pub const ENTRY_OVERHEAD: u64 = 10;
+
 /// `cls_queue_entry`: one payload and the marker naming its slot. The dump
 /// carries the marker and the payload's length as `data_len`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
@@ -281,6 +285,17 @@ pub struct RemoveOp {
 #[denc(crate = "rados", version = 1, compat = 1)]
 pub struct GetCapacityRet {
     pub queue_capacity: u64,
+}
+
+/// `cls_queue_get_stats_ret`, the `2pc_queue` class's topic statistics:
+/// the ring's used bytes (entry overheads included) and its committed
+/// entry count. Ceph gives it no dump and does not register it with
+/// `ceph-dencoder`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
+#[denc(crate = "rados", version = 1, compat = 1)]
+pub struct GetStatsRet {
+    pub queue_size: u64,
+    pub queue_entries: u32,
 }
 
 /// `cls_queue_init`: lay out a ring of `size` usable bytes with no urgent
@@ -629,5 +644,18 @@ mod tests {
             outdata: encode_with_capacity(&ret, 0).expect("encode"),
         };
         assert_eq!(decode_list(&reply).expect("decode"), ret);
+    }
+
+    #[test]
+    fn get_stats_ret_matches_the_corpus() {
+        // Derived: v19.2.2's ceph-dencoder does not register this type.
+        // Corpus 19.2.0 cls_queue_get_stats_ret/bf93a2b1....
+        let s = GetStatsRet {
+            queue_size: 19_762,
+            queue_entries: 782,
+        };
+        let wire = b"\x01\x01\x0c\x00\x00\x00\x32\x4d\x00\x00\x00\x00\x00\x00\x0e\x03\x00\x00";
+        assert_eq!(bytes(&s), wire);
+        assert_eq!(GetStatsRet::decode(&mut &wire[..], 0).expect("decode"), s);
     }
 }

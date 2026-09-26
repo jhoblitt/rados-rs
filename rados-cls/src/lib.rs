@@ -23,7 +23,8 @@ mod call;
     feature = "refcount",
     feature = "rgw",
     feature = "user",
-    feature = "lock"
+    feature = "lock",
+    feature = "two_pc_queue"
 ))]
 pub(crate) mod dump;
 
@@ -37,6 +38,8 @@ pub mod refcount;
 pub mod rgw;
 #[cfg(feature = "rgw_gc")]
 pub mod rgw_gc;
+#[cfg(feature = "two_pc_queue")]
+pub mod two_pc_queue;
 #[cfg(feature = "user")]
 pub mod user;
 #[cfg(feature = "version")]
