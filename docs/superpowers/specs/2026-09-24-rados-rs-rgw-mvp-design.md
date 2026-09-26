@@ -14,39 +14,51 @@ client encodings for the object classes RGW calls. After this work, every
 RADOS interaction of RGW's single-site data and metadata paths can be
 expressed against the fork.
 
+What "RGW's single-site paths" means is decided by the sibling rgw-go
+effort's exclusion list, `rgw-go/docs/exclusions.md`, which the owner
+made canon for this fork on 2026-09-25: the feature set is what a
+drop-in replacement for radosgw in a Rook cluster needs, sized by Rook's
+object integration suite (`TestCephObjectSuite`) without multisite, and
+every feature that list excludes is excluded here, every feature it
+keeps is in scope here. This fork tracks that document; it does not
+maintain a list of its own.
+
 ## Non-goals
 
 - Multisite: no `cls_log`, `cls_timeindex`, `cls_fifo`, `cls_cmpomap`, no
   bucket-index log (`bilog`) or `bi_*` repair ops, no data or metadata
   log, no sync of any kind.
-- Persistent bucket notifications: no `cls_2pc_queue` in the roadmap as
-  written (pending the owner's decision above); HTTP delivery and the
-  topic actions are RGW-level.
+- Persistent bucket notifications are in scope at the RADOS layer
+  (`cls_2pc_queue` and the queue locks, package `cls-2pc-queue`); only
+  Kafka and AMQP delivery are out, and delivery of any kind is RGW-level.
 - Resharding as an action: the reshard queue ops are out. The resharding
   guard and `get_bucket_resharding` are in, because C++ RGW attaches the
   guard to every bucket-index write and a compatible client must too.
-- `cls_otp` (MFA), `copy_from2` (radosgw does not use it: a copy shares
+- `copy_from2` (radosgw does not use it: a copy shares
   the source's tails through `cls_refcount` under a new tag and streams
   data only when placement, storage class, encryption or head geometry
   force it, which the `refcount` module supports),
   `rgw_s3select` usage data beyond what the usage-log types carry.
-- RGW features excluded from the MVP driver for the time being, listed
-  here so that nothing in this fork is sized or tested for them, and
-  synchronized on 2026-09-25 with the sibling rgw-go effort's exclusion
-  list (`rgw-go/docs/exclusions.md`) so the two gateways and radosgw can
-  be benchmarked on one feature set: the D4N cache layer and the D3N
+- RGW features excluded from the driver, as rgw-go's exclusion list
+  (`rgw-go/docs/exclusions.md`, canon for this fork since 2026-09-25)
+  states them, listed here so that nothing in this fork is sized or
+  tested for them; that document, not this summary, is authoritative: the D4N cache layer and the D3N
   read cache, the POSIX driver and every other non-RADOS driver, the
   Swift API (and with it the object expirer), Lua scripting, S3 Select,
   S3 Vectors and dedup, cloud transition and restore, Keystone and LDAP
   authentication, key management (SSE-KMS and SSE-S3 with every
   backend; SSE-C stays), the dynamic resharding worker (the guard stays,
   as above), librgw with NFS and SMB, QAT and UADK offload, and Kafka
-  and AMQP notification delivery. None of them needs RADOS surface the
-  packages below lack, so this is a driver-scope statement, not a
-  transport one. Where the two gateways still differ, the owner
-  decides: rgw-go keeps persistent bucket notifications (`cls_2pc_queue`)
-  and MFA (`cls_otp`) and has `cls_lock` through librados; this fork's
-  roadmap has none of the three yet.
+  and AMQP notification delivery. None of them needs RADOS surface the packages below lack, so this is a
+  driver-scope statement, not a transport one. What rgw-go keeps and
+  this fork lacked, the roadmap now carries: `cls_lock` (the GC,
+  lifecycle and reshard workers and the notification queues take
+  radosgw's locks by name), `cls_2pc_queue` (persistent notifications)
+  and `cls_otp` (MFA). Feature level is a separate axis: rgw-go targets
+  Tentacle radosgw gateway-side on a Squid floor; this fork's class
+  bindings encode what Squid's OSD accepts and decode what `main`
+  writes, and Tentacle-only replies (the OLH epoch, `get_stales`) are
+  follow-ups, not exclusions.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
 
@@ -168,6 +180,13 @@ land last.
 - `cls-rgw-usage`: add, read, trim, clear.
 - `cls-rgw-lc`: head get and put, entry get, set, rm, next, list.
 - `cls-rgw-olh`: link, unlink instance, read and trim the OLH log, clear.
+- `cls-lock`: lock, unlock, break, get info, set cookie, assert locked,
+  with radosgw's lock names, cookies and durations documented per worker.
+- `cls-2pc-queue`: init, get capacity, reserve (a writing method that
+  replies, so `RETURNVEC`), commit, abort, list entries, list
+  reservations, remove entries, expire reservations; what
+  `rgw_notify.cc` does with them.
+- `cls-otp`: create, remove, set, check and get, and the MFA seed types.
 
 Every struct records the `ENCODE_START` version and compat it mirrors, and
 its floor is what C++ RGW on Squid writes.
