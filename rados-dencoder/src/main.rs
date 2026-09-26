@@ -39,7 +39,9 @@ use rados_cls::rgw::gc::{
     RemoveOp as RgwGcRemoveOp, SetEntryOp as RgwGcSetEntryOp,
 };
 use rados_cls::rgw::types::{
-    GcObjInfo, Obj as RgwObj, ObjChain as RgwObjChain, ObjKey as RgwObjKey,
+    CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
+    ObjChain as RgwObjChain, ObjKey as RgwObjKey, PendingInfo as RgwPendingInfo,
+    ZoneSet as RgwZoneSet,
 };
 use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
 use rados_cls::user::{
@@ -225,6 +227,10 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_rgw_obj" => Some(type_info_denc::<RgwObj>()),
         "cls_rgw_obj_chain" => Some(type_info_denc::<RgwObjChain>()),
         "cls_rgw_gc_obj_info" => Some(type_info_denc::<GcObjInfo>()),
+        "rgw_bucket_entry_ver" => Some(type_info_denc::<RgwEntryVer>()),
+        "rgw_bucket_pending_info" => Some(type_info_denc::<RgwPendingInfo>()),
+        "rgw_bucket_category_stats" => Some(type_info_denc::<RgwCategoryStats>()),
+        "rgw_zone_set" => Some(type_info_denc::<RgwZoneSet>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
         "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
@@ -300,6 +306,9 @@ fn list_types() {
          cls_queue_get_capacity_ret [versioned]"
     );
     println!("  cls_rgw_{{obj_key,obj,obj_chain,gc_obj_info}} [versioned]");
+    println!(
+        "  rgw_bucket_{{entry_ver,pending_info,category_stats}} / rgw_zone_set [versioned]"
+    );
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );

@@ -3,4 +3,5 @@
 //! with the bucket-index, GC, usage, lifecycle and OLH work.
 
 pub mod gc;
+mod packed;
 pub mod types;
