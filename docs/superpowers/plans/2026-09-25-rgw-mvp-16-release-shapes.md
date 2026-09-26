@@ -395,8 +395,7 @@ without touching the map. The map fields stay u8. On the v19 test
 cluster the release reads squid and survives incrementals; the flip
 to a later release cannot be exercised there.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
 ---
@@ -613,8 +612,7 @@ same for metadata the caller builds. Every change keeps compat 1 or
 3, so a Squid OSD skips the tail; sending a later release's shape is
 still a caller error.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
 ---
@@ -729,8 +727,7 @@ ReshardStatus gains IN_LOGRECORD; the STANDARD storage class in newer
 dumps is a v19.2.4 dump change only; and Umbrella's nanosecond OLH
 epochs and stale log entries are described where the v19 rules are.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
 ---
@@ -814,8 +811,7 @@ bucket_init_index2, bi_put_entries, reshard_log_trim and
 bucket_refresh_instance answer EOPNOTSUPP. What Tentacle and Umbrella
 do with these shapes cannot be exercised on this cluster.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
 ---
@@ -844,11 +840,31 @@ model. The PR body:
 **What changed.** `rados` applies both release fields from incrementals as C++ does and exposes `require_osd_release()` with a test override; `rados-cls` offers `update_stats` v2 (Tentacle) and `read_olh_log` v2 and metadata v8 (Umbrella) by release, pinned against v20.2.4 and v21.1.0 captures, and corrects its docs about later releases.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
+
+### Task 3 additions (2026-09-26, from the rgw-go session, to verify before writing)
+
+- `index::guard_op`'s doc says radosgw puts the guard "in front of every
+  index write"; radosgw v19.2.2 guards `bucket_prepare_op`,
+  `bucket_complete_op` and the OLH writes only, not `bucket_list`,
+  `bucket_check_index` or `dir_suggest_changes` (verify in
+  `rgw_rados.cc` at v19.2.2) and the module doc of `rgw::index` should
+  say which calls, not "every index write".
+- Duplicate keys in a decoded map: from v19.2.0 (commit 641279c4d0f)
+  `encoding.h` decodes `std::map`/`std::unordered_map` with `emplace`,
+  keeping the FIRST value for a repeated key, while
+  `boost::container::flat_map` (`rgw_bucket_dir`'s entries) keeps the
+  LAST; the crate's `BTreeMap` decode keeps the last. Verify both in
+  `encoding.h` and `rados/src/denc/codec.rs`, and document the
+  difference on the crate's map decode (well-formed class replies never
+  repeat a key, so this is a parity note, not a behaviour change).
+- Two writing class calls in one compound op both read the pre-op
+  object state, so the later write wins (two `rgw_gc` enqueues in one op
+  kept only the second on a Squid cluster). Add one sentence to
+  `call.rs`'s module doc warning against composing two writing calls on
+  one object in one op.
 
 ## Roadmap for later plans
 
