@@ -152,6 +152,38 @@ impl EntityAddr {
         }
     }
 
+    /// The address as C++ `entity_addr_t::get_legacy_str` prints it, which
+    /// is how `cls_lock` dumps a locker: `a.b.c.d:port/nonce`,
+    /// `[ipv6]:port/nonce` with glibc's `inet_ntop` compression, or
+    /// `(unrecognized address family N)/nonce`. The address type is not
+    /// printed.
+    pub fn legacy_str(&self) -> String {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let d = &self.sockaddr_data;
+        let af = u16::from_le_bytes([d[0], d[1]]);
+        let port = u16::from_be_bytes([d[2], d[3]]);
+        let sockaddr = match af {
+            AF_INET => format!("{}:{port}", Ipv4Addr::new(d[4], d[5], d[6], d[7])),
+            AF_INET6 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&d[8..24]);
+                let ip = Ipv6Addr::from(octets);
+                let seg = ip.segments();
+                // glibc prints an IPv4-compatible address (`::a.b.c.d`) in
+                // dotted form, which Rust's Display compresses as hex.
+                let text = if seg[..6].iter().all(|&s| s == 0) && seg[6] != 0 {
+                    format!("::{}", Ipv4Addr::new(d[20], d[21], d[22], d[23]))
+                } else {
+                    ip.to_string()
+                };
+                format!("[{text}]:{port}")
+            }
+            _ => format!("(unrecognized address family {af})"),
+        };
+        format!("{sockaddr}/{}", self.nonce)
+    }
+
     /// Returns true if this address is a msgr2 (v2) address.
     pub fn is_msgr2(&self) -> bool {
         matches!(self.addr_type, EntityAddrType::Msgr2)
@@ -680,6 +712,73 @@ mod tests {
             },
             "0101011c000000010000000500000010000000020000027f0001020000000000000000",
         );
+    }
+
+    fn legacy(addr: &str, nonce: u32) -> EntityAddr {
+        EntityAddr {
+            nonce,
+            ..EntityAddr::from_socket_addr(EntityAddrType::Legacy, addr.parse().unwrap())
+        }
+    }
+
+    #[test]
+    fn legacy_str_matches_get_legacy_str() {
+        assert_eq!(legacy("127.0.1.2:2", 1).legacy_str(), "127.0.1.2:2/1");
+        assert_eq!(
+            EntityAddr::default().legacy_str(),
+            "(unrecognized address family 0)/0"
+        );
+        assert_eq!(legacy("127.0.1.2:20", 10).legacy_str(), "127.0.1.2:20/10");
+        assert_eq!(
+            legacy("172.21.5.153:0", 1725310796).legacy_str(),
+            "172.21.5.153:0/1725310796"
+        );
+        assert_eq!(legacy("[::1]:6789", 7).legacy_str(), "[::1]:6789/7");
+        assert_eq!(
+            legacy("[2001:db8::1]:6800", 42).legacy_str(),
+            "[2001:db8::1]:6800/42"
+        );
+        assert_eq!(legacy("[::1.2.3.4]:1", 0).legacy_str(), "[::1.2.3.4]:1/0");
+        assert_eq!(
+            legacy("[::ffff:10.0.0.1]:3", 0).legacy_str(),
+            "[::ffff:10.0.0.1]:3/0"
+        );
+        let mut family_1 = EntityAddr {
+            addr_type: EntityAddrType::Legacy,
+            ..EntityAddr::default()
+        };
+        family_1.sockaddr_data[0] = 1;
+        assert_eq!(family_1.legacy_str(), "(unrecognized address family 1)/0");
+    }
+
+    // The encodings ceph-dencoder v19.2.2 dumped as these strings.
+    #[test]
+    fn legacy_str_of_ceph_dencoder_encodings() {
+        for (hex, expected) in [
+            (
+                "0101012800000001000000000000001c0000000a000001000000000000000000000000000000000102030400000000",
+                "[::1.2.3.4]:1/0",
+            ),
+            (
+                "0101012800000001000000000000001c0000000a0000030000000000000000000000000000ffff0a00000100000000",
+                "[::ffff:10.0.0.1]:3/0",
+            ),
+            (
+                "0101012800000001000000070000001c0000000a001a85000000000000000000000000000000000000000100000000",
+                "[::1]:6789/7",
+            ),
+            (
+                "01010128000000010000002a0000001c0000000a001a900000000020010db800000000000000000000000100000000",
+                "[2001:db8::1]:6800/42",
+            ),
+            (
+                "0101012800000001000000000000001c00000001000000000000000000000000000000000000000000000000000000",
+                "(unrecognized address family 1)/0",
+            ),
+        ] {
+            let addr = <EntityAddr as Denc>::decode(&mut &unhex(hex)[..], 0).unwrap();
+            assert_eq!(addr.legacy_str(), expected);
+        }
     }
 
     #[test]
