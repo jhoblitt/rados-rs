@@ -30,13 +30,7 @@ impl WatchItem {
     /// The watcher as `entity_name_t` prints it: `client.4242`, or
     /// `client.?` when the number is negative as an `int64_t`.
     pub fn watcher_name(&self) -> String {
-        let entity_type = crate::EntityType::from_bits_truncate(u32::from(self.name.entity_type));
-        let num = self.name.num.get();
-        if (num as i64) < 0 {
-            format!("{entity_type}.?")
-        } else {
-            format!("{entity_type}.{num}")
-        }
+        self.name.to_string()
     }
 }
 
