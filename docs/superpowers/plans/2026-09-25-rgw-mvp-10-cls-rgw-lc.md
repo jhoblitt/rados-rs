@@ -69,10 +69,11 @@ Plans 3 to 9's Global Constraints apply unchanged. Plus:
   `version = 2, compat = 2, min_version = 2, ceph_release = "Octopus v15+"`,
   `ListRet` `version = 3, compat = 1, min_version = 3, ceph_release =
   "Octopus v15+"`. The hint's basis: v15.2.0 writes the entry messages as
-  1/1, v16.2.0 as 2/2 and the list reply as v3. It does not model the list
-  request's `compat_v` (it always sends 3 and so always receives 3); the
-  other five (`GetEntryOp`, `GetNextEntryOp`, `PutHeadOp`, `GetHeadRet`
-  at version 1, `ListEntriesOp` at 3/1) carry no floor.
+  1/1, v15.2.5 as 2/2 and the list request and reply as v3. It does not
+  model the list request's `compat_v` (it always sends 3 and so always
+  receives 3); `ListEntriesOp` (3/1) floors at 3 like the reply; the
+  four version-1 types (`GetEntryOp`, `GetNextEntryOp`, `PutHeadOp`,
+  `GetHeadRet`) carry no floor.
 - Server facts (`cls_rgw.cc`, v19): the head is the omap header,
   `get_head` on an empty header returns a default head (4350-4362), a
   decode failure is `EINVAL`; `put_head` creates the object; `get_entry`
@@ -192,7 +193,7 @@ floors at version 2":
 
 | Type | Attribute | `ceph_release` |
 |---|---|---|
-| `PendingInfo` (`rgw_bucket_pending_info`) | `version = 2, compat = 2, min_version = 2` | `"Bobtail v0.56+"` |
+| `PendingInfo` (`rgw_bucket_pending_info`) | `version = 2, compat = 2, min_version = 2` | `"Argonaut v0.48+"` (already 2/2 at v0.48argonaut) |
 | `LcObjHead` (`cls_rgw_lc_obj_head`) | `version = 2, compat = 2, min_version = 2` | `"Reef v18+"` |
 | `ListBucketsOp` (`cls_user_list_buckets_op`) | `version = 2, compat = 1, min_version = 2` | `"Jewel v10+"` |
 | `AddOp` (`rgw_cls_usage_log_add_op`) | `version = 2, compat = 1, min_version = 2` | `"Jewel v10+"` |
@@ -369,7 +370,7 @@ request's `compat_v` echo (the port always sends version 3).
 ## Patched after execution (2026-09-25)
 
 - Global Constraints: the false claim that the derived `VersionedDenc` rejects a `struct_v` below its version replaced by what it did (lib.rs:444, only `compat_version > version`) and the rule that a derived type floors only with `min_version`.
-- New Task 1 (`rados-denc-macros` `min_version` + `ceph_release`, `VersionTooOld` via `check_min_version!`, test in `rados/src/denc/codec.rs`, "Version floor" doc section) and Task 2 (five derived types floored: `PendingInfo` Bobtail, `LcObjHead` Reef, `ListBucketsOp`/`AddOp`/`CheckMtimeOp` Jewel, rejection tests); lc tasks renumbered 3 and 4, gate Task 5.
+- New Task 1 (`rados-denc-macros` `min_version` + `ceph_release`, `VersionTooOld` via `check_min_version!`, test in `rados/src/denc/codec.rs`, "Version floor" doc section) and Task 2 (five derived types floored: `PendingInfo` Argonaut, `LcObjHead` Reef, `ListBucketsOp`/`AddOp`/`CheckMtimeOp` Jewel, rejection tests); lc tasks renumbered 3 and 4, gate Task 5.
 - Task 3: lc types derived with `min_version` (entry messages 2/2/2, `ListRet` 3/1/3, "Octopus v15+"; basis v15.2.0 1/1, v16.2.0 2/2 and v3 list reply); rejection tests assert `VersionTooOld`; the v1-entry-frame, sorting, decoder and request-bytes tests added to the list.
 - Server facts: missing-object `ENOENT` for `rm_entry`, `get_entry`, `get_next_entry`, `list`; `put_head` creates; `max_entries` 0 gives no entries and truncated; default next entry (cls_rgw.cc:4264-4277) and default head (4350-4362) cited.
 - Task 4: `std::slice::from_ref(&b3)` deviation (clippy 1.98 rejects `[b3.clone()]`); README feature row folded in as a separate commit.
