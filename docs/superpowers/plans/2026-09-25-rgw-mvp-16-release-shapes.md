@@ -852,13 +852,19 @@ model. The PR body:
   `bucket_check_index` or `dir_suggest_changes` (verify in
   `rgw_rados.cc` at v19.2.2) and the module doc of `rgw::index` should
   say which calls, not "every index write".
-- Duplicate keys in a decoded map: from v19.2.0 (commit 641279c4d0f)
-  `encoding.h` decodes `std::map`/`std::unordered_map` with `emplace`,
-  keeping the FIRST value for a repeated key, while
-  `boost::container::flat_map` (`rgw_bucket_dir`'s entries) keeps the
-  LAST; the crate's `BTreeMap` decode keeps the last. Verify both in
-  `encoding.h` and `rados/src/denc/codec.rs`, and document the
-  difference on the crate's map decode (well-formed class replies never
+- Duplicate keys in a decoded map (settled by the rgw-go session with
+  ceph-dencoder on v19.2.6 and v20.2.4 using crafted inputs): when the
+  key or the value is a struct with its own encode/decode, C++ decodes
+  through the legacy `m[k]` path and the LAST value wins, decoded in
+  place over the earlier one (so a field an older struct version omits
+  keeps the earlier value); this covers `std::map` and `flat_map` alike,
+  including `rgw_bucket_dir_header` stats, `rgw_bucket_dir` entries and
+  `rgw_usage_log_entry`'s usage map. When both key and value have denc
+  traits (integers, strings, bufferlists) the denc path uses
+  `emplace_hint` and the FIRST value wins (for example `RGWUserCaps`'s
+  `map<string, uint32>`). The crate's `BTreeMap` decode keeps the last,
+  which matches every struct-valued map the classes return; document
+  the first-wins case on the map decode (well-formed replies never
   repeat a key, so this is a parity note, not a behaviour change).
 - Two writing class calls in one compound op both read the pre-op
   object state, so the later write wins (two `rgw_gc` enqueues in one op
