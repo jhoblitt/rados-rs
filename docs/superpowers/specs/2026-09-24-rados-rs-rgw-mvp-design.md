@@ -220,6 +220,18 @@ land last.
   reservations, remove entries, expire reservations; what
   `rgw_notify.cc` does with them.
 - `cls-otp`: create, remove, set, check and get, and the MFA seed types.
+- `object-locator-routing` (after `watch-notify`): the OSD client places
+  an object by its full locator (pool, namespace, key), not by its name
+  alone. A review of `watch-notify` found `object_to_osds_in_map`
+  ignores the namespace and locator key, so operations on namespaced
+  objects reach the wrong OSD and hang (reproduced on v19.2.2); RGW's
+  metadata and log pools live in namespaces.
+- `cephx-aes256krb5` (after `object-locator-routing`): the cephx key type
+  `CEPH_CRYPTO_AES256KRB5` (AES256-CTS-HMAC-SHA384-192, RFC 8009) that
+  v19.2.6 and v20.2.4 add and make the default for new keys; without it
+  the client cannot read a keyring a fresh current Squid or Tentacle
+  cluster (Rook included) hands out. Reported by the rgw-go session,
+  verified in `ceph_fs.h` at the tags.
 - `release-shapes` (after `watch-notify`): the cluster's required OSD
   release exposed from the OSD map (and kept through incrementals, which
   today discard it, as C++ applies it when the byte read as `i8` is not
