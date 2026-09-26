@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::create_ioctx;
-use rados::{IoCtx, OSDClientError, OpBuilder, UTime};
+use rados::{Denc, IoCtx, OSDClientError, OpBuilder, UTime};
 use rados_cls::queue;
 use rados_cls::two_pc_queue::{self as q, Reservation, UrgentData};
 
@@ -20,6 +20,7 @@ const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const EINVAL: i32 = 22;
 const ENOSPC: i32 = 28;
+const ENODATA: i32 = 61;
 
 /// 256 KiB: upstream ReserveError's queue.
 const CAPACITY: u64 = 256 * 1024;
@@ -538,6 +539,163 @@ async fn reserve_without_returnvec_loses_the_id() {
             "the reservation was made"
         );
         assert_eq!(q::reserve(&ioctx, &oid, 100, 1).await.expect("reserve"), 2);
+    })
+    .await;
+}
+
+/// v19.2.2 is expected to leak ten bytes per reserved entry and v19.2.4+
+/// and main not; no request carries `reserved_size`, so a client cannot
+/// repair it.
+#[tokio::test]
+#[ignore]
+async fn squid_leaks_the_entry_overhead() {
+    common::init_tracing();
+    let ioctx = create_ioctx().await.expect("create_ioctx");
+    let oid = unique("cls-2pc-leak");
+    guarded(&ioctx, &[&oid], async {
+        new_queue(&ioctx, &oid, CAPACITY).await;
+        let reserved = || async {
+            q::read_head(&ioctx, &oid)
+                .await
+                .expect("head")
+                .urgent_data
+                .reserved_size
+        };
+
+        let v = q::read_head(&ioctx, &oid)
+            .await
+            .expect("head")
+            .urgent_data_version;
+        let leaks = v < 3;
+        println!("urgent data version: {v}");
+
+        let id = q::reserve(&ioctx, &oid, 100, 3).await.expect("reserve");
+        assert_eq!(reserved().await, 130);
+        q::commit(&ioctx, &oid, id, vec![Bytes::from_static(&[7; 30]); 3])
+            .await
+            .expect("commit");
+        assert_eq!(reserved().await, if leaks { 30 } else { 0 });
+
+        let id = q::reserve(&ioctx, &oid, 50, 2).await.expect("reserve");
+        q::abort(&ioctx, &oid, id).await.expect("abort");
+        assert_eq!(reserved().await, if leaks { 50 } else { 0 });
+
+        let id = q::reserve(&ioctx, &oid, 40, 1).await.expect("reserve");
+        let t = q::list_reservations(&ioctx, &oid)
+            .await
+            .expect("reservations")[&id]
+            .timestamp;
+        q::expire_reservations(&ioctx, &oid, after(t))
+            .await
+            .expect("expire");
+        assert_eq!(reserved().await, if leaks { 60 } else { 0 });
+        assert!(
+            q::list_reservations(&ioctx, &oid)
+                .await
+                .expect("reservations")
+                .is_empty()
+        );
+
+        let next = list(&ioctx, &oid).await.next_marker;
+        q::remove_entries(&ioctx, &oid, &next, 0)
+            .await
+            .expect("remove");
+        let stats = q::get_topic_stats(&ioctx, &oid).await.expect("stats");
+        assert_eq!(
+            (stats.queue_size, stats.queue_entries),
+            (0, 0),
+            "every byte of the ring is free again"
+        );
+
+        if leaks {
+            let err = q::reserve(&ioctx, &oid, CAPACITY - 60 - 10 + 1, 1)
+                .await
+                .expect_err("the leaked sixty bytes");
+            assert!(is_osd_error(&err, ENOSPC), "{err:?}");
+            q::reserve(&ioctx, &oid, CAPACITY - 60 - 10, 1)
+                .await
+                .expect("all but the leaked bytes");
+        } else {
+            q::reserve(&ioctx, &oid, CAPACITY - 10, 1)
+                .await
+                .expect("the whole ring");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn reservations_spill_into_the_xattr_at_785() {
+    common::init_tracing();
+    let ioctx = create_ioctx().await.expect("create_ioctx");
+    let oid = unique("cls-2pc-spill");
+    guarded(&ioctx, &[&oid], async {
+        new_queue(&ioctx, &oid, CAPACITY).await;
+        let xattr_ids = || async {
+            let mut xattr = ioctx
+                .get_xattr(&oid, q::URGENT_DATA_XATTR)
+                .await
+                .expect("xattr");
+            ids(&BTreeMap::<u32, Reservation>::decode(&mut xattr, 0).expect("decode"))
+        };
+
+        for _ in 0..784 {
+            q::reserve(&ioctx, &oid, 1, 1).await.expect("reserve");
+        }
+        let state = q::read_head(&ioctx, &oid).await.expect("head");
+        assert_eq!(state.urgent_data.reservations.len(), 784);
+        assert!(!state.urgent_data.has_xattrs);
+        let err = ioctx
+            .get_xattr(&oid, q::URGENT_DATA_XATTR)
+            .await
+            .expect_err("no xattr yet");
+        assert!(is_osd_error(&err, ENODATA), "{err:?}");
+
+        // 27 + 30 x 785 bytes would pass the head's 23,552.
+        assert_eq!(q::reserve(&ioctx, &oid, 1, 1).await.expect("reserve"), 785);
+        let state = q::read_head(&ioctx, &oid).await.expect("head");
+        assert_eq!(state.urgent_data.reservations.len(), 784);
+        assert!(state.urgent_data.has_xattrs);
+        assert_eq!(xattr_ids().await, [785]);
+        assert_eq!(
+            ids(&q::list_reservations(&ioctx, &oid)
+                .await
+                .expect("reservations")),
+            (1..=785).collect::<Vec<_>>()
+        );
+
+        q::commit(&ioctx, &oid, 785, one(b"x"))
+            .await
+            .expect("commit from the xattr");
+        assert_eq!(
+            q::list_reservations(&ioctx, &oid)
+                .await
+                .expect("reservations")
+                .len(),
+            784
+        );
+        assert!(xattr_ids().await.is_empty());
+        let state = q::read_head(&ioctx, &oid).await.expect("head");
+        assert!(state.urgent_data.has_xattrs, "never cleared");
+        let err = q::commit(&ioctx, &oid, 9999, one(b"x"))
+            .await
+            .expect_err("commit of an unknown id after the spill");
+        assert!(is_osd_error(&err, ENOENT), "{err:?}");
+
+        assert_eq!(q::reserve(&ioctx, &oid, 1, 1).await.expect("reserve"), 786);
+        assert_eq!(xattr_ids().await, [786]);
+        q::abort(&ioctx, &oid, 786)
+            .await
+            .expect("abort from the xattr");
+        assert_eq!(
+            q::list_reservations(&ioctx, &oid)
+                .await
+                .expect("reservations")
+                .len(),
+            784
+        );
+        q::abort(&ioctx, &oid, 9999).await.expect("abort unknown");
     })
     .await;
 }
