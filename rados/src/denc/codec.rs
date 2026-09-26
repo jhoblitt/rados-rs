@@ -1339,4 +1339,52 @@ mod tests {
         assert_eq!(back, map);
         assert_eq!(map.encoded_size(0), Some(14));
     }
+
+    #[derive(Debug, PartialEq, Eq, crate::VersionedDenc)]
+    #[denc(
+        crate = "crate",
+        version = 2,
+        compat = 2,
+        min_version = 2,
+        ceph_release = "Test v2+"
+    )]
+    struct FlooredV2 {
+        a: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq, crate::VersionedDenc)]
+    #[denc(crate = "crate", version = 2, compat = 2)]
+    struct UnflooredV2 {
+        a: u32,
+    }
+
+    #[test]
+    fn versioned_denc_min_version_rejects_older_headers() {
+        let v1: &[u8] = &[1, 1, 4, 0, 0, 0, 7, 0, 0, 0];
+        let v2: &[u8] = &[2, 2, 4, 0, 0, 0, 7, 0, 0, 0];
+
+        let err = FlooredV2::decode(&mut &v1[..], 0).expect_err("v1 below the floor");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(CodecError::VersionTooOld {
+                    got: 1,
+                    min: 2,
+                    type_name: "FlooredV2",
+                    ceph_release: "Test v2+",
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            FlooredV2::decode(&mut &v2[..], 0).expect("v2"),
+            FlooredV2 { a: 7 }
+        );
+
+        // Without the attribute the older header is still read.
+        assert_eq!(
+            UnflooredV2::decode(&mut &v1[..], 0).expect("v1 unfloored"),
+            UnflooredV2 { a: 7 }
+        );
+    }
 }

@@ -253,9 +253,15 @@ pub struct RemoveBucketOp {
 }
 
 /// `cls_user_list_buckets_op`: version 2 added `end_marker` after
-/// `max_entries`; the dump leaves it out.
+/// `max_entries`; the dump leaves it out. The decoder floors at version 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
-#[denc(crate = "rados", version = 2, compat = 1)]
+#[denc(
+    crate = "rados",
+    version = 2,
+    compat = 1,
+    min_version = 2,
+    ceph_release = "Jewel v10+"
+)]
 pub struct ListBucketsOp {
     pub marker: String,
     pub max_entries: i32,
@@ -1070,5 +1076,21 @@ mod tests {
             .expect("encode"),
         };
         assert_eq!(decode_get_header(&reply).expect("decode"), header);
+    }
+
+    #[test]
+    fn list_buckets_op_floors_at_version_2() {
+        let mut wire = encode_with_capacity(&ListBucketsOp::default(), 0)
+            .expect("encode")
+            .to_vec();
+        wire[..2].copy_from_slice(&[1, 1]);
+        let err = ListBucketsOp::decode(&mut &wire[..], 0).expect_err("version 1");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(rados::CodecError::VersionTooOld { got: 1, min: 2, .. })
+            ),
+            "{err:?}"
+        );
     }
 }

@@ -179,6 +179,8 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_lc_entry", None, false),
     // No corpus directory and no test instances.
     TypeSpec::new("cls_rgw_lc_obj_head", None, false),
+    TypeSpec::new("cls_rgw_lc_get_entry_ret", None, false),
+    TypeSpec::new("cls_rgw_lc_set_entry_op", None, false),
     TypeSpec::new("rgw_cls_tag_timeout_op", None, false),
     TypeSpec::new("rgw_cls_obj_prepare_op", None, false),
     TypeSpec::new("rgw_cls_obj_complete_op", None, false),
