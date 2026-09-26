@@ -193,6 +193,12 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("cls_rgw_set_bucket_resharding_op", None, false),
     TypeSpec::new("cls_rgw_clear_bucket_resharding_op", None, false),
     TypeSpec::new("cls_rgw_guard_bucket_resharding_op", None, false),
+    TypeSpec::new("rgw_cls_link_olh_op", None, false),
+    TypeSpec::new("rgw_cls_unlink_instance_op", None, false),
+    TypeSpec::new("rgw_cls_read_olh_log_op", None, false),
+    TypeSpec::new("rgw_cls_read_olh_log_ret", None, false),
+    TypeSpec::new("rgw_cls_trim_olh_log_op", None, false),
+    TypeSpec::new("rgw_cls_bucket_clear_olh_op", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];
