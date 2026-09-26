@@ -900,12 +900,26 @@ impl IoCtx {
     /// codes of later ops in a compound operation are the caller's to
     /// inspect in the returned [`OpResult`].
     pub async fn execute_op(&self, oid: impl Into<String>, op: BuiltOp) -> Result<OpResult> {
+        let result = self.execute_op_unchecked(oid, op).await?;
+        OSDClient::check_op_result(&result, "execute_op")?;
+        Ok(result)
+    }
+
+    /// Execute a built operation on `oid` and return the reply whatever
+    /// its result codes; only a failure to get a reply is an error.
+    ///
+    /// For methods that answer a negative result together with a reply
+    /// the caller must read, such as `cls_rgw`'s `bucket_list` and its
+    /// `EFBIG`.
+    pub async fn execute_op_unchecked(
+        &self,
+        oid: impl Into<String>,
+        op: BuiltOp,
+    ) -> Result<OpResult> {
         let oid = oid.into();
         debug!("Executing op for object '{}' in pool {}", oid, self.pool_id);
 
-        let result = self.execute(&oid, op).await?;
-        OSDClient::check_op_result(&result, "execute_op")?;
-        Ok(result)
+        self.execute(&oid, op).await
     }
 
     // ---- Pool-level snapshot operations ----

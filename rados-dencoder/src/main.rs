@@ -40,8 +40,14 @@ use rados_cls::rgw::gc::{
 };
 use rados_cls::rgw::index::{
     BiEntry as RgwBiEntry, BiLogEntry as RgwBiLogEntry,
-    BucketInstanceEntry as RgwBucketInstanceEntry, Dir as RgwDir, DirEntry as RgwDirEntry,
-    DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader, ReshardEntry as RgwReshardEntry,
+    BucketInstanceEntry as RgwBucketInstanceEntry, CheckAttrsPrefixOp as RgwCheckAttrsPrefixOp,
+    CheckIndexRet as RgwCheckIndexRet, ClearBucketReshardingOp as RgwClearBucketReshardingOp,
+    CompleteOp as RgwCompleteOp, Dir as RgwDir, DirEntry as RgwDirEntry,
+    DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader,
+    GuardBucketReshardingOp as RgwGuardBucketReshardingOp, ListOp as RgwListOp,
+    ListRet as RgwListRet, PrepareOp as RgwPrepareOp, RemoveObjOp as RgwRemoveObjOp,
+    ReshardEntry as RgwReshardEntry, SetBucketReshardingOp as RgwSetBucketReshardingOp,
+    StorePgVerOp as RgwStorePgVerOp, TagTimeoutOp as RgwTagTimeoutOp,
 };
 use rados_cls::rgw::lc::{LcEntry as RgwLcEntry, LcObjHead as RgwLcObjHead};
 use rados_cls::rgw::olh::{OlhEntry as RgwOlhEntry, OlhLogEntry as RgwOlhLogEntry};
@@ -267,6 +273,22 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_rgw_gc_remove_op" => Some(type_info_denc::<RgwGcRemoveOp>()),
         "cls_rgw_gc_urgent_data" => Some(type_info_denc::<RgwGcUrgentData>()),
         "cls_rgw_gc_queue_init_op" => Some(type_info_denc::<RgwGcQueueInitOp>()),
+        "rgw_cls_tag_timeout_op" => Some(type_info_denc::<RgwTagTimeoutOp>()),
+        "rgw_cls_obj_prepare_op" => Some(type_info_denc::<RgwPrepareOp>()),
+        "rgw_cls_obj_complete_op" => Some(type_info_denc::<RgwCompleteOp>()),
+        "rgw_cls_list_op" => Some(type_info_denc::<RgwListOp>()),
+        "rgw_cls_list_ret" => Some(type_info_denc::<RgwListRet>()),
+        "rgw_cls_check_index_ret" => Some(type_info_denc::<RgwCheckIndexRet>()),
+        "rgw_cls_obj_remove_op" => Some(type_info_denc::<RgwRemoveObjOp>()),
+        "rgw_cls_obj_store_pg_ver_op" => Some(type_info_denc::<RgwStorePgVerOp>()),
+        "rgw_cls_obj_check_attrs_prefix" => Some(type_info_denc::<RgwCheckAttrsPrefixOp>()),
+        "cls_rgw_set_bucket_resharding_op" => Some(type_info_denc::<RgwSetBucketReshardingOp>()),
+        "cls_rgw_clear_bucket_resharding_op" => {
+            Some(type_info_denc::<RgwClearBucketReshardingOp>())
+        }
+        "cls_rgw_guard_bucket_resharding_op" => {
+            Some(type_info_denc::<RgwGuardBucketReshardingOp>())
+        }
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -351,6 +373,11 @@ fn list_types() {
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );
     println!("  cls_rgw_gc_urgent_data / cls_rgw_gc_queue_init_op [versioned]");
+    println!(
+        "  rgw_cls_{{tag_timeout,obj_prepare,obj_complete,list,obj_remove,obj_store_pg_ver}}_op \
+         / rgw_cls_{{list,check_index}}_ret / rgw_cls_obj_check_attrs_prefix [versioned]"
+    );
+    println!("  cls_rgw_{{set,clear,guard}}_bucket_resharding_op [versioned]");
     println!();
     println!("LEVEL 4: Top-level cluster structures");
     println!("  Test these ONLY after all lower levels are validated");
