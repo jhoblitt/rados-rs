@@ -34,7 +34,7 @@ use serde::ser::SerializeStruct;
 
 use super::CLASS;
 use super::index::{DirEntryMeta, DumpUtime, ZonesTraceBare};
-use super::types::{ObjKey, ZoneSet, byte_enum};
+use super::types::{ObjKey, ZoneSet};
 use crate::call;
 
 byte_enum! {
