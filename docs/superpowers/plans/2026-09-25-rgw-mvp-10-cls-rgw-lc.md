@@ -66,9 +66,9 @@ Plans 3 to 9's Global Constraints apply unchanged. Plus:
   versions 1 and 2 carried `map<string, int>`. The port encodes version 2
   (entries) and version 3 (list request and reply) and floors them with
   the derive: the four entry messages
-  `version = 2, compat = 2, min_version = 2, ceph_release = "Pacific v16+"`,
+  `version = 2, compat = 2, min_version = 2, ceph_release = "Octopus v15+"`,
   `ListRet` `version = 3, compat = 1, min_version = 3, ceph_release =
-  "Pacific v16+"`. The hint's basis: v15.2.0 writes the entry messages as
+  "Octopus v15+"`. The hint's basis: v15.2.0 writes the entry messages as
   1/1, v16.2.0 as 2/2 and the list reply as v3. It does not model the list
   request's `compat_v` (it always sends 3 and so always receives 3); the
   other five (`GetEntryOp`, `GetNextEntryOp`, `PutHeadOp`, `GetHeadRet`
@@ -149,7 +149,7 @@ As plan 3's Task 0; branch `cls-rgw-lc` off the fork's `main` after plan
   errors. No attribute means no change (the parameter stays `_version`).
 - The derive's docs gain a "Version floor" section with the example
   `#[denc(version = 2, compat = 2, min_version = 2, ceph_release =
-  "Pacific v16+")]`.
+  "Octopus v15+")]`.
 
 Unit test, in `rados/src/denc/codec.rs` because a proc-macro crate cannot
 run its own derive: `versioned_denc_min_version_rejects_older_headers`
@@ -239,7 +239,7 @@ Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
   { head: LcObjHead }` (v1); `GetHeadRet { head }` (v1); `ListEntriesOp {
   marker, max_entries: u32 }` (v3/1); `ListRet { entries: Vec<LcEntry>,
   is_truncated: bool }` (v3/1, floored at 3). "Floored" is Task 1's
-  `min_version` with `ceph_release = "Pacific v16+"`, per Global
+  `min_version` with `ceph_release = "Octopus v15+"`, per Global
   Constraints; the derive enforces nothing without it. The `SetEntryOp`
   `Serialize` is the one hand-written piece.
 - Op constructors: `get_head_op()` (raw, empty), `put_head_op(&LcObjHead)`,
@@ -370,8 +370,9 @@ request's `compat_v` echo (the port always sends version 3).
 
 - Global Constraints: the false claim that the derived `VersionedDenc` rejects a `struct_v` below its version replaced by what it did (lib.rs:444, only `compat_version > version`) and the rule that a derived type floors only with `min_version`.
 - New Task 1 (`rados-denc-macros` `min_version` + `ceph_release`, `VersionTooOld` via `check_min_version!`, test in `rados/src/denc/codec.rs`, "Version floor" doc section) and Task 2 (five derived types floored: `PendingInfo` Bobtail, `LcObjHead` Reef, `ListBucketsOp`/`AddOp`/`CheckMtimeOp` Jewel, rejection tests); lc tasks renumbered 3 and 4, gate Task 5.
-- Task 3: lc types derived with `min_version` (entry messages 2/2/2, `ListRet` 3/1/3, "Pacific v16+"; basis v15.2.0 1/1, v16.2.0 2/2 and v3 list reply); rejection tests assert `VersionTooOld`; the v1-entry-frame, sorting, decoder and request-bytes tests added to the list.
+- Task 3: lc types derived with `min_version` (entry messages 2/2/2, `ListRet` 3/1/3, "Octopus v15+"; basis v15.2.0 1/1, v16.2.0 2/2 and v3 list reply); rejection tests assert `VersionTooOld`; the v1-entry-frame, sorting, decoder and request-bytes tests added to the list.
 - Server facts: missing-object `ENOENT` for `rm_entry`, `get_entry`, `get_next_entry`, `list`; `put_head` creates; `max_entries` 0 gives no entries and truncated; default next entry (cls_rgw.cc:4264-4277) and default head (4350-4362) cited.
 - Task 4: `std::slice::from_ref(&b3)` deviation (clippy 1.98 rejects `[b3.clone()]`); README feature row folded in as a separate commit.
 - Review Focus renumbered and rewritten: items 1-2 for the derive floor and the sweep; 3-4 say the floor is `min_version` and the error `VersionTooOld`.
 - Every commit message is the branch's verbatim, trailers included; Goal, Architecture, gate scope and PR body widened to the derive fix.
+- Review fold: the lc hints are Octopus v15+ (v15.2.5 first wrote the versions), `ListEntriesOp` floors at 3, `PendingInfo`'s hint is Argonaut v0.48+, each derive panics on the other derive's floor key, and two commit messages lost their process notes.
