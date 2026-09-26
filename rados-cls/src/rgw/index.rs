@@ -134,7 +134,7 @@ rados::impl_denc_for_versioned!(DirEntryMeta);
 
 /// A [`UTime`] dumped through [`crate::dump::utime`] (`utime_t::gmtime`),
 /// for use where a value, not a `serialize_with` function, is needed.
-struct DumpUtime<'a>(&'a UTime);
+pub(super) struct DumpUtime<'a>(pub(super) &'a UTime);
 
 impl Serialize for DumpUtime<'_> {
     fn serialize<S: serde::Serializer>(
@@ -714,7 +714,7 @@ impl BiLogEntry {
 /// has a dedicated overload for `rgw_zone_set` that dumps `zs.entries`
 /// directly, skipping the `{"entries": [...]}` wrapper [`ZoneSet`]'s own
 /// dump uses.
-struct ZonesTraceBare<'a>(&'a ZoneSet);
+pub(super) struct ZonesTraceBare<'a>(pub(super) &'a ZoneSet);
 
 impl Serialize for ZonesTraceBare<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
