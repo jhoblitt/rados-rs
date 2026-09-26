@@ -4,5 +4,6 @@
 
 pub mod gc;
 pub mod index;
+pub mod olh;
 mod packed;
 pub mod types;

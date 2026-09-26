@@ -163,6 +163,9 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("rgw_bi_log_entry", None, false),
     TypeSpec::new("cls_rgw_bucket_instance_entry", None, false),
     TypeSpec::new("cls_rgw_reshard_entry", None, false),
+    TypeSpec::new("rgw_bucket_olh_log_entry", None, false),
+    TypeSpec::new("rgw_bucket_olh_entry", None, false),
+    TypeSpec::new("rgw_cls_bi_entry", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

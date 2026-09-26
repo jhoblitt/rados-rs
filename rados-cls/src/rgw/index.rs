@@ -5,16 +5,17 @@
 
 use std::collections::BTreeMap;
 
-use bytes::{Buf, BufMut};
-use rados::{Denc, RadosError, UTime, VersionedEncode};
+use bytes::{Buf, BufMut, Bytes};
+use rados::{Denc, OmapKey, RadosError, UTime, VersionedDenc, VersionedEncode};
 use serde::Serialize;
 use serde::ser::{SerializeSeq, SerializeStruct};
 
+use super::olh::OlhEntry;
 use super::packed;
 use super::types::{
-    CategoryStats, EntryVer, FLAG_COMMON_PREFIX, FLAG_CURRENT, FLAG_DELETE_MARKER, FLAG_VER,
-    FLAG_VER_MARKER, ModifyOp, ObjCategory, ObjKey, PendingInfo, PendingState, ReshardStatus,
-    ZoneSet,
+    BiIndexType, CategoryStats, EntryVer, FLAG_COMMON_PREFIX, FLAG_CURRENT, FLAG_DELETE_MARKER,
+    FLAG_VER, FLAG_VER_MARKER, ModifyOp, ObjCategory, ObjKey, PendingInfo, PendingState,
+    ReshardStatus, ZoneSet, rounded_size,
 };
 
 /// `rgw_bucket_dir_entry_meta`: what the bucket index caches about an
@@ -817,6 +818,99 @@ impl Serialize for ReshardEntry {
     }
 }
 
+/// `rgw_cls_bi_entry::get_info`'s result: the entry's key, its category
+/// when it has one (a `PLAIN`/`INSTANCE` dir entry; `None` for `OLH`),
+/// the stats delta the dir entry contributes, and whether it counts
+/// towards the bucket's accounted stats.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BiInfo {
+    pub key: ObjKey,
+    pub category: Option<ObjCategory>,
+    pub stats: CategoryStats,
+    pub counts: bool,
+}
+
+/// `rgw_cls_bi_entry`: one bucket-index entry, its payload encoded by
+/// `kind` as a [`DirEntry`] (`PLAIN`/`INSTANCE`) or an [`OlhEntry`]
+/// (`OLH`). The dump decodes that payload; [`BiEntry::get_info`] mirrors
+/// the C++ accounting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
+#[denc(crate = "rados", version = 1, compat = 1)]
+pub struct BiEntry {
+    pub kind: BiIndexType,
+    /// The omap key the entry lives under. Instance and OLH keys start
+    /// with the `0x80` namespace byte, so the key is bytes, not a
+    /// `String`; the dump renders it lossily where the C++ writes the
+    /// raw bytes into its JSON.
+    pub idx: OmapKey,
+    pub data: Bytes,
+}
+
+impl BiEntry {
+    /// `rgw_cls_bi_entry::get_info`. A payload that fails to decode is
+    /// returned as an error rather than the C++'s undefined behaviour.
+    pub fn get_info(&self) -> std::result::Result<BiInfo, RadosError> {
+        let mut buf = self.data.clone();
+        if self.kind == BiIndexType::OLH {
+            let entry = OlhEntry::decode(&mut buf, 0)?;
+            return Ok(BiInfo {
+                key: entry.key,
+                category: None,
+                stats: CategoryStats::default(),
+                counts: false,
+            });
+        }
+
+        let entry = DirEntry::decode(&mut buf, 0)?;
+        let stats = CategoryStats {
+            total_size: entry.meta.accounted_size,
+            total_size_rounded: rounded_size(entry.meta.accounted_size),
+            num_entries: 1,
+            actual_size: entry.meta.size,
+        };
+        let counts = match self.kind {
+            BiIndexType::PLAIN => entry.exists && entry.flags == 0,
+            BiIndexType::INSTANCE => entry.exists,
+            _ => false,
+        };
+        Ok(BiInfo {
+            key: entry.key,
+            category: Some(entry.meta.category),
+            stats,
+            counts,
+        })
+    }
+}
+
+impl Serialize for BiEntry {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let has_entry = matches!(
+            self.kind,
+            BiIndexType::PLAIN | BiIndexType::INSTANCE | BiIndexType::OLH
+        );
+        let mut state = serializer.serialize_struct("BiEntry", if has_entry { 3 } else { 2 })?;
+        state.serialize_field("type", self.kind.as_str())?;
+        state.serialize_field("idx", &String::from_utf8_lossy(&self.idx))?;
+        match self.kind {
+            BiIndexType::PLAIN | BiIndexType::INSTANCE => {
+                let mut buf = self.data.clone();
+                let entry = DirEntry::decode(&mut buf, 0).map_err(serde::ser::Error::custom)?;
+                state.serialize_field("entry", &entry)?;
+            }
+            BiIndexType::OLH => {
+                let mut buf = self.data.clone();
+                let entry = OlhEntry::decode(&mut buf, 0).map_err(serde::ser::Error::custom)?;
+                state.serialize_field("entry", &entry)?;
+            }
+            _ => {}
+        }
+        state.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,15 +955,22 @@ mod tests {
         let m = meta_instance();
         assert_eq!(
             bytes(&m),
-            unhex("07035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f747970650000000000000000000000000000000000")
+            unhex(
+                "07035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f747970650000000000000000000000000000000000"
+            )
         );
         assert_eq!(
             json(&m),
             r#"{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false}"#
         );
-        assert_eq!(DirEntryMeta::decode(&mut &bytes(&m)[..], 0).expect("decode"), m);
+        assert_eq!(
+            DirEntryMeta::decode(&mut &bytes(&m)[..], 0).expect("decode"),
+            m
+        );
         // Version 6 lacked appendable; below the floor.
-        let v6 = unhex("06035200000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f7479706500000000000000000000000000000000");
+        let v6 = unhex(
+            "06035200000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f7479706500000000000000000000000000000000",
+        );
         assert!(DirEntryMeta::decode(&mut &v6[..], 0).is_err());
     }
 
@@ -922,7 +1023,10 @@ mod tests {
                 name: "name".to_owned(),
                 instance: String::new(),
             },
-            ver: EntryVer { pool: 1, epoch: 1234 },
+            ver: EntryVer {
+                pool: 1,
+                epoch: 1234,
+            },
             locator: "locator".to_owned(),
             exists: true,
             meta: meta_instance(),
@@ -939,7 +1043,9 @@ mod tests {
         let e = dir_entry_instance();
         assert_eq!(
             bytes(&e),
-            unhex("080399000000040000006e616d65d2040000000000000107035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000000000000070000006c6f6361746f720101040000000182d20400030000007461670000000000000000000000000000")
+            unhex(
+                "080399000000040000006e616d65d2040000000000000107035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000000000000070000006c6f6361746f720101040000000182d20400030000007461670000000000000000000000000000"
+            )
         );
         assert_eq!(
             json(&e),
@@ -1025,13 +1131,18 @@ mod tests {
         let h = dir_header_instance();
         assert_eq!(
             bytes(&h),
-            unhex("07025700000001000000000302200000000004000000000000001000000000000002000000000000000004000000000000000000000000000000000000000000000000000000000000000000000301090000000000000000ffffffff00")
+            unhex(
+                "07025700000001000000000302200000000004000000000000001000000000000002000000000000000004000000000000000000000000000000000000000000000000000000000000000000000301090000000000000000ffffffff00"
+            )
         );
         assert_eq!(
             json(&h),
             r#"{"ver":0,"master_ver":0,"stats":[0,{"total_size":1024,"total_size_rounded":4096,"num_entries":2,"actual_size":1024}],"new_instance":{"reshard_status":"not-resharding"}}"#
         );
-        assert_eq!(DirHeader::decode(&mut &bytes(&h)[..], 0).expect("decode"), h);
+        assert_eq!(
+            DirHeader::decode(&mut &bytes(&h)[..], 0).expect("decode"),
+            h
+        );
     }
 
     #[test]
@@ -1042,7 +1153,9 @@ mod tests {
         };
         assert_eq!(
             bytes(&d),
-            unhex("02026100000007025700000001000000000302200000000004000000000000001000000000000002000000000000000004000000000000000000000000000000000000000000000000000000000000000000000301090000000000000000ffffffff0000000000")
+            unhex(
+                "02026100000007025700000001000000000302200000000004000000000000001000000000000002000000000000000004000000000000000000000000000000000000000000000000000000000000000000000301090000000000000000ffffffff0000000000"
+            )
         );
         assert_eq!(Dir::decode(&mut &bytes(&d)[..], 0).expect("decode"), d);
         assert!(json(&d).contains(r#""map":[]"#));
@@ -1071,13 +1184,18 @@ mod tests {
         let e = bilog_entry_instance();
         assert_eq!(
             bytes(&e),
-            unhex("04014b000000040000006d696466030000006f626a020000000300000001010a00000088ffffffffffffffff0009000000746167617364666473010082e310000000000000000000000000000000000000")
+            unhex(
+                "04014b000000040000006d696466030000006f626a020000000300000001010a00000088ffffffffffffffff0009000000746167617364666473010082e310000000000000000000000000000000000000"
+            )
         );
         assert_eq!(
             json(&e),
             r#"{"op_id":"midf","op_tag":"tagasdfds","op":"del","object":"obj","instance":"","state":"pending","index_ver":4323,"timestamp":"2.000000","ver":{"pool":-1,"epoch":0},"bilog_flags":0,"versioned":false,"owner":"","owner_display_name":"","zones_trace":[]}"#
         );
-        assert_eq!(BiLogEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+        assert_eq!(
+            BiLogEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"),
+            e
+        );
         assert!(!e.is_versioned());
         assert!(!e.is_null_verid());
     }
@@ -1102,10 +1220,89 @@ mod tests {
             json(&e),
             r#"{"time":"2.000000","tenant":"tenant","bucket_name":"bucket1","bucket_id":"bucket_id","old_num_shards":8,"tentative_new_num_shards":64}"#
         );
-        assert_eq!(ReshardEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+        assert_eq!(
+            ReshardEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"),
+            e
+        );
         assert_eq!(e.key(), "tenant:bucket1");
         // Version 1 carried a new_instance_id string; below the floor.
-        let v1 = unhex("01013200000002000000030000000600000074656e616e74070000006275636b657431090000006275636b65745f69640800000040000000");
+        let v1 = unhex(
+            "01013200000002000000030000000600000074656e616e74070000006275636b657431090000006275636b65745f69640800000040000000",
+        );
         assert!(ReshardEntry::decode(&mut &v1[..], 0).is_err());
+    }
+
+    fn olh_entry_payload() -> Vec<u8> {
+        unhex(
+            "01013800000001011c000000080000006b65792e6e616d650c0000006b65792e696e7374616e636501d20400000000000000000000030000007461670101",
+        )
+    }
+
+    #[test]
+    fn bi_entry_invalid_has_no_entry() {
+        let e = BiEntry::default();
+        assert_eq!(bytes(&e), unhex("010109000000000000000000000000"));
+        assert_eq!(json(&e), r#"{"type":"invalid","idx":""}"#);
+        assert_eq!(BiEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+    }
+
+    #[test]
+    fn bi_entry_dumps_a_namespaced_key_lossily() {
+        let e = BiEntry {
+            kind: BiIndexType::INVALID,
+            idx: Bytes::from_static(b"\x801000_obj"),
+            data: Bytes::new(),
+        };
+        assert_eq!(
+            bytes(&e),
+            unhex("010112000000000900000080313030305f6f626a00000000")
+        );
+        assert_eq!(
+            json(&e),
+            "{\"type\":\"invalid\",\"idx\":\"\u{fffd}1000_obj\"}"
+        );
+        assert_eq!(BiEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+    }
+
+    #[test]
+    fn bi_entry_olh_dumps_the_decoded_olh_entry() {
+        let e = BiEntry {
+            kind: BiIndexType::OLH,
+            idx: Bytes::from_static(b"idx"),
+            data: Bytes::from(olh_entry_payload()),
+        };
+        assert_eq!(
+            bytes(&e),
+            unhex(
+                "01014a00000003030000006964783e00000001013800000001011c000000080000006b65792e6e616d650c0000006b65792e696e7374616e636501d20400000000000000000000030000007461670101"
+            )
+        );
+        assert_eq!(
+            json(&e),
+            r#"{"type":"olh","idx":"idx","entry":{"key":{"name":"key.name","instance":"key.instance"},"delete_marker":true,"epoch":1234,"pending_log":[],"tag":"tag","exists":true,"pending_removal":true}}"#
+        );
+        assert_eq!(BiEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+        let info = e.get_info().expect("get_info");
+        assert_eq!(info.key.name, "key.name");
+        assert_eq!(info.category, None);
+        assert!(!info.counts);
+    }
+
+    #[test]
+    fn bi_entry_plain_accounts_a_dir_entry() {
+        let dir_entry = dir_entry_instance();
+        let e = BiEntry {
+            kind: BiIndexType::PLAIN,
+            idx: Bytes::from_static(b"idx"),
+            data: Bytes::from(bytes(&dir_entry)),
+        };
+        let info = e.get_info().expect("get_info");
+        assert_eq!(info.key.name, "name");
+        assert_eq!(info.category, Some(ObjCategory::MAIN));
+        assert_eq!(info.stats.num_entries, 1);
+        assert_eq!(info.stats.actual_size, dir_entry.meta.size);
+        assert_eq!(info.stats.total_size, dir_entry.meta.accounted_size);
+        // exists is true and flags is 0, so it counts.
+        assert!(info.counts);
     }
 }

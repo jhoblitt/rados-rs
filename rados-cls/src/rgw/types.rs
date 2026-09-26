@@ -138,6 +138,7 @@ macro_rules! byte_enum {
         }
     };
 }
+pub(crate) use byte_enum;
 
 byte_enum! {
     /// `RGWObjCategory`: what a bucket-index entry accounts for. Dumps as a number.

@@ -39,10 +39,11 @@ use rados_cls::rgw::gc::{
     RemoveOp as RgwGcRemoveOp, SetEntryOp as RgwGcSetEntryOp,
 };
 use rados_cls::rgw::index::{
-    BiLogEntry as RgwBiLogEntry, BucketInstanceEntry as RgwBucketInstanceEntry, Dir as RgwDir,
-    DirEntry as RgwDirEntry, DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader,
-    ReshardEntry as RgwReshardEntry,
+    BiEntry as RgwBiEntry, BiLogEntry as RgwBiLogEntry,
+    BucketInstanceEntry as RgwBucketInstanceEntry, Dir as RgwDir, DirEntry as RgwDirEntry,
+    DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader, ReshardEntry as RgwReshardEntry,
 };
+use rados_cls::rgw::olh::{OlhEntry as RgwOlhEntry, OlhLogEntry as RgwOlhLogEntry};
 use rados_cls::rgw::types::{
     CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
     ObjChain as RgwObjChain, ObjKey as RgwObjKey, PendingInfo as RgwPendingInfo,
@@ -243,6 +244,9 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_bi_log_entry" => Some(type_info_denc::<RgwBiLogEntry>()),
         "cls_rgw_bucket_instance_entry" => Some(type_info_denc::<RgwBucketInstanceEntry>()),
         "cls_rgw_reshard_entry" => Some(type_info_denc::<RgwReshardEntry>()),
+        "rgw_bucket_olh_log_entry" => Some(type_info_denc::<RgwOlhLogEntry>()),
+        "rgw_bucket_olh_entry" => Some(type_info_denc::<RgwOlhEntry>()),
+        "rgw_cls_bi_entry" => Some(type_info_denc::<RgwBiEntry>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
         "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
@@ -327,6 +331,9 @@ fn list_types() {
     );
     println!(
         "  cls_rgw_{{bucket_instance_entry,reshard_entry}} [versioned]"
+    );
+    println!(
+        "  rgw_bucket_olh_{{log_entry,entry}} / rgw_cls_bi_entry [versioned]"
     );
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
