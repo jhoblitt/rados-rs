@@ -1,7 +1,7 @@
 //! Renderings that match `ceph-dencoder`'s `dump_json` where `serde`'s
 //! defaults do not.
 
-#[cfg(any(feature = "user", feature = "rgw"))]
+#[cfg(any(feature = "user", feature = "rgw", feature = "lock"))]
 use rados::UTime;
 #[cfg(feature = "rgw")]
 use serde::Serialize;
@@ -39,7 +39,7 @@ pub(crate) fn gmtime(t: &UTime) -> String {
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`;
 /// Howard Hinnant's `civil_from_days`.
-#[cfg(any(feature = "user", feature = "rgw"))]
+#[cfg(any(feature = "user", feature = "rgw", feature = "lock"))]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -120,7 +120,7 @@ pub(crate) fn real_time<S: serde::Serializer>(t: &UTime, s: S) -> Result<S::Ok, 
     s.serialize_str(&iso_utc(t))
 }
 
-#[cfg(feature = "rgw")]
+#[cfg(any(feature = "rgw", feature = "lock"))]
 pub(crate) fn iso_utc(t: &UTime) -> String {
     let usec = t.nsec / 1000;
     let (year, month, day) = civil_from_days(i64::from(t.sec / 86_400));
@@ -131,6 +131,26 @@ pub(crate) fn iso_utc(t: &UTime) -> String {
         (secs % 3600) / 60,
         secs % 60
     )
+}
+
+/// A `utime_t` streamed with `operator<<`: `utime_t::localtime`, which
+/// prints a count of seconds below ten years as `<sec>.<usec>` and
+/// anything later in the calendar form with the zone's `%z`, `+0000`
+/// where `ceph-dencoder` runs.
+#[cfg(feature = "lock")]
+pub(crate) fn localtime(t: &UTime) -> String {
+    if t.sec < 315_360_000 {
+        return format!("{}.{:06}", t.sec, t.nsec / 1000);
+    }
+    iso_utc(t)
+}
+
+#[cfg(feature = "lock")]
+pub(crate) fn utime_localtime<S: serde::Serializer>(
+    t: &UTime,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&localtime(t))
 }
 
 #[cfg(test)]
@@ -277,6 +297,25 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&w).expect("json"),
             r#"[{"key":"a","val":1},{"key":"b","val":2}]"#
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lock")]
+    fn localtime_switches_to_the_calendar_at_ten_years() {
+        assert_eq!(localtime(&UTime::new(5, 0)), "5.000000");
+        assert_eq!(localtime(&UTime::new(0, 0)), "0.000000");
+        assert_eq!(
+            localtime(&UTime::new(315_359_999, 999_999_999)),
+            "315359999.999999"
+        );
+        assert_eq!(
+            localtime(&UTime::new(315_360_000, 0)),
+            "1979-12-30T00:00:00.000000+0000"
+        );
+        assert_eq!(
+            localtime(&UTime::new(1_727_604_086, 460_555_954)),
+            "2024-09-29T10:01:26.460555+0000"
         );
     }
 }
