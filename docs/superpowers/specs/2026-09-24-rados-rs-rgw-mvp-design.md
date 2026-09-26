@@ -106,8 +106,11 @@ class behind a Cargo feature of the same name (`version`, `refcount`,
 structs with `Denc` derives, and async functions that issue a `Call` op
 through `IoCtx::exec` or add one to a builder for compound use, then decode
 the reply. Each function mirrors one function of the corresponding
-`cls_*_client.h`. `cls_lock` stays in the core crate where it already
-lives.
+`cls_*_client.h`. The core crate's existing `cls_lock` helpers
+(`IoCtx::lock_exclusive`, `lock_shared`, `unlock`) stay as upstream's API;
+the complete mirror of the class, all seven methods, is the `cls-lock`
+package of `rados-cls`, and routing the core helpers through it is a
+follow-up.
 
 The split exists so upstream can accept the transport work on its own
 merits and take or leave RGW-specific encodings crate by crate, and so an
