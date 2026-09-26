@@ -15,7 +15,9 @@ RADOS interaction of RGW's single-site data and metadata paths can be
 expressed against the fork.
 
 What "RGW's single-site paths" means is decided by the sibling rgw-go
-effort's exclusion list, `rgw-go/docs/exclusions.md`, which the owner
+effort's exclusion list, `rgw-go/docs/exclusions.md` (published at
+`https://github.com/jhoblitt/rgw-go/blob/main/docs/exclusions.md` once
+its first pull request merges), which the owner
 made canon for this fork on 2026-09-25: the feature set is what a
 drop-in replacement for radosgw in a Rook cluster needs, sized by Rook's
 object integration suite (`TestCephObjectSuite`) without multisite, and
