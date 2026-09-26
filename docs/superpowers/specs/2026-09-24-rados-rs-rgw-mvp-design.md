@@ -76,12 +76,18 @@ maintain a list of its own.
   requests at the versions Squid's radosgw sends, decodes replies up to
   what `main` writes, and floors its decoders at Squid (every reply is
   re-encoded by the OSD; the raw-omap readers that would see older
-  stored bytes, `bi_get` and `bi_list`, are out); where Tentacle changed
-  a request or reply shape (the OLH epoch reply on link and unlink,
-  `get_stales` on `read_olh_log`, `update_stats` version 2), the
-  `release-shapes` package offers both shapes, selectable by release,
-  and the `rados` crate exposes the cluster's required OSD release for
-  the driver's detection seam. The driver-level types the gateway
+  stored bytes, `bi_get` and `bi_list`, are out); where a later release changed a request or reply shape (`update_stats`
+  version 2 in Tentacle v20.2.0; `read_olh_log` version 2 with
+  `get_stales` and the version-8 index-entry metadata in Umbrella
+  v21.1.0; the OLH epoch reply on link and unlink only on `main`, unreleased),
+  the `release-shapes` package offers each shape, selected by the
+  cluster's required OSD release, and the `rados` crate exposes that
+  release for the driver's detection seam. radosgw itself does not key
+  on the release: it sends the newest request shape with compat 1
+  (older OSDs ignore the tail) and probes new methods for
+  `EOPNOTSUPP`, so during a rolling upgrade it sends newer shapes than
+  the map's release; keying on the map is stricter and never sends an
+  OSD a shape it might not accept, which is the trade the rule makes. The driver-level types the gateway
   writes itself are rgw-rs's, and there the rule applies in full.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
@@ -215,12 +221,18 @@ land last.
   `rgw_notify.cc` does with them.
 - `cls-otp`: create, remove, set, check and get, and the MFA seed types.
 - `release-shapes` (after `watch-notify`): the cluster's required OSD
-  release exposed from the OSD map (and kept through incrementals,
-  which today discard it), and the Tentacle request and reply shapes of
-  the `rgw` class selectable by release: the OLH epoch reply on link and
-  unlink (a writing method that replies, so `RETURNVEC`), `get_stales`
-  on `read_olh_log`, `update_stats` version 2, and whatever else the
-  package's research finds changed between v19.2.2 and `main`.
+  release exposed from the OSD map (and kept through incrementals, which
+  today discard it, as C++ applies it when the byte read as `i8` is not
+  negative) with a config override; the later request shapes of the
+  `rgw` class selected by release (`update_stats` version 2, Tentacle;
+  `read_olh_log` version 2 with `get_stales` and metadata version 8,
+  Umbrella), with the unreleased `main`-only OLH epoch reply deferred
+  until it ships; the docs the crate got wrong about later releases
+  corrected (the null-version bilog flag shipped in Squid v19.2.3, the
+  class guards its own index writes from v20.2.0, `ReshardStatus` gains
+  `IN_LOGRECORD`). The resharding-only methods (`bucket_init_index2`,
+  `bi_put_entries`, `reshard_log_trim`) and the cloud-restore
+  `bucket_refresh_instance` stay out with the features they serve.
 
 Every struct records the `ENCODE_START` version and compat it mirrors, and
 its floor is what C++ RGW on Squid writes.
