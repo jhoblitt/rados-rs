@@ -77,6 +77,11 @@ use rados_cls::rgw::usage::{
     UserBucket as RgwUserBucket,
 };
 use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
+use rados_cls::two_pc_queue::{
+    AbortOp as TwoPcAbortOp, CommitOp as TwoPcCommitOp, ExpireOp as TwoPcExpireOp,
+    Reservation as TwoPcReservation, ReservationsRet as TwoPcReservationsRet,
+    ReserveOp as TwoPcReserveOp, ReserveRet as TwoPcReserveRet, UrgentData as TwoPcUrgentData,
+};
 use rados_cls::user::{
     AccountHeader as UserAccountHeader, AccountResource as UserAccountResource,
     AccountResourceAddOp as UserAccountResourceAddOp,
@@ -329,6 +334,14 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "cls_lock_list_locks_reply" => Some(type_info_denc::<LockListLocksReply>()),
         "cls_lock_assert_op" => Some(type_info_denc::<LockAssertOp>()),
         "cls_lock_set_cookie_op" => Some(type_info_denc::<LockSetCookieOp>()),
+        "cls_2pc_reservation" => Some(type_info_denc::<TwoPcReservation>()),
+        "cls_2pc_urgent_data" => Some(type_info_denc::<TwoPcUrgentData>()),
+        "cls_2pc_queue_reserve_op" => Some(type_info_denc::<TwoPcReserveOp>()),
+        "cls_2pc_queue_reserve_ret" => Some(type_info_denc::<TwoPcReserveRet>()),
+        "cls_2pc_queue_commit_op" => Some(type_info_denc::<TwoPcCommitOp>()),
+        "cls_2pc_queue_abort_op" => Some(type_info_denc::<TwoPcAbortOp>()),
+        "cls_2pc_queue_expire_op" => Some(type_info_denc::<TwoPcExpireOp>()),
+        "cls_2pc_queue_reservations_ret" => Some(type_info_denc::<TwoPcReservationsRet>()),
 
         // Level 4: Top-level cluster structures
         "OSDMap" => Some(type_info_versioned::<OSDMap>()),
@@ -427,6 +440,11 @@ fn list_types() {
         "  [rados::cls::lock::]{{locker_id,locker_info,lock_info}}_t / \
          cls_lock_{{lock,unlock,break,get_info,assert,set_cookie}}_op / \
          cls_lock_{{get_info,list_locks}}_reply [versioned]"
+    );
+    println!(
+        "  cls_2pc_{{reservation,urgent_data}} / \
+         cls_2pc_queue_{{reserve,commit,abort,expire}}_op / \
+         cls_2pc_queue_{{reserve,reservations}}_ret [versioned]"
     );
     println!();
     println!("LEVEL 4: Top-level cluster structures");

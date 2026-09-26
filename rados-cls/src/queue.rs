@@ -24,6 +24,10 @@ pub const CLASS: &str = "queue";
 /// (the class adds `max_urgent_data_size` on top).
 pub const HEAD_SIZE_1K: u64 = 1024;
 
+/// `QUEUE_ENTRY_OVERHEAD`: the `u16` magic and `u64` length ahead of
+/// every payload in the ring.
+pub const ENTRY_OVERHEAD: u64 = 10;
+
 /// `cls_queue_entry`: one payload and the marker naming its slot. The dump
 /// carries the marker and the payload's length as `data_len`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
@@ -283,14 +287,32 @@ pub struct GetCapacityRet {
     pub queue_capacity: u64,
 }
 
+/// `cls_queue_get_stats_ret`, the `2pc_queue` class's topic statistics:
+/// the ring's used bytes (entry overheads included) and its committed
+/// entry count. Ceph gives it no dump and does not register it with
+/// `ceph-dencoder`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
+#[denc(crate = "rados", version = 1, compat = 1)]
+pub struct GetStatsRet {
+    pub queue_size: u64,
+    pub queue_entries: u32,
+}
+
 /// `cls_queue_init`: lay out a ring of `size` usable bytes with no urgent
 /// data. `EEXIST` if the object already holds a head.
 ///
-/// The object must already exist: the class reads the head first, so a
-/// missing object returns `ENOENT`. C++ callers put a create in front of
-/// the init in one compound op (`RGWGC::initialize` does `op.create(false)`
-/// before `gc_log_init2`; the upstream tests use `op.create(true)`), which
-/// here is `OpBuilder::new().create(false).op(init_op(..)?)`.
+/// A missing object is created: a writing class call on a missing object
+/// reads zero bytes, which `queue_read_head` answers with `EINVAL` (the
+/// `ret == 0` branch, `cls_queue_src.cc:57-60` at v19.2.2) and
+/// `queue_init` takes as uninitialised. `queue_init` already answers
+/// `EEXIST` for an object holding a queue head; what `create(true)` in
+/// front of the init in one compound op adds is `EEXIST` for an existing
+/// object that is not a queue, which init would otherwise overwrite (its
+/// head read answers `EINVAL` on bad magic or a failed decode, and init
+/// treats that as uninitialised). The upstream tests use
+/// `op.create(true)`, here `OpBuilder::new().create(true).op(init_op(..)?)`;
+/// `RGWGC::initialize` puts `op.create(false)` before `gc_log_init2`,
+/// which adds neither.
 pub fn init_op(size: u64) -> Result<OSDOp> {
     call::op(
         CLASS,
@@ -355,11 +377,18 @@ pub fn remove_entries_op(end_marker: &str) -> Result<OSDOp> {
 
 /// Lay out a ring of `size` usable bytes on `oid`; see [`init_op`].
 ///
-/// The object must already exist: the class reads the head first, so a
-/// missing object returns `ENOENT`. C++ callers put a create in front of
-/// the init in one compound op (`RGWGC::initialize` does `op.create(false)`
-/// before `gc_log_init2`; the upstream tests use `op.create(true)`), which
-/// here is `OpBuilder::new().create(false).op(init_op(..)?)`.
+/// A missing object is created: a writing class call on a missing object
+/// reads zero bytes, which `queue_read_head` answers with `EINVAL` (the
+/// `ret == 0` branch, `cls_queue_src.cc:57-60` at v19.2.2) and
+/// `queue_init` takes as uninitialised. `queue_init` already answers
+/// `EEXIST` for an object holding a queue head; what `create(true)` in
+/// front of the init in one compound op adds is `EEXIST` for an existing
+/// object that is not a queue, which init would otherwise overwrite (its
+/// head read answers `EINVAL` on bad magic or a failed decode, and init
+/// treats that as uninitialised). The upstream tests use
+/// `op.create(true)`, here `OpBuilder::new().create(true).op(init_op(..)?)`;
+/// `RGWGC::initialize` puts `op.create(false)` before `gc_log_init2`,
+/// which adds neither.
 pub async fn init(ioctx: &IoCtx, oid: &str, size: u64) -> Result<()> {
     call::exec(
         ioctx,
@@ -629,5 +658,18 @@ mod tests {
             outdata: encode_with_capacity(&ret, 0).expect("encode"),
         };
         assert_eq!(decode_list(&reply).expect("decode"), ret);
+    }
+
+    #[test]
+    fn get_stats_ret_matches_the_corpus() {
+        // Derived: v19.2.2's ceph-dencoder does not register this type.
+        // Corpus 19.2.0 cls_queue_get_stats_ret/bf93a2b1....
+        let s = GetStatsRet {
+            queue_size: 19_762,
+            queue_entries: 782,
+        };
+        let wire = b"\x01\x01\x0c\x00\x00\x00\x32\x4d\x00\x00\x00\x00\x00\x00\x0e\x03\x00\x00";
+        assert_eq!(bytes(&s), wire);
+        assert_eq!(GetStatsRet::decode(&mut &wire[..], 0).expect("decode"), s);
     }
 }
