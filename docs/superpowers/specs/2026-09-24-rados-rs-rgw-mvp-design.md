@@ -19,19 +19,31 @@ expressed against the fork.
 - Multisite: no `cls_log`, `cls_timeindex`, `cls_fifo`, `cls_cmpomap`, no
   bucket-index log (`bilog`) or `bi_*` repair ops, no data or metadata
   log, no sync of any kind.
-- Persistent bucket notifications: no `cls_2pc_queue`. Topics and
-  endpoint delivery are RGW-level and out with it.
+- Persistent bucket notifications: no `cls_2pc_queue` in the roadmap as
+  written (pending the owner's decision above); HTTP delivery and the
+  topic actions are RGW-level.
 - Resharding as an action: the reshard queue ops are out. The resharding
   guard and `get_bucket_resharding` are in, because C++ RGW attaches the
   guard to every bucket-index write and a compatible client must too.
 - `cls_otp` (MFA), `copy_from2` (the MVP copies by read and write),
   `rgw_s3select` usage data beyond what the usage-log types carry.
 - RGW features excluded from the MVP driver for the time being, listed
-  here so that nothing in this fork is sized or tested for them: the D4N
-  cache layer, the Swift API, the POSIX driver and Lua scripting. None of
-  them needs RADOS surface the packages below lack (D4N and POSIX are
-  other backends; Swift and Lua use the same objects and sysobj reads and
-  writes), so this is a driver-scope statement, not a transport one.
+  here so that nothing in this fork is sized or tested for them, and
+  synchronized on 2026-09-25 with the sibling rgw-go effort's exclusion
+  list (`rgw-go/docs/exclusions.md`) so the two gateways and radosgw can
+  be benchmarked on one feature set: the D4N cache layer and the D3N
+  read cache, the POSIX driver and every other non-RADOS driver, the
+  Swift API (and with it the object expirer), Lua scripting, S3 Select,
+  S3 Vectors and dedup, cloud transition and restore, Keystone and LDAP
+  authentication, key management (SSE-KMS and SSE-S3 with every
+  backend; SSE-C stays), the dynamic resharding worker (the guard stays,
+  as above), librgw with NFS and SMB, QAT and UADK offload, and Kafka
+  and AMQP notification delivery. None of them needs RADOS surface the
+  packages below lack, so this is a driver-scope statement, not a
+  transport one. Where the two gateways still differ, the owner
+  decides: rgw-go keeps persistent bucket notifications (`cls_2pc_queue`)
+  and MFA (`cls_otp`) and has `cls_lock` through librados; this fork's
+  roadmap has none of the three yet.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
 
