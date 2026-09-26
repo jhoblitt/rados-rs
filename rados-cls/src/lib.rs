@@ -14,6 +14,7 @@
     feature = "refcount",
     feature = "user",
     feature = "queue",
+    feature = "rgw",
     feature = "rgw_gc"
 ))]
 mod call;
