@@ -172,6 +172,9 @@ const CORPUS_TYPES: &[TypeSpec] = &[
     TypeSpec::new("rgw_usage_log_entry", None, false),
     TypeSpec::new("rgw_usage_log_info", None, false),
     TypeSpec::new("rgw_user_bucket", None, false),
+    TypeSpec::new("cls_rgw_lc_entry", None, false),
+    // No corpus directory and no test instances.
+    TypeSpec::new("cls_rgw_lc_obj_head", None, false),
     TypeSpec::new("mon_info_t", Some(u64::MAX), true), // different JSON format
     TypeSpec::new("MonMap", Some(u64::MAX), true),     // different JSON format
 ];

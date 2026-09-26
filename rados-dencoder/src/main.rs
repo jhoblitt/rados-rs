@@ -43,16 +43,17 @@ use rados_cls::rgw::index::{
     BucketInstanceEntry as RgwBucketInstanceEntry, Dir as RgwDir, DirEntry as RgwDirEntry,
     DirEntryMeta as RgwDirEntryMeta, DirHeader as RgwDirHeader, ReshardEntry as RgwReshardEntry,
 };
+use rados_cls::rgw::lc::{LcEntry as RgwLcEntry, LcObjHead as RgwLcObjHead};
 use rados_cls::rgw::olh::{OlhEntry as RgwOlhEntry, OlhLogEntry as RgwOlhLogEntry};
-use rados_cls::rgw::usage::{
-    S3selectUsageData as RgwS3selectUsageData, UsageData as RgwUsageData,
-    UsageLogEntry as RgwUsageLogEntry, UsageLogInfo as RgwUsageLogInfo,
-    UserBucket as RgwUserBucket,
-};
 use rados_cls::rgw::types::{
     CategoryStats as RgwCategoryStats, EntryVer as RgwEntryVer, GcObjInfo, Obj as RgwObj,
     ObjChain as RgwObjChain, ObjKey as RgwObjKey, PendingInfo as RgwPendingInfo,
     ZoneSet as RgwZoneSet,
+};
+use rados_cls::rgw::usage::{
+    S3selectUsageData as RgwS3selectUsageData, UsageData as RgwUsageData,
+    UsageLogEntry as RgwUsageLogEntry, UsageLogInfo as RgwUsageLogInfo,
+    UserBucket as RgwUserBucket,
 };
 use rados_cls::rgw_gc::{InitOp as RgwGcQueueInitOp, UrgentData as RgwGcUrgentData};
 use rados_cls::user::{
@@ -257,6 +258,8 @@ fn get_type_info(name: &str) -> Option<TypeInfo> {
         "rgw_usage_log_entry" => Some(type_info_denc::<RgwUsageLogEntry>()),
         "rgw_usage_log_info" => Some(type_info_denc::<RgwUsageLogInfo>()),
         "rgw_user_bucket" => Some(type_info_denc::<RgwUserBucket>()),
+        "cls_rgw_lc_entry" => Some(type_info_denc::<RgwLcEntry>()),
+        "cls_rgw_lc_obj_head" => Some(type_info_denc::<RgwLcObjHead>()),
         "cls_rgw_gc_set_entry_op" => Some(type_info_denc::<RgwGcSetEntryOp>()),
         "cls_rgw_gc_defer_entry_op" => Some(type_info_denc::<RgwGcDeferEntryOp>()),
         "cls_rgw_gc_list_op" => Some(type_info_denc::<RgwGcListOp>()),
@@ -332,23 +335,18 @@ fn list_types() {
          cls_queue_get_capacity_ret [versioned]"
     );
     println!("  cls_rgw_{{obj_key,obj,obj_chain,gc_obj_info}} [versioned]");
-    println!(
-        "  rgw_bucket_{{entry_ver,pending_info,category_stats}} / rgw_zone_set [versioned]"
-    );
+    println!("  rgw_bucket_{{entry_ver,pending_info,category_stats}} / rgw_zone_set [versioned]");
     println!(
         "  rgw_bucket_dir_{{entry_meta,entry,header}} / rgw_bucket_dir / rgw_bi_log_entry \
          [versioned]"
     );
-    println!(
-        "  cls_rgw_{{bucket_instance_entry,reshard_entry}} [versioned]"
-    );
-    println!(
-        "  rgw_bucket_olh_{{log_entry,entry}} / rgw_cls_bi_entry [versioned]"
-    );
+    println!("  cls_rgw_{{bucket_instance_entry,reshard_entry}} [versioned]");
+    println!("  rgw_bucket_olh_{{log_entry,entry}} / rgw_cls_bi_entry [versioned]");
     println!(
         "  rgw_usage_{{data,log_entry,log_info}} / rgw_s3select_usage_data / \
          rgw_user_bucket [versioned]"
     );
+    println!("  cls_rgw_lc_{{entry,obj_head}} [versioned]");
     println!(
         "  cls_rgw_gc_{{set_entry,defer_entry,list,remove}}_op / cls_rgw_gc_list_ret [versioned]"
     );
