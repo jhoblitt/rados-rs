@@ -285,8 +285,15 @@ rados::impl_denc_for_versioned!(EntryVer);
 
 /// `rgw_bucket_pending_info`: a change the class has prepared but not
 /// completed. Version 2 (compat 2); `op` holds an `RGWModifyOp` value.
+/// The decoder floors at version 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
-#[denc(crate = "rados", version = 2, compat = 2)]
+#[denc(
+    crate = "rados",
+    version = 2,
+    compat = 2,
+    min_version = 2,
+    ceph_release = "Argonaut v0.48+"
+)]
 pub struct PendingInfo {
     pub state: PendingState,
     #[serde(serialize_with = "crate::dump::utime")]
@@ -660,5 +667,19 @@ mod tests {
             ..GcObjInfo::default()
         };
         assert!(json(&info).starts_with(r#"{"tag":"t\u0000""#));
+    }
+
+    #[test]
+    fn pending_info_floors_at_version_2() {
+        let mut wire = bytes(&PendingInfo::default());
+        wire[..2].copy_from_slice(&[1, 1]);
+        let err = PendingInfo::decode(&mut &wire[..], 0).expect_err("version 1");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(rados::CodecError::VersionTooOld { got: 1, min: 2, .. })
+            ),
+            "{err:?}"
+        );
     }
 }

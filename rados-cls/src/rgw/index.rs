@@ -1379,9 +1379,16 @@ pub struct CheckAttrsPrefixOp {
 }
 
 /// `rgw_cls_obj_check_mtime`: version 2 (compat 1) added
-/// `high_precision_time`. Ceph neither registers nor dumps it.
+/// `high_precision_time`. Ceph neither registers nor dumps it. The
+/// decoder floors at version 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
-#[denc(crate = "rados", version = 2, compat = 1)]
+#[denc(
+    crate = "rados",
+    version = 2,
+    compat = 1,
+    min_version = 2,
+    ceph_release = "Jewel v10+"
+)]
 pub struct CheckMtimeOp {
     pub mtime: UTime,
     pub kind: CheckMtimeType,
@@ -2562,7 +2569,14 @@ mod tests {
         );
         // Version 1 had no high_precision_time; below the floor.
         let v1 = unhex("010109000000010000000200000001");
-        assert!(CheckMtimeOp::decode(&mut &v1[..], 0).is_err());
+        let err = CheckMtimeOp::decode(&mut &v1[..], 0).expect_err("version 1");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(rados::CodecError::VersionTooOld { got: 1, min: 2, .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
