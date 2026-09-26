@@ -17,8 +17,15 @@ pub struct LcEntry {
 /// `cls_rgw_lc_obj_head`: the per-shard lifecycle marker. Both `time_t`
 /// fields are written as eight-byte integers (`start_date` unsigned,
 /// `shard_rollover_date` signed); the dump drops `shard_rollover_date`.
+/// Version 2 added `shard_rollover_date`; the decoder floors at version 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, VersionedDenc)]
-#[denc(crate = "rados", version = 2, compat = 2)]
+#[denc(
+    crate = "rados",
+    version = 2,
+    compat = 2,
+    min_version = 2,
+    ceph_release = "Reef v18+"
+)]
 pub struct LcObjHead {
     pub start_date: i64,
     pub marker: String,
@@ -29,7 +36,7 @@ pub struct LcObjHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rados::{Denc, encode_with_capacity};
+    use rados::{Denc, RadosError, encode_with_capacity};
 
     fn bytes<T: Denc>(v: &T) -> Vec<u8> {
         encode_with_capacity(v, 0).expect("encode").to_vec()
@@ -83,6 +90,20 @@ mod tests {
         assert_eq!(
             LcObjHead::decode(&mut &bytes(&h)[..], 0).expect("decode"),
             h
+        );
+    }
+
+    #[test]
+    fn lc_obj_head_floors_at_version_2() {
+        let mut wire = bytes(&LcObjHead::default());
+        wire[..2].copy_from_slice(&[1, 1]);
+        let err = LcObjHead::decode(&mut &wire[..], 0).expect_err("version 1");
+        assert!(
+            matches!(
+                err,
+                RadosError::Codec(rados::CodecError::VersionTooOld { got: 1, min: 2, .. })
+            ),
+            "{err:?}"
         );
     }
 }
