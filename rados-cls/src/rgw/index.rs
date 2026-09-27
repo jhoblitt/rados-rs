@@ -11,7 +11,27 @@
 //! and RGW decides per call site to put [`guard_op`] in front of the
 //! write in one compound operation, which then fails with
 //! `OSDError { code: -ERR_BUSY_RESHARDING }` while the shard reshards.
-//! The `*_op` constructors are for building that compound.
+//! The `*_op` constructors are for building that compound. Squid's
+//! radosgw (`rgw_rados.cc@v19.2.6`) guards [`prepare`], [`complete`]
+//! (including the completion manager's retry, `:917`) and the OLH
+//! writes; from Tentacle it also sends `assert_exists`, the guard and
+//! then [`suggest_changes`] in both listing paths
+//! (`rgw_rados.cc:10823,11061@v20.2.4`, where v19.2.6's `:9902,10138`
+//! send the suggestion bare), so a gateway at Tentacle level guards its
+//! listing-time suggestions. Listing, [`check_index`],
+//! [`rebuild_index`], [`init_index`] and [`set_tag_timeout`] stay
+//! unguarded in both (radosgw prepends no guard to them).
+//!
+//! From Tentacle v20.2.0 (d011c522bb1) the class also guards itself:
+//! prepare, complete, link_olh, unlink_instance, trim_olh_log,
+//! clear_olh, suggest_changes, bi_put_entries and rebuild_index run
+//! `guard_bucket_resharding(hctx, header)`
+//! (`cls_rgw.cc:906-921@v20.2.4`), which answers -2300 when the header is
+//! `IN_PROGRESS`, or `IN_LOGRECORD` with `reshardlog_entries >=
+//! rgw_reshardlog_threshold`. On those releases a write can fail with
+//! -2300 even without [`guard_op`]. Keep prepending it all the same: it is
+//! what radosgw sends (`main`'s link does `assert_exists`, then the guard,
+//! then the link, `rgw_rados.cc:9573-9597@main`).
 //!
 //! Server facts (Ceph v19 `cls_rgw.cc`): a second [`init_index`] is
 //! `EINVAL`, so RGW creates the shard with `create(exclusive)` first to
@@ -52,6 +72,12 @@ use crate::call;
 /// it exactly when the struct is version 8, so a meta decoded from a
 /// listing re-encodes in the version it arrived in, as C++ does. Build
 /// request metadata with [`DirEntryMeta::for_release`].
+///
+/// The dump prints `storage_class` raw, as v19.2.2's dencoder does. From
+/// Squid v19.2.4, `rgw_bucket_dir_entry_meta::dump` prints an empty one as
+/// `STANDARD` through `get_canonical_storage_class`
+/// (`cls_rgw_types.cc:199-217@main`; absent at v19.2.3). The bytes are
+/// the same; only the dump differs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirEntryMeta {
     pub category: ObjCategory,
@@ -438,6 +464,12 @@ impl BucketInstanceEntry {
     pub fn resharding_in_progress(&self) -> bool {
         self.reshard_status == ReshardStatus::IN_PROGRESS
     }
+
+    /// `cls_rgw_bucket_instance_entry::resharding_in_logrecord`
+    /// (`cls_rgw_types.h:804@v20.2.4`).
+    pub fn resharding_in_logrecord(&self) -> bool {
+        self.reshard_status == ReshardStatus::IN_LOGRECORD
+    }
 }
 
 impl Serialize for BucketInstanceEntry {
@@ -452,8 +484,8 @@ impl Serialize for BucketInstanceEntry {
 }
 
 /// `rgw_bucket_dir_header`: the dir's running stats and bookkeeping.
-/// Squid v19.2.2 writes version 7 (compat 2); version 8's
-/// `reshardlog_entries` is not modelled and is skipped on decode.
+/// Squid v19.2.2 writes version 7 (compat 2); Tentacle v20.2.0's version
+/// 8 `reshardlog_entries` is not modelled and is skipped on decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirHeader {
     pub stats: BTreeMap<ObjCategory, CategoryStats>,
@@ -642,7 +674,10 @@ impl Serialize for Dir {
 
 /// `RGW_BILOG_FLAG_VERSIONED_OP`.
 pub const BILOG_FLAG_VERSIONED_OP: u16 = 0x1;
-/// `RGW_BILOG_NULL_VERSION` (Tentacle v20+; a v19 cluster never sets it).
+/// `RGW_BILOG_NULL_VERSION`. radosgw sets it on a null-version delete
+/// from Squid v19.2.3 (c860a396697, 012d8ebd71f;
+/// `rgw_rados.cc:7233,10355@main`), and `cls_rgw_bucket_unlink_instance`
+/// passes it.
 pub const BILOG_NULL_VERSION: u16 = 0x2;
 
 fn bilog_state_str(state: PendingState) -> &'static str {
@@ -756,8 +791,9 @@ impl BiLogEntry {
         self.bilog_flags & BILOG_FLAG_VERSIONED_OP != 0
     }
 
-    /// `rgw_bi_log_entry::is_null_verid`; always false on v19, which
-    /// never sets the flag.
+    /// `rgw_bi_log_entry::is_null_verid`: set on entries written by
+    /// v19.2.3+ radosgw for the null version, or by an unlink sent as
+    /// [`super::olh::unlink_instance_op`] describes, on any Squid class.
     pub fn is_null_verid(&self) -> bool {
         self.bilog_flags & BILOG_NULL_VERSION != 0
     }
@@ -805,8 +841,8 @@ impl Serialize for BiLogEntry {
 
 /// `cls_rgw_reshard_entry`: one bucket queued for resharding. Version 1's
 /// `new_instance_id` string (removed in version 2) is not modelled;
-/// version 3's `initiator` byte is not modelled either and is skipped on
-/// decode.
+/// Tentacle v20.2.0's version 3 `initiator` byte is not modelled either
+/// and is skipped on decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReshardEntry {
     pub time: UTime,
@@ -1814,9 +1850,13 @@ pub fn clear_bucket_resharding_op() -> Result<OSDOp> {
     )
 }
 
-/// `cls_rgw_guard_bucket_resharding`: fail with `ret_err` when the
-/// header's reshard status is anything but `NOT_RESHARDING`, which
-/// aborts the compound operation it leads.
+/// `cls_rgw_guard_bucket_resharding`: fail with `ret_err`, which aborts
+/// the compound operation it leads. On Squid the trip condition is a
+/// reshard status other than `NOT_RESHARDING` (`header.resharding()`,
+/// `cls_rgw.cc:4606@v19.2.2`). From Tentacle v20.2.0 the method calls the
+/// class's own guard helper (`cls_rgw.cc:4995-5016@v20.2.4`), so `DONE`
+/// no longer trips it, and `IN_LOGRECORD` trips it only once
+/// `reshardlog_entries` reaches `rgw_reshardlog_threshold`.
 pub fn guard_bucket_resharding_op(ret_err: i32) -> Result<OSDOp> {
     call::op(
         CLASS,
@@ -1825,7 +1865,7 @@ pub fn guard_bucket_resharding_op(ret_err: i32) -> Result<OSDOp> {
     )
 }
 
-/// The guard RGW puts in front of every index write:
+/// The guard RGW puts in front of the index writes the module docs list:
 /// [`guard_bucket_resharding_op`] with `-ERR_BUSY_RESHARDING`.
 pub fn guard_op() -> Result<OSDOp> {
     guard_bucket_resharding_op(-ERR_BUSY_RESHARDING)
@@ -2357,6 +2397,19 @@ mod tests {
         // Version 2 dropped the legacy fields; below the floor.
         let v2 = unhex("0201010000000100");
         assert!(BucketInstanceEntry::decode(&mut &v2[..], 0).is_err());
+    }
+
+    #[test]
+    fn bucket_instance_entry_reads_tentacles_in_logrecord() {
+        // Hand-derived from v19.2.2/cls_rgw_bucket_instance_entry.1
+        // (0301090000000000000000ffffffff) with the status byte set to 3.
+        let wire = unhex("0301090000000300000000ffffffff");
+        let e = BucketInstanceEntry::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(e.reshard_status, ReshardStatus::IN_LOGRECORD);
+        assert_eq!(bytes(&e), wire);
+        assert_eq!(json(&e), r#"{"reshard_status":"in-logrecord"}"#);
+        assert!(e.resharding_in_logrecord());
+        assert!(!e.resharding_in_progress());
     }
 
     fn dir_header_instance() -> DirHeader {

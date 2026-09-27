@@ -20,8 +20,17 @@
 //! [`trim_olh_log`], [`clear_olh`]) take no resharding guard of their
 //! own: as for the index writes, RGW puts
 //! [`super::index::guard_op`] in front of them in one compound
-//! operation. [`read_olh_log`], [`trim_olh_log`] and [`clear_olh`]
-//! compare `olh_tag` with the OLH's, and a missing OLH's tag is empty.
+//! operation, and from Tentacle v20.2.0 the class guards them itself as
+//! well (see [`super::index`]). [`read_olh_log`], [`trim_olh_log`] and
+//! [`clear_olh`] compare `olh_tag` with the OLH's, and a missing OLH's
+//! tag is empty.
+//!
+//! Umbrella v21.1.0 differs from those v19 rules. An `olh_epoch` of 0
+//! makes the class use the current time in nanoseconds since 1970 rather
+//! than the OLH's epoch plus one (`cls_rgw.cc:1865,1927,2102-2103@v21.1.0`,
+//! 75c7b8ece79). Link and unlink log `STALE` (4) entries
+//! (`cls_rgw.cc:1875,2009,2176,2198@v21.1.0`), which [`read_olh_log`]
+//! returns only with `get_stales` (`cls_rgw.cc:2289-2292@v21.1.0`).
 
 use std::collections::BTreeMap;
 
@@ -39,7 +48,8 @@ use crate::call;
 
 byte_enum! {
     /// `OLHLogOp`: what one OLH log entry records. Ceph decodes any byte and
-    /// `CLS_RGW_OLH_OP_STALE` (4) is not modelled; the newtype keeps the byte.
+    /// `CLS_RGW_OLH_OP_STALE` (4) is not modelled (Umbrella v21.1.0+; kept
+    /// as the raw byte).
     OlhLogOp { UNKNOWN = 0, LINK_OLH = 1, UNLINK_OLH = 2, REMOVE_INSTANCE = 3 }
 }
 
@@ -408,7 +418,8 @@ pub struct ClearOlhOp {
 /// exist unless `delete_marker` (which creates one). `ECANCELED` when
 /// the OLH exists with another tag and is not pending removal; `ENOENT`
 /// for a new delete marker on an object whose current version already
-/// is one. With `unmod_since` set and an existing instance whose mtime is
+/// is one on v19.2.2 (`cls_rgw.cc:1673-1693@v19.2.2`); v19.2.3 removed the
+/// check and links it. With `unmod_since` set and an existing instance whose mtime is
 /// not older (whole seconds unless `high_precision_time`), nothing is
 /// linked and the call succeeds. A newer epoch, or an equal one on an instance
 /// that does not sort after the current one, makes the instance current and
@@ -423,6 +434,18 @@ pub fn link_olh_op(op: &LinkOlhOp) -> Result<OSDOp> {
 /// becomes current; when it was the last, the OLH logs
 /// `UNLINK_OLH` and is marked pending removal. A plain entry with no OLH
 /// is first converted to a versioned one.
+///
+/// To unlink the null version, send instance `""` with
+/// [`BILOG_NULL_VERSION`] set in `bilog_flags`, never `"null"`: that is
+/// what radosgw sends from v19.2.3, whose class no longer maps `"null"` to `""` in the key it
+/// unlinks, where v19.2.2's does (`cls_rgw.cc:1889-1892@v19.2.2`). Every
+/// Squid class, v19.2.2 included, records `bilog_flags` in the bilog entry
+/// it logs (`cls_rgw.cc:2022,166@v19.2.2`) and treats an instance of `""`
+/// the same way, so this form behaves identically on every Squid point
+/// release, which `require_osd_release` (19 for all of them) cannot tell
+/// apart anyway.
+///
+/// [`BILOG_NULL_VERSION`]: super::index::BILOG_NULL_VERSION
 pub fn unlink_instance_op(op: &UnlinkInstanceOp) -> Result<OSDOp> {
     call::op(CLASS, "bucket_unlink_instance", op)
 }

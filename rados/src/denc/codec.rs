@@ -773,7 +773,13 @@ macro_rules! impl_denc_map {
     };
 }
 
-// BTreeMap: tree-based, no with_capacity
+// BTreeMap: tree-based, no with_capacity. A repeated key keeps its last
+// value, as C++'s `std::map`/`flat_map` decode does when the key or the
+// value is a struct with its own `decode` (`decode(m[k], p)`, though C++
+// decodes over the earlier value in place). C++ keeps the first when both
+// have denc traits (`emplace_hint`, e.g. a `map<string, uint32_t>`) and
+// for every `unordered_map` (`emplace`). Well-formed encodings never
+// repeat a key.
 impl_denc_map!(BTreeMap, Ord,);
 
 // HashMap: hash-based, pre-allocate with the decoded count
