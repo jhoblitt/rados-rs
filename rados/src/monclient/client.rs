@@ -1348,8 +1348,11 @@ impl MonClient {
             *latest_osdmap = Some(osdmap);
         }
 
-        // Mark subscription as received
-        {
+        // With an OSDClient, it alone marks the subscription got, with the
+        // epoch it applied, as only Objecter calls sub_got
+        // (v19.2.2:src/osdc/Objecter.cc:1388). Marking it here with the
+        // message's last epoch would race its request for a missing one.
+        if self.osdmap_tx.is_none() {
             let mut sub_state = self.subscription_state.write().await;
             sub_state.got(MonService::OsdMap, epoch as u64);
         }
@@ -1883,6 +1886,70 @@ mod tests {
 
         // Should fail before init
         assert!(client.subscribe(MonService::OsdMap, 0, 0).await.is_err());
+    }
+
+    /// A `CEPH_MSG_OSD_MAP` carrying incrementals at `inc`.
+    fn osdmap_msg(inc: &[u32]) -> crate::msgr2::message::Message {
+        let mut front = vec![0u8; 16];
+        front.extend_from_slice(&(inc.len() as u32).to_le_bytes());
+        for e in inc {
+            front.extend_from_slice(&e.to_le_bytes());
+            front.extend_from_slice(&0u32.to_le_bytes());
+        }
+        front.extend_from_slice(&0u32.to_le_bytes());
+        front.extend_from_slice(&[0u8; 8]);
+        crate::msgr2::message::Message::new(
+            crate::msgr2::message::CEPH_MSG_OSD_MAP,
+            bytes::Bytes::from(front),
+        )
+        .with_version(4)
+    }
+
+    async fn osdmap_sub_start(client: &MonClient) -> Option<u64> {
+        let sub_state = client.subscription_state.read().await;
+        sub_state
+            .get_subs()
+            .get(&MonService::OsdMap)
+            .map(|i| i.start)
+    }
+
+    #[tokio::test]
+    async fn osdmap_got_is_left_to_the_osdclient() {
+        let auth = crate::monclient::auth_config::AuthConfig::no_auth("client.test".to_string());
+        let config = MonClientConfig {
+            mon_addrs: vec!["v2:127.0.0.1:3300".to_string()],
+            auth: Some(auth),
+            ..Default::default()
+        };
+        let (tx, _rx) = crate::msgr2::map_channel::<MOSDMap>(4);
+
+        for (osdmap_tx, want_start) in [(Some(tx), 5), (None, 13)] {
+            let client = MonClient::new(config.clone(), osdmap_tx).await.unwrap();
+            client
+                .subscription_state
+                .write()
+                .await
+                .want(MonService::OsdMap, 5, 0);
+            let mut events = client.subscribe_events();
+
+            // Epochs 10-12: with an OSDClient, one missing below them is
+            // its to request, so the subscription must stay at 5.
+            client
+                .handle_osdmap(osdmap_msg(&[10, 11, 12]))
+                .await
+                .unwrap();
+
+            assert_eq!(osdmap_sub_start(&client).await, Some(want_start));
+            // MonClient's own waiters still see the map.
+            assert!(matches!(
+                events.try_recv(),
+                Ok(MapEvent::OsdMapUpdated { epoch: 12 })
+            ));
+            client
+                .wait_for_map(MonService::OsdMap, 12)
+                .await
+                .expect("the cached map satisfies wait_for_map");
+        }
     }
 
     #[test]

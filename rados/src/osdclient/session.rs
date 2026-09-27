@@ -782,6 +782,12 @@ impl OSDSession {
         )
     }
 
+    /// Whether the session's I/O loop was told to stop.
+    #[cfg(test)]
+    pub(crate) fn io_loop_cancelled_for_test(&self) -> bool {
+        self.io_loop_token.is_cancelled()
+    }
+
     /// Submit an operation to the OSD
     ///
     /// This queues the message for sending (non-blocking, like ceph_con_send)

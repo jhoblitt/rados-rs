@@ -245,6 +245,74 @@ struct MapBatch {
     /// Some epochs in between were never seen (a gap, or a full map that
     /// jumps), so an interval change may have gone unnoticed.
     skipped: bool,
+    /// The message lacked this epoch, which the mon still holds: ask
+    /// for the maps from it.
+    request_from: Option<u32>,
+}
+
+/// Advance `working`, at `from`, through `mosdmap`'s epochs as
+/// `Objecter::handle_osd_map` does (v19.2.2:src/osdc/Objecter.cc:
+/// 1202-1241): each epoch from its incremental when that follows the
+/// map so far, else from its full map. `incremental` and `full` build
+/// the epoch's map, or fail with `None`.
+///
+/// An epoch neither builds is missing. If the mon still holds it (it is
+/// at or above the message's trim lower bound), the walk stops and asks
+/// for the maps from the one after the last it has. Otherwise the mon
+/// trimmed it: the walk jumps to the lower bound, whose full map must
+/// be in the message, and flags the batch skipped.
+fn walk_map_epochs(
+    mosdmap: &crate::monclient::messages::MOSDMap,
+    from: u32,
+    mut working: Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    mut incremental: impl FnMut(
+        u32,
+        &Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    ) -> Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    mut full: impl FnMut(u32) -> Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+) -> MapBatch {
+    let mut batch = MapBatch::default();
+    let lower_bound = mosdmap.cluster_osdmap_trim_lower_bound;
+    let mut e = from + 1;
+    while e <= mosdmap.get_last() {
+        let working_epoch = working.as_ref().map_or(from, |m| m.epoch.as_u32());
+        let contiguous = working_epoch == e - 1;
+        let next = if contiguous && mosdmap.incremental_maps.contains_key(&e) {
+            incremental(e, &working)
+        } else if mosdmap.maps.contains_key(&e) {
+            // A full map that does not follow the previous epoch jumps
+            // over maps nobody here has seen.
+            batch.skipped |= !contiguous;
+            full(e)
+        } else {
+            None
+        };
+        match next {
+            Some(map) => {
+                working = Some(Arc::clone(&map));
+                batch.maps.push(map);
+                e += 1;
+            }
+            None if e >= lower_bound => {
+                warn!(
+                    "Missing epoch {}; requesting maps from {}",
+                    e,
+                    working_epoch + 1
+                );
+                batch.request_from = Some(working_epoch + 1);
+                break;
+            }
+            None => {
+                warn!(
+                    "Missing epoch {}, trimmed by the mon; jumping to {}",
+                    e, lower_bound
+                );
+                e = lower_bound;
+                batch.skipped = true;
+            }
+        }
+    }
+    batch
 }
 
 /// The OSD's `osd_default_notify_timeout`, which it applies to a wire
@@ -2873,10 +2941,11 @@ impl OSDClient {
         Ok(())
     }
 
-    /// Scan pending ops after OSDMap update, resend if target changed
+    /// Scan pending ops after OSDMap update, resend if target changed,
+    /// or every op when epochs were `skipped`.
     ///
     /// This implements Ceph's `_scan_requests` pattern from Objecter.
-    async fn scan_requests_on_map_change(&self, new_epoch: u32) -> Result<()> {
+    async fn scan_requests_on_map_change(&self, new_epoch: u32, skipped: bool) -> Result<()> {
         let osdmap = self.get_osdmap().await?;
 
         // Collect session snapshot
@@ -2895,7 +2964,7 @@ impl OSDClient {
                 sessions_to_close.push(osd_id);
                 // Drain all ops; CRUSH errors are silently dropped (session is closing).
                 let _ = self
-                    .collect_resend_ops(&session, &osdmap, new_epoch, None, &mut need_resend)
+                    .collect_resend_ops(&session, &osdmap, new_epoch, None, false, &mut need_resend)
                     .await;
                 continue;
             }
@@ -2903,7 +2972,14 @@ impl OSDClient {
             // Scan ops: only re-target those whose primary OSD changed or whose pool
             // bumped last_force_op_resend since this op was sent.
             let any_migrated = self
-                .collect_resend_ops(&session, &osdmap, new_epoch, Some(osd_id), &mut need_resend)
+                .collect_resend_ops(
+                    &session,
+                    &osdmap,
+                    new_epoch,
+                    Some(osd_id),
+                    skipped,
+                    &mut need_resend,
+                )
                 .await?;
 
             if any_migrated {
@@ -2912,7 +2988,7 @@ impl OSDClient {
                 // didn't change but whose connection is being torn down).
                 sessions_to_close.push(osd_id);
                 let _ = self
-                    .collect_resend_ops(&session, &osdmap, new_epoch, None, &mut need_resend)
+                    .collect_resend_ops(&session, &osdmap, new_epoch, None, false, &mut need_resend)
                     .await;
             }
         }
@@ -2969,6 +3045,13 @@ impl OSDClient {
     ///     sent, or whose PG split or merged since it was placed.
     ///   - `None`     — drain path: collect every op unconditionally (session is closing).
     ///
+    /// `skipped`, on the scan path, collects every op: epochs were skipped,
+    /// so a change of target may have gone unseen, and `_scan_requests`
+    /// resends an op its `_calc_target` leaves alone when `skipped_map`
+    /// is set (v19.2.2:src/osdc/Objecter.cc:1105-1111). An op collected
+    /// only for the skip is not migrated: it goes back out through its
+    /// session, which stays up.
+    ///
     /// Returns `true` if at least one op was migrated (scan path only; always `false` for
     /// the drain path because all ops stay within the same "session is closing" group).
     ///
@@ -2979,6 +3062,7 @@ impl OSDClient {
         osdmap: &crate::osdclient::osdmap::OSDMap,
         new_epoch: u32,
         current_osd: Option<i32>,
+        skipped: bool,
         need_resend: &mut Vec<(i32, crate::osdclient::session::PendingOp)>,
     ) -> Result<bool> {
         let metadata = session.get_pending_ops_metadata();
@@ -2996,10 +3080,12 @@ impl OSDClient {
                 Self::cached_rescan_osds(&mut placement_cache, osdmap, &msg)?;
             let new_primary = new_osds.first().copied().unwrap_or(-1);
 
-            // Scan path: only resend if primary changed or pool forced a resend.
+            // Scan path: resend if the op migrated (primary changed, pool forced
+            // a resend, PG split or merged), which tears the session down, or
+            // if epochs were skipped, which does not.
             // Drain path (current_osd == None): always resend.
-            let needs_resend = match current_osd {
-                None => true,
+            let (needs_resend, migrated) = match current_osd {
+                None => (true, false),
                 Some(osd_id) => {
                     // Mirrors Objecter::_calc_target step 4: if last_force_op_resend is in
                     // (op_epoch, new_epoch] the op must be resubmitted even if its primary
@@ -3013,7 +3099,8 @@ impl OSDClient {
                     // op sent before its PG split or merged, primary or not.
                     let split_or_merge =
                         Self::pg_split_or_merge(pool_id, new_hash, op_pg_num, new_pg_num);
-                    new_primary != osd_id || force_resend || split_or_merge
+                    let migrated = new_primary != osd_id || force_resend || split_or_merge;
+                    (skipped || migrated, migrated)
                 }
             };
 
@@ -3029,7 +3116,7 @@ impl OSDClient {
                 // Scan path only: cancel the io_loop so any message already
                 // encoded for this tid is dropped before reaching the wire.
                 // See `cancel_io_loop`'s doc comment for the full rationale.
-                if current_osd.is_some() {
+                if migrated {
                     session.cancel_io_loop();
                     any_migrated = true;
                 }
@@ -3395,7 +3482,7 @@ impl OSDClient {
 
         if current_epoch.as_u32() > 0 {
             // We have a current map, apply updates sequentially
-            self.apply_sequential_updates(mosdmap, current_epoch, current_map)
+            Some(self.apply_sequential_updates(mosdmap, current_epoch, current_map))
         } else {
             // No current map, use latest full map
             self.load_initial_map(mosdmap)
@@ -3403,42 +3490,21 @@ impl OSDClient {
     }
 
     /// Apply sequential updates to existing map, keeping every applied
-    /// epoch's map so the lingers can be checked against each.
+    /// epoch's map so the lingers can be checked against each; see
+    /// [`walk_map_epochs`].
     fn apply_sequential_updates(
         &self,
         mosdmap: &crate::monclient::messages::MOSDMap,
         current_epoch: crate::Epoch,
         current_map: Option<Arc<crate::osdclient::osdmap::OSDMap>>,
-    ) -> Option<MapBatch> {
-        let mut working_map = current_map;
-        let mut batch = MapBatch::default();
-
-        for e in (current_epoch.as_u32() + 1)..=mosdmap.get_last() {
-            let current_map_epoch = working_map.as_ref().map(|m| m.epoch).unwrap_or_default();
-            let contiguous = current_map_epoch == crate::Epoch::new(e - 1);
-
-            if contiguous && mosdmap.incremental_maps.contains_key(&e) {
-                // Apply incremental
-                if let Some(new_map) = self.apply_incremental_map(mosdmap, e, &working_map) {
-                    working_map = Some(Arc::clone(&new_map));
-                    batch.maps.push(new_map);
-                }
-            } else if mosdmap.maps.contains_key(&e) {
-                // Use full map
-                if let Some(new_map) = self.apply_full_map(mosdmap, e) {
-                    // A full map that does not follow the previous epoch
-                    // jumps over maps nobody here has seen.
-                    batch.skipped |= !contiguous;
-                    working_map = Some(Arc::clone(&new_map));
-                    batch.maps.push(new_map);
-                }
-            } else {
-                warn!("Missing epoch {} (incremental and full)", e);
-                batch.skipped = true;
-            }
-        }
-
-        (!batch.maps.is_empty()).then_some(batch)
+    ) -> MapBatch {
+        walk_map_epochs(
+            mosdmap,
+            current_epoch.as_u32(),
+            current_map,
+            |e, working| self.apply_incremental_map(mosdmap, e, working),
+            |e| self.apply_full_map(mosdmap, e),
+        )
     }
 
     /// Apply incremental map update
@@ -3535,15 +3601,14 @@ impl OSDClient {
                 base_epoch,
                 mosdmap.get_last(),
             );
-            let mut batch = self
-                .apply_sequential_updates(mosdmap, full_epoch, Some(full_map.clone()))
-                .unwrap_or_default();
+            let mut batch =
+                self.apply_sequential_updates(mosdmap, full_epoch, Some(full_map.clone()));
             batch.maps.insert(0, full_map);
             Some(batch)
         } else {
             Some(MapBatch {
                 maps: vec![full_map],
-                skipped: false,
+                ..MapBatch::default()
             })
         }
     }
@@ -3599,7 +3664,9 @@ impl OSDClient {
         // Skip the normal rescan if we just got blocklisted — all ops were
         // already failed above.
         if !self.blocklisted.load(Ordering::Relaxed)
-            && let Err(e) = self.scan_requests_on_map_change(final_epoch.as_u32()).await
+            && let Err(e) = self
+                .scan_requests_on_map_change(final_epoch.as_u32(), batch.skipped)
+                .await
         {
             warn!("Failed to rescan requests after OSDMap update: {}", e);
         }
@@ -3635,10 +3702,37 @@ impl OSDClient {
 
         // Update state if we got a new map
         if let Some(batch) = new_maps {
+            // Before the maps are marked got, as Objecter requests them
+            // in the loop and calls sub_got after it
+            // (v19.2.2:src/osdc/Objecter.cc:1228-1233, 1388).
+            if let Some(epoch) = batch.request_from {
+                self.request_maps_from(epoch).await;
+            }
             self.update_osdmap_state(batch).await?;
         }
 
         Ok(())
+    }
+
+    /// Ask the mon for the OSDMaps from `epoch` on: Objecter's
+    /// `_maybe_request_map` (v19.2.2:src/osdc/Objecter.cc:2024-2042),
+    /// `sub_want` then `renew_subs`, which [`MonClient::subscribe`] both
+    /// does. Objecter asks once (`CEPH_SUBSCRIBE_ONETIME`) unless the map
+    /// is full or paused, since it otherwise learns of new maps from the
+    /// OSDs; this client keeps one continuous `osdmap` subscription
+    /// (`wait_for_latest_osdmap`), and a one-time want would replace it,
+    /// on the mon too (v19.2.2:src/mon/Session.h:260-275), and end the
+    /// map stream. So the continuous subscription restarts at `epoch`.
+    ///
+    /// [`MonClient::subscribe`]: crate::monclient::MonClient::subscribe
+    async fn request_maps_from(&self, epoch: u32) {
+        if let Err(e) = self
+            .mon_client
+            .subscribe(crate::monclient::MonService::OsdMap, u64::from(epoch), 0)
+            .await
+        {
+            warn!("Failed to request OSDMaps from epoch {}: {}", epoch, e);
+        }
     }
 
     /// Handle OSD operation reply from a specific OSD
@@ -4219,7 +4313,7 @@ mod tests {
         let map = one_osd_map(new_pg_num, 11);
         let mut need_resend = Vec::new();
         client
-            .collect_resend_ops(&session, &map, 11, Some(0), &mut need_resend)
+            .collect_resend_ops(&session, &map, 11, Some(0), false, &mut need_resend)
             .await
             .expect("placed");
         need_resend
@@ -4253,6 +4347,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_epochs_resend_every_op() {
+        let client = offline_client().await;
+        let (session, _rx) = session_with_op(&object_in_pg(8, 5), 8, true);
+        let mut need_resend = Vec::new();
+        client
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                Some(0),
+                true,
+                &mut need_resend,
+            )
+            .await
+            .expect("placed");
+        assert_eq!(
+            need_resend.len(),
+            1,
+            "same primary and pg_num, still resent"
+        );
+        assert_eq!(need_resend[0].0, 0);
+        assert_eq!(need_resend[0].1.op.osdmap_epoch, 11);
+    }
+
+    #[tokio::test]
+    async fn skipped_epochs_leave_the_session_up() {
+        let client = offline_client().await;
+        let (session, _rx) = session_with_op(&object_in_pg(8, 5), 8, true);
+        let mut need_resend = Vec::new();
+        let any_migrated = client
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                Some(0),
+                true,
+                &mut need_resend,
+            )
+            .await
+            .expect("placed");
+        assert_eq!(need_resend.len(), 1);
+        assert!(!any_migrated, "a skip alone closes no session");
+        assert!(!session.io_loop_cancelled_for_test());
+    }
+
+    fn map_at(epoch: u32) -> Arc<crate::osdclient::osdmap::OSDMap> {
+        let mut map = crate::osdclient::osdmap::OSDMap::new();
+        map.epoch = crate::Epoch::new(epoch);
+        Arc::new(map)
+    }
+
+    /// An MOSDMap holding incrementals at `inc` and full maps at `full`,
+    /// whose bytes only `walk` below reads, with trim lower bound `lb`.
+    fn mosdmap_with(inc: &[u32], full: &[u32], lb: u32) -> crate::monclient::MOSDMap {
+        let epochs = |es: &[u32]| es.iter().map(|&e| (e, Bytes::new())).collect();
+        crate::monclient::MOSDMap {
+            fsid: [0; 16],
+            incremental_maps: epochs(inc),
+            maps: epochs(full),
+            cluster_osdmap_trim_lower_bound: lb,
+            newest_map: 100,
+        }
+    }
+
+    /// Walk `m` from a map at epoch 10, every map building. Returns the
+    /// batch and the epochs built, `i` for incremental and `f` for full.
+    fn walk(m: &crate::monclient::MOSDMap) -> (super::MapBatch, Vec<String>) {
+        let built = std::cell::RefCell::new(Vec::new());
+        let batch = super::walk_map_epochs(
+            m,
+            10,
+            Some(map_at(10)),
+            |e, working| {
+                assert_eq!(working.as_ref().unwrap().epoch.as_u32(), e - 1);
+                built.borrow_mut().push(format!("i{e}"));
+                Some(map_at(e))
+            },
+            |e| {
+                built.borrow_mut().push(format!("f{e}"));
+                Some(map_at(e))
+            },
+        );
+        (batch, built.into_inner())
+    }
+
+    fn epochs(batch: &super::MapBatch) -> Vec<u32> {
+        batch.maps.iter().map(|m| m.epoch.as_u32()).collect()
+    }
+
+    #[test]
+    fn a_missing_epoch_the_mon_holds_is_requested() {
+        // 12 is missing and above the trim bound: ask for it, and apply
+        // nothing after it, not even 13's full map.
+        let (batch, built) = walk(&mosdmap_with(&[11, 13, 14], &[13], 5));
+        assert_eq!(built, ["i11"]);
+        assert_eq!(epochs(&batch), [11]);
+        assert_eq!(batch.request_from, Some(12));
+        assert!(!batch.skipped);
+
+        // The first epoch missing asks for it.
+        let (batch, built) = walk(&mosdmap_with(&[12], &[], 11));
+        assert!(built.is_empty() && batch.maps.is_empty());
+        assert_eq!(batch.request_from, Some(11));
+
+        // An epoch that fails to build is missing too.
+        let m = mosdmap_with(&[11, 12], &[], 0);
+        let batch = super::walk_map_epochs(&m, 10, Some(map_at(10)), |_, _| None, |_| None);
+        assert_eq!(batch.request_from, Some(11));
+    }
+
+    #[test]
+    fn a_missing_epoch_the_mon_trimmed_jumps_to_the_trim_bound() {
+        // The mon trimmed up to 20: its full map, then incrementals.
+        let (batch, built) = walk(&mosdmap_with(&[21, 22], &[20], 20));
+        assert_eq!(built, ["f20", "i21", "i22"]);
+        assert_eq!(epochs(&batch), [20, 21, 22]);
+        assert!(batch.skipped);
+        assert_eq!(batch.request_from, None);
+
+        // Without the bound's full map, the next epoch is asked for.
+        let (batch, built) = walk(&mosdmap_with(&[21, 22], &[], 20));
+        assert!(built.is_empty());
+        assert!(batch.skipped);
+        assert_eq!(batch.request_from, Some(11));
+    }
+
+    #[test]
+    fn a_contiguous_message_applies_whole() {
+        let (batch, built) = walk(&mosdmap_with(&[11, 12], &[13], 5));
+        assert_eq!(built, ["i11", "i12", "f13"]);
+        assert!(!batch.skipped);
+        assert_eq!(batch.request_from, None);
+    }
+
+    #[tokio::test]
     async fn an_op_whose_pg_is_unchanged_is_not_resent() {
         assert!(rescan(&object_in_pg(8, 5), 8, 8).await.is_empty());
         // An op that recorded no pg_num is never judged split.
@@ -4278,7 +4507,14 @@ mod tests {
         let map = one_osd_map(new_pg_num, 11);
         let mut need_resend = Vec::new();
         client
-            .collect_resend_ops(&session, &map, 11, Some(session_osd), &mut need_resend)
+            .collect_resend_ops(
+                &session,
+                &map,
+                11,
+                Some(session_osd),
+                false,
+                &mut need_resend,
+            )
             .await
             .expect("placed");
         let pending = session.get_pending_ops_metadata().len() == 1;
@@ -4320,7 +4556,14 @@ mod tests {
         let (session, mut rx) = session_with_op(&object, 8, false);
         let mut need_resend = Vec::new();
         let _ = client
-            .collect_resend_ops(&session, &one_osd_map(8, 11), 11, None, &mut need_resend)
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                None,
+                false,
+                &mut need_resend,
+            )
             .await;
         assert!(need_resend.is_empty());
         assert!(session.get_pending_ops_metadata().is_empty());
