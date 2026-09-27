@@ -1457,6 +1457,25 @@ impl OSDClient {
         Ok(entry)
     }
 
+    /// Whether the PG an op with raw hash `ps` was placed in, when its pool
+    /// had `old_pg_num` PGs, splits or merges now the pool has
+    /// `new_pg_num`: Objecter::_calc_target's `split_or_merge` (ceph
+    /// v19.2.2 src/osdc/Objecter.cc:2925-2931), false when the op recorded
+    /// no pg_num.
+    fn pg_split_or_merge(pool: u64, ps: u32, old_pg_num: u32, new_pg_num: u32) -> bool {
+        use crate::crush::placement::{PgId, ceph_stable_mod, pg_num_mask};
+        if old_pg_num == 0 {
+            return false;
+        }
+        let prev = PgId::new(
+            pool,
+            ceph_stable_mod(ps, old_pg_num, pg_num_mask(old_pg_num)),
+        );
+        prev.is_split(old_pg_num, new_pg_num, None)
+            || prev.is_merge_source(old_pg_num, new_pg_num, None)
+            || prev.is_merge_target(old_pg_num, new_pg_num)
+    }
+
     /// Map a PG to its acting OSD set, applying CRUSH placement and all overrides.
     /// Returns `NoOSDs` if the acting set is empty.
     fn pg_to_osds_in_map(
@@ -1900,7 +1919,11 @@ impl OSDClient {
             // Arc::clone is a cheap refcount bump; submit_op stores the Arc in
             // pending_ops and drops it when the reply arrives, so by the time
             // we reach the next iteration the refcount is back to 1.
-            let rx = session.submit_op(Arc::clone(msg), priority).await;
+            let pg_num = final_map
+                .pools
+                .get(&msg.object.pool)
+                .map_or(0, |p| p.pg_num);
+            let rx = session.submit_op(Arc::clone(msg), priority, pg_num).await;
             return Ok(Submitted {
                 osd: primary_osd,
                 osdmap: final_map,
@@ -2297,6 +2320,7 @@ impl OSDClient {
             .submit_op(
                 Arc::new(msg),
                 crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                pool_info.pg_num,
             )
             .await?;
 
@@ -2760,8 +2784,9 @@ impl OSDClient {
     /// Collect pending ops from a session that need resubmission after an OSDMap change.
     ///
     /// `current_osd`:
-    ///   - `Some(id)` — scan path: only collect ops whose primary OSD changed or
-    ///     whose pool's `last_force_op_resend` epoch was bumped since the op was sent.
+    ///   - `Some(id)` — scan path: only collect ops whose primary OSD changed,
+    ///     whose pool's `last_force_op_resend` epoch was bumped since the op was
+    ///     sent, or whose PG split or merged since it was placed.
     ///   - `None`     — drain path: collect every op unconditionally (session is closing).
     ///
     /// Returns `true` if at least one op was migrated (scan path only; always `false` for
@@ -2780,11 +2805,12 @@ impl OSDClient {
         let mut placement_cache = HashMap::new();
         let mut any_migrated = false;
 
-        for (tid, msg, op_osdmap_epoch) in metadata {
+        for (tid, msg, op_osdmap_epoch, op_pg_num) in metadata {
             let pool_id = msg.object.pool;
             if Self::fail_if_pool_deleted(session, tid, pool_id, osdmap).await {
                 continue;
             }
+            let new_pg_num = osdmap.pools.get(&pool_id).map_or(0, |p| p.pg_num);
 
             let (new_hash, new_spg, new_osds) =
                 Self::cached_rescan_osds(&mut placement_cache, osdmap, &msg)?;
@@ -2802,7 +2828,12 @@ impl OSDClient {
                         let lf = p.canonical_last_force_op_resend().as_u32();
                         lf > op_osdmap_epoch && lf <= new_epoch
                     });
-                    new_primary != osd_id || force_resend
+                    // Objecter::_calc_target's split_or_merge
+                    // (Objecter.cc:2925-2931, 3009-3013): the OSD drops an
+                    // op sent before its PG split or merged, primary or not.
+                    let split_or_merge =
+                        Self::pg_split_or_merge(pool_id, new_hash, op_pg_num, new_pg_num);
+                    new_primary != osd_id || force_resend || split_or_merge
                 }
             };
 
@@ -2815,6 +2846,7 @@ impl OSDClient {
                     any_migrated = true;
                 }
                 op.target.update(new_epoch, new_primary, new_osds.clone());
+                op.target.pg_num = new_pg_num;
                 // Restamp the MOSDOp pgid from the new map.  A pg_num change
                 // (autoscaler split, manual resize) shifts the seed even when
                 // the primary OSD is unchanged; without this, the migrated op
@@ -2932,6 +2964,10 @@ impl OSDClient {
 
             target_osd = osds[0];
             epoch_for_op = new_osdmap.epoch.as_u32();
+            pending_op.target.pg_num = new_osdmap
+                .pools
+                .get(&pending_op.op.object.pool)
+                .map_or(0, |p| p.pg_num);
             {
                 let msg = Arc::make_mut(&mut pending_op.op);
                 msg.object.hash = new_hash;
@@ -3042,7 +3078,7 @@ impl OSDClient {
 
         let new_epoch = osdmap.epoch.as_u32();
 
-        for (tid, msg, _) in metadata {
+        for (tid, msg, ..) in metadata {
             let pool_id = msg.object.pool;
             let Some(mut pending_op) = old_session.remove_pending_op(tid) else {
                 continue;
@@ -3386,7 +3422,7 @@ impl OSDClient {
     async fn fail_all_pending_ops_blocklisted(&self) {
         let session_snapshot = self.collect_session_snapshot().await;
         for (_osd_id, session) in session_snapshot {
-            for (tid, _, _) in session.get_pending_ops_metadata() {
+            for (tid, ..) in session.get_pending_ops_metadata() {
                 if let Some(op) = session.remove_pending_op(tid) {
                     let _ = op.result_tx.send(Err(OSDClientError::Blocklisted));
                 }
@@ -3911,6 +3947,133 @@ mod tests {
         let map = map_with_pool(2, 12);
         let pool = &map.pools[&2];
         assert_eq!(OSDClient::cursor_pg(pool, 2, 0xef61efce).seed, 6);
+    }
+
+    /// `map_with_crush` at `epoch` with its host holding OSD 0 alone, so
+    /// every PG's primary is OSD 0 whatever pg_num is.
+    fn one_osd_map(pg_num: u32, epoch: u32) -> Arc<crate::osdclient::osdmap::OSDMap> {
+        let mut map = map_with_crush(2, pg_num);
+        let crush = map.crush.as_mut().expect("crush");
+        crush.max_devices = 1;
+        let host = crush.buckets[0].as_mut().expect("host");
+        host.size = 1;
+        host.weight = 0x10000;
+        host.items = vec![0];
+        host.data = crate::crush::BucketData::Straw2 {
+            item_weights: vec![0x10000],
+        };
+        map.max_osd = 1;
+        map.osd_weight = vec![0x10000];
+        map.epoch = crate::Epoch::new(epoch);
+        Arc::new(map)
+    }
+
+    /// An object of pool 2 whose PG with `pg_num` PGs is `seed`.
+    fn object_in_pg(pg_num: u32, seed: u32) -> ObjectId {
+        let map = map_with_pool(2, pg_num);
+        (0..)
+            .map(|i| ObjectId::new(2, &format!("obj{i}")))
+            .find(|o| OSDClient::object_pg_in_map(&map, o).unwrap().pg.seed == seed)
+            .expect("some object lands in every PG")
+    }
+
+    /// A session to OSD 0 holding a write to `object`, placed and sent at
+    /// epoch 10 when its pool had `pg_num` PGs, with tid 77.
+    fn session_with_op(
+        object: &ObjectId,
+        pg_num: u32,
+    ) -> (
+        crate::osdclient::session::OSDSession,
+        tokio::sync::oneshot::Receiver<super::Result<crate::osdclient::types::OpResult>>,
+    ) {
+        let (tx, _rx) = crate::msgr2::map_channel(1);
+        let session = crate::osdclient::session::OSDSession::new(
+            0,
+            None,
+            0,
+            tx,
+            std::sync::Weak::new(),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        );
+        let map = one_osd_map(pg_num, 10);
+        let (hash, spg, osds) = OSDClient::object_to_osds_in_map(&map, object).unwrap();
+        assert_eq!(osds[0], 0);
+        let mut op = mosdop(
+            object.clone(),
+            vec![crate::osdclient::types::OSDOp::write_full(
+                Bytes::from_static(b"x"),
+            )],
+        );
+        op.object.hash = hash;
+        op.pgid = spg;
+        op.osdmap_epoch = 10;
+        op.reqid = crate::osdclient::types::RequestId::new(&"client.test".into(), 77, 0);
+        let rx = session.insert_pending_for_test(Arc::new(op), pg_num);
+        (session, rx)
+    }
+
+    /// The ops the scan path of `collect_resend_ops` takes off a session
+    /// holding one op to `object` placed with `old_pg_num` PGs, when a map
+    /// at epoch 11 has `new_pg_num`.
+    async fn rescan(
+        object: &ObjectId,
+        old_pg_num: u32,
+        new_pg_num: u32,
+    ) -> Vec<(i32, crate::osdclient::session::PendingOp)> {
+        let client = offline_client().await;
+        let (session, _rx) = session_with_op(object, old_pg_num);
+        let map = one_osd_map(new_pg_num, 11);
+        let mut need_resend = Vec::new();
+        client
+            .collect_resend_ops(&session, &map, 11, Some(0), &mut need_resend)
+            .await
+            .expect("placed");
+        need_resend
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_pg_splits_is_resent_to_the_same_primary() {
+        let object = object_in_pg(8, 5);
+        let resent = rescan(&object, 8, 16).await;
+        assert_eq!(resent.len(), 1, "a split resends");
+        let (osd, op) = &resent[0];
+        assert_eq!(*osd, 0);
+        assert_eq!(op.target.pg_num, 16);
+        assert_eq!(op.op.osdmap_epoch, 11);
+        // The OSD deduplicates a resent write by its reqid.
+        assert_eq!(op.op.reqid.tid, 77);
+        assert_eq!(op.tid, 77);
+        assert_eq!(op.op.reqid.entity_name, "client.test".into());
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_pg_merges_is_resent_to_the_same_primary() {
+        // 8 -> 6: PG 6 merges into PG 2, which is the merge target.
+        for seed in [6, 2] {
+            let resent = rescan(&object_in_pg(8, seed), 8, 6).await;
+            assert_eq!(resent.len(), 1, "PG {seed} merges");
+            assert_eq!(resent[0].1.target.pg_num, 6);
+        }
+        // PG 0 takes no part in the merge, so C++ leaves its op be.
+        assert!(rescan(&object_in_pg(8, 0), 8, 6).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_pg_is_unchanged_is_not_resent() {
+        assert!(rescan(&object_in_pg(8, 5), 8, 8).await.is_empty());
+        // An op that recorded no pg_num is never judged split.
+        assert!(rescan(&object_in_pg(8, 5), 0, 16).await.is_empty());
+    }
+
+    #[test]
+    fn split_or_merge_reduces_the_hash_by_the_old_pg_num() {
+        // Hash 0x7fc1f406 is PG 6 of 8 and PG 2 of 4 (stable_mod).
+        assert!(OSDClient::pg_split_or_merge(2, 0x7fc1f406, 8, 6));
+        assert!(OSDClient::pg_split_or_merge(2, 0x7fc1f406, 8, 16));
+        assert!(!OSDClient::pg_split_or_merge(2, 0x7fc1f406, 8, 8));
+        assert!(!OSDClient::pg_split_or_merge(2, 0x7fc1f406, 0, 16));
+        // Hash 0x10 is PG 0 of 8: 8 -> 6 leaves it alone.
+        assert!(!OSDClient::pg_split_or_merge(2, 0x10, 8, 6));
     }
 
     #[test]

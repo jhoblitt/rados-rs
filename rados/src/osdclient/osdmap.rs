@@ -1040,14 +1040,15 @@ impl PgPool {
         false
     }
 
+    /// The epoch before which a Nautilus+ client's ops on this pool must
+    /// be resent: `last_force_op_resend` alone. Objecter reads only it
+    /// (ceph v19.2.2 src/osdc/Objecter.cc:2811), and an OSD drops a
+    /// Nautilus+ client's op sent before it (src/osd/PG.cc:2381). The mon
+    /// bumps `last_force_op_resend_prenautilus` and `_preluminous` for
+    /// older clients when pg_num changes (src/mon/OSDMonitor.cc:4034-4037,
+    /// 8510-8539); a stale one of those must not stand in for it.
     pub(crate) fn canonical_last_force_op_resend(&self) -> Epoch {
-        if self.last_force_op_resend.as_u32() != 0 {
-            self.last_force_op_resend
-        } else if self.last_force_op_resend_prenautilus.as_u32() != 0 {
-            self.last_force_op_resend_prenautilus
-        } else {
-            self.last_force_op_resend_preluminous
-        }
+        self.last_force_op_resend
     }
 }
 
@@ -1081,7 +1082,6 @@ impl VersionedEncode for PgPool {
             version,
             Self::VERSION_OCTOPUS | Self::VERSION_OCTOPUS_STRETCH | Self::VERSION_CURRENT
         ));
-        let canonical_last_force_op_resend = self.canonical_last_force_op_resend();
 
         // Basic fields (always present in ENCODE_START format)
         self.pool_type.encode(buf, features)?;
@@ -1120,7 +1120,8 @@ impl VersionedEncode for PgPool {
         self.cache_min_flush_age.encode(buf, features)?;
         self.cache_min_evict_age.encode(buf, features)?;
         self.erasure_code_profile.encode(buf, features)?;
-        canonical_last_force_op_resend.encode(buf, features)?;
+        self.last_force_op_resend_preluminous
+            .encode(buf, features)?;
         self.min_read_recency_for_promote.encode(buf, features)?;
         self.expected_num_objects.encode(buf, features)?;
         self.cache_target_dirty_high_ratio_micro
@@ -1138,7 +1139,8 @@ impl VersionedEncode for PgPool {
         opts_len.encode(buf, features)?;
         buf.put_slice(&self.opts_data);
 
-        canonical_last_force_op_resend.encode(buf, features)?;
+        self.last_force_op_resend_prenautilus
+            .encode(buf, features)?;
         self.application_metadata.encode(buf, features)?;
         self.create_time.encode(buf, features)?;
         self.pg_num_target.encode(buf, features)?;
@@ -1146,7 +1148,7 @@ impl VersionedEncode for PgPool {
         self.pg_num_pending.encode(buf, features)?;
         0u32.encode(buf, features)?; // pg_num_dec_last_epoch_started (always 0)
         0u32.encode(buf, features)?; // pg_num_dec_last_epoch_clean (always 0)
-        canonical_last_force_op_resend.encode(buf, features)?;
+        self.last_force_op_resend.encode(buf, features)?;
         self.pg_autoscale_mode.encode(buf, features)?;
         self.last_pg_merge_meta.encode(buf, features)?;
 
@@ -3763,6 +3765,37 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use serde_json::json;
+
+    #[test]
+    fn the_resend_epoch_ignores_the_legacy_fields() {
+        let mut pool = PgPool {
+            last_force_op_resend_preluminous: Epoch::new(7),
+            last_force_op_resend_prenautilus: Epoch::new(5),
+            ..Default::default()
+        };
+        assert_eq!(pool.canonical_last_force_op_resend().as_u32(), 0);
+        pool.last_force_op_resend = Epoch::new(3);
+        assert_eq!(pool.canonical_last_force_op_resend().as_u32(), 3);
+    }
+
+    #[test]
+    fn a_pool_keeps_its_three_resend_epochs_through_encode() {
+        use crate::Denc;
+        let pool = PgPool {
+            pg_num: 8,
+            pgp_num: 8,
+            last_force_op_resend_preluminous: Epoch::new(7),
+            last_force_op_resend_prenautilus: Epoch::new(5),
+            last_force_op_resend: Epoch::new(3),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        pool.encode(&mut buf, u64::MAX).expect("encode");
+        let back = PgPool::decode(&mut buf.freeze(), u64::MAX).expect("decode");
+        assert_eq!(back.last_force_op_resend_preluminous.as_u32(), 7);
+        assert_eq!(back.last_force_op_resend_prenautilus.as_u32(), 5);
+        assert_eq!(back.last_force_op_resend.as_u32(), 3);
+    }
 
     fn map_with_pool(id: u64, pg_num: u32, object_hash: u8) -> OSDMap {
         let mut map = OSDMap::new();

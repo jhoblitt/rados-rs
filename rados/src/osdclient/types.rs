@@ -72,6 +72,10 @@ pub struct OpTarget {
     pub osd: i32,
     /// Acting set
     pub acting: Vec<i32>,
+    /// The pool's pg_num when the op was last placed; 0 when not known.
+    /// A split or merge of the PG the op went to is judged against it, as
+    /// Objecter's `op_target_t::pg_num` is.
+    pub pg_num: u32,
 }
 
 impl OpTarget {
@@ -82,6 +86,7 @@ impl OpTarget {
             pgid,
             osd,
             acting,
+            pg_num: 0,
         }
     }
 
@@ -105,6 +110,7 @@ impl Default for OpTarget {
             pgid: StripedPgId::new(0, 0, -1),
             osd: -1,
             acting: Vec::new(),
+            pg_num: 0,
         }
     }
 }
