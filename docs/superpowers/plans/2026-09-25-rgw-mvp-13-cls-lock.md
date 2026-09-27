@@ -48,9 +48,8 @@ dependencies). Plus:
   (`cls-rgw-olh`) merges. Execution order of the remaining plans: 11, 13,
   14 (`cls-2pc-queue`), 15 (`cls-otp`), then 12 (`watch-notify`).
 - Commits: `osdclient: ...` subjects for Task 1's `rados` fixes, `lock: ...`
-  for the rest; bodies say what and why; trailers, in this order:
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and
-  `Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s`.
+  for the rest; bodies say what and why; the trailer:
+  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` only.
   One commit per Task 1 fix.
 - Wire and server semantics are identical on v19.2.2 and `main`
   7ed73efc1be (§0.1, §7): `git diff v19.2.2 7ed73efc1be -- src/cls/lock/`
@@ -206,7 +205,6 @@ unset address, as in ceph-dencoder's entity_addr_t and locker_info_t
 instances, did not match C++ byte for byte. Decoding was unaffected.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 **(b) `PackedEntityName`: `Default`, `PartialOrd`/`Ord`, `Hash`, `Display`.**
@@ -238,7 +236,6 @@ the number as a signed 64-bit value, and the C++ printing, with
 the OSD's order. WatchItem's formatter now uses it.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 **(c) `EntityAddr::legacy_str(&self) -> String`, as `get_legacy_str`.**
@@ -292,7 +289,6 @@ v1:/v2: and omits the nonce, and the dump formatter prints IPv6 in full,
 so neither can serve.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 **(d) `LockType` and `LockFlags` usable in encoded structs.**
@@ -324,7 +320,6 @@ does; an unknown type byte is refused, which only a request the class
 would reject with EINVAL can carry.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -492,7 +487,6 @@ dencoder runs. The locker map orders as locker_id_t does, so a map built
 in Rust encodes as the OSD's.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -626,7 +620,6 @@ and what it does on EBUSY, for GC, lifecycle, reshard, multipart
 completion and the notification queues.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -729,7 +722,6 @@ object, EIO from reading an expired ephemeral lock, and a second
 client that cannot unlock or renew the first's lock.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -749,8 +741,6 @@ expected); the cluster suites of every `rados-cls` test file plus
 **What changed.** `rados-cls` gains a `lock` module: the eleven structs pinned against `ceph-dencoder` v19.2.2 and the corpus, all seven methods, and radosgw's lock table in the docs. `rados` fixes `EntityAddr`'s unset-address length and orders and prints entity names as C++ does. Twelve cluster tests pin the class's semantics on v19.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 Then merge when green and open the upstream PR from the same branch.

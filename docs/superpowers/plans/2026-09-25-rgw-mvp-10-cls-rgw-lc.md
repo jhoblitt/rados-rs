@@ -175,7 +175,6 @@ VersionTooOld error check_min_version! returns. Without the attribute
 the decoder is unchanged.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -219,7 +218,6 @@ writes, so an older encoding fails with VersionTooOld as the
 hand-written decoders' floors do.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -280,7 +278,6 @@ keeps the head in the omap header, answers a missing next entry with
 an empty one, and reads legacy pair values when listing.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---
@@ -328,7 +325,6 @@ get_next_entry's empty entry past the end, listing after a marker
 with truncation, overwrite by set_entry, and idempotent rm_entry.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ```
@@ -338,7 +334,6 @@ The crate table's row fell behind the queue, rgw and rgw_gc features
 added since plan 5.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 ---

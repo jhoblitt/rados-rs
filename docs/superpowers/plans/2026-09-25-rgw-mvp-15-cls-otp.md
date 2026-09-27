@@ -42,9 +42,8 @@ with the scratchpad `CARGO_HOME`; no new dependencies). Plus:
   (`default`, the `mod call` gate, the CI clippy loop, the suite loops,
   the README class list) already carries what plans 11 to 14 added; add
   `otp` to it, do not rewrite it.
-- Commit trailers for this plan are two lines:
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` then
-  `Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s`.
+- The commit trailer for this plan is:
+  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` only.
   Subjects start `otp: `.
 - Methods (report §1; `S:src/cls/otp/cls_otp.cc:557-575`; names and
   flags identical on `main`, `M:src/cls/otp/cls_otp_ops.h:171-181`):
@@ -403,7 +402,6 @@ byte_enum! moves to the crate root so otp's one-byte enums do not
 depend on the rgw feature.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -534,7 +532,6 @@ hand-written SHA-1 TOTP helper pinned to RFC 6238's vectors, since
 the workspace has no sha1 crate.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -553,8 +550,6 @@ corpus); the cluster suites through `cls_otp`; the PR body:
 **What changed.** A new `otp` module and feature in `rados-cls`: request and reply structs pinned by hand-derived bytes (no `ceph-dencoder` type or corpus exists), op constructors and `IoCtx` functions, and cluster tests pinning v19's verdicts, replay guard, rate limit and result expiry.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 Then merge when green and open the upstream PR from the same branch.

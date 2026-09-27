@@ -67,9 +67,8 @@ when green then an upstream PR; offline builds with the scratchpad
   `utime_localtime` stay `#[cfg(feature = "lock")]`, since this plan
   does not use them. Task 0 confirms.
 - Commit messages: subject `two_pc_queue: ...`, a body of what and why,
-  then exactly these two trailers:
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and
-  `Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s`.
+  then exactly this trailer:
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` only.
 - Methods (`S:cls_2pc_queue_const.h:5-14`, registration
   `S:cls_2pc_queue.cc:664-675`; `main` has the same ten names and
   flags). Class `2pc_queue`:
@@ -804,7 +803,6 @@ differ in order only. The commit op dumps its payloads as base64 through
 the workspace's `base64` crate.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -1252,7 +1250,6 @@ ten bytes per reserved entry. The module doc records what radosgw does
 with the class, for a driver that must coexist with it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -1441,7 +1438,6 @@ class count, including for a Reef client's request; and without
 RETURNVEC the reservation is made but its id is lost.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -1525,7 +1521,6 @@ writers of v19.2.4 and main. The head holds 784 reservations; the
 and abort still find it and has_xattrs stays set.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 EOF
 ```
 
@@ -1550,8 +1545,6 @@ cluster suites through `cls_2pc_queue`; the PR body:
 **What changed.** A `two_pc_queue` module in `rados-cls`: the ten methods, `reserve` through `RETURNVEC`; the eight `ceph-dencoder` types plus `cls_2pc_queue_remove_op` and `cls_queue_get_stats_ret`; a head reader; and cluster tests pinning v19.2.2's semantics, including its reserved-size leak.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-https://claude.ai/code/session_01UctL4Y67TY89ZjJPAmnR4s
 ```
 
 Then merge when green and open the upstream PR from the same branch.
