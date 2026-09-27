@@ -183,6 +183,7 @@ against v19.2.2.
     `OSDClientError::Other` (`rados-cls/src/rgw/usage.rs`, ea2c204, PR #12).
   - `usage_trim_gives_up_on_a_payer_keyed_entry` pins it (e6daa93, PR #12).
     The test inverts on an image that carries 674d42d9023.
+  - The `trim` doc names the fix release (fork PR #25, 7fb2a13).
 - **Found:** rados-rs plan 09, 2026-09-25.
 - **Upstream:** not filed as such. ceph/ceph PR #65329 fixed it in passing,
   on main only.
@@ -215,7 +216,8 @@ against v19.2.2.
     unbounded loop in CEPH-BUG-005.
 - **rados-rs:**
   - The same `MAX_TRIM_ROUNDS` bound applies (`usage.rs`, ea2c204, PR #12).
-  - Its doc says "on v19", but the defect persists through main.
+  - Its doc names the affected releases, through main (fork PR #25,
+    7fb2a13; upstream tchaikov/rados-rs#131).
   - No test pins it.
 - **Found:** the rados-rs plan 09 review, 2026-09-25. The radosgw-admin hang
   was traced on 2026-09-27.
