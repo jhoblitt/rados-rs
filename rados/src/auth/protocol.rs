@@ -25,6 +25,30 @@ pub const CEPHX_KEY_USAGE_AUTHORIZE_REPLY: u32 = 0x12;
 pub const CEPHX_KEY_USAGE_ROTATING_SECRET: u32 = 0x20;
 pub const CEPHX_KEY_USAGE_TICKET_INFO: u32 = 0x30;
 
+/// msgr2 connection modes (`CEPH_CON_MODE_*`, ceph_fs.h)
+pub const CEPH_CON_MODE_CRC: u32 = 0x1;
+pub const CEPH_CON_MODE_SECURE: u32 = 0x2;
+
+/// Shortest connection secret SECURE mode can key from: an AES-128-GCM key
+/// and two 12-byte nonces, which C++ `rxtx_t::create_handler_pair` asserts.
+pub const CONNECTION_SECRET_MIN_LEN: usize = 16 + 2 * 12;
+
+/// A SECURE-mode connection secret: the given one, or an error when it is
+/// missing or too short to key the connection. Ceph never continues a SECURE
+/// connection without one.
+pub fn require_secure_connection_secret(secret: Option<Bytes>) -> crate::auth::Result<Bytes> {
+    match secret {
+        Some(secret) if secret.len() >= CONNECTION_SECRET_MIN_LEN => Ok(secret),
+        Some(secret) => Err(crate::auth::CephXError::ProtocolError(format!(
+            "SECURE mode connection secret is {} bytes, need at least {CONNECTION_SECRET_MIN_LEN}",
+            secret.len()
+        ))),
+        None => Err(crate::auth::CephXError::ProtocolError(
+            "SECURE mode without a connection secret".into(),
+        )),
+    }
+}
+
 /// AES-128 key length in bytes
 pub const AES_KEY_LEN: usize = 16;
 /// AES block size in bytes

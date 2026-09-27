@@ -370,7 +370,14 @@ impl AuthServer {
     fn handle_auth_request(mut self, frame: Frame) -> Result<Step<Self, AuthOutput>> {
         let auth_request = AuthRequestFrame::from_frame(&frame)?;
         self.client_preferred_modes = auth_request.preferred_modes.clone();
-        let connection_mode = Self::negotiate_mode(&auth_request.preferred_modes);
+        // Without authentication there is no connection secret to key SECURE
+        // mode from, so AUTH_NONE only allows CRC, as C++
+        // `AuthRegistry::get_supported_modes` does.
+        let connection_mode = if self.auth_handler.is_some() {
+            Self::negotiate_mode(&auth_request.preferred_modes)
+        } else {
+            crate::msgr2::ConnectionMode::Crc.into()
+        };
         self.connection_mode = Some(connection_mode);
 
         if let Some(ref mut handler) = self.auth_handler {

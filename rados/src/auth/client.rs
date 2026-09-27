@@ -411,19 +411,31 @@ impl CephXClientHandler {
         }
     }
 
-    /// Decode connection_secret from payload (outer method that handles errors gracefully)
+    /// Decode the connection secret that follows the tickets in AUTH_DONE.
     ///
-    /// Returns Ok(None) if decoding fails (connection_secret is optional for CRC mode)
+    /// In SECURE mode a secret that is missing, short, or fails to decrypt or
+    /// decode is an error, because the connection cannot be encrypted without
+    /// it. In CRC mode the secret is unused, so a failure yields `None`.
     fn decode_connection_secret(
         &self,
         payload: &mut Bytes,
         session_key: &CryptoKey,
+        con_mode: u32,
     ) -> Result<Option<Bytes>> {
-        if payload.remaining() == 0 {
-            return Ok(None);
-        }
+        use crate::auth::protocol::{CEPH_CON_MODE_SECURE, require_secure_connection_secret};
 
-        match Self::try_decode_connection_secret(payload, session_key) {
+        let decoded = if payload.remaining() == 0 {
+            Ok(None)
+        } else {
+            Self::try_decode_connection_secret(payload, session_key)
+        };
+
+        if con_mode == CEPH_CON_MODE_SECURE {
+            let secret = require_secure_connection_secret(decoded?)?;
+            debug!("Connection secret: {} bytes", secret.len());
+            return Ok(Some(secret));
+        }
+        match decoded {
             Ok(secret) => {
                 if let Some(ref s) = secret {
                     debug!("Connection secret: {} bytes", s.len());
@@ -538,7 +550,7 @@ impl CephXClientHandler {
         let session_key_bytes = auth_session_key.secret.clone();
 
         let connection_secret_bytes =
-            self.decode_connection_secret(&mut auth_payload, &auth_session_key)?;
+            self.decode_connection_secret(&mut auth_payload, &auth_session_key, con_mode)?;
 
         trace!(
             "After connection_secret, auth_payload remaining: {} bytes",
@@ -1067,7 +1079,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         const GLOBAL_ID: u64 = 4242;
-        const SECURE: u32 = 2;
+        const SECURE: u32 = crate::auth::protocol::CEPH_CON_MODE_SECURE;
+        const CRC: u32 = crate::auth::protocol::CEPH_CON_MODE_CRC;
+        /// A connection secret as long as a SECURE-mode Ceph server makes.
+        const CONNECTION_SECRET: [u8; 64] = [0x5a; 64];
 
         pub(crate) fn random_key(key_type: KeyType) -> CryptoKey {
             let len = match key_type {
@@ -1235,7 +1250,7 @@ mod tests {
                 .iter()
                 .map(|(service, t)| (*service, random_key(*t)))
                 .collect();
-            let connection_secret = [0x5au8; 16];
+            let connection_secret = CONNECTION_SECRET;
             let built = build(&client_key, &auth_key, &extras, &connection_secret);
 
             let mut handler = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
@@ -1270,8 +1285,7 @@ mod tests {
                 assert_eq!(th.session_key.secret, key.secret, "service {service}");
             }
 
-            // handle_auth_done hides a failed connection-secret decrypt, so
-            // decrypt the built blob directly.
+            // The blob is sealed under the connection-secret key usage only.
             let mut plain = auth_key
                 .decrypt(
                     CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET,
@@ -1405,7 +1419,7 @@ mod tests {
                 .build_auth_payload(GLOBAL_ID, EntityType::OSD.bits())
                 .unwrap();
 
-            let secret = Bytes::from_static(&[0x77; 32]);
+            let secret = Bytes::from_static(&[0x77; 64]);
             let reply = CephXAuthorizeReply::with_connection_secret(1, secret.clone());
             let payload = encrypted_reply(&osd, CEPHX_KEY_USAGE_AUTHORIZE_REPLY, reply);
             let (session_key, connection_secret) = provider
@@ -1414,7 +1428,7 @@ mod tests {
             assert_eq!(session_key.unwrap(), osd.secret);
             assert_eq!(connection_secret.unwrap(), secret);
 
-            // try_extract_connection_secret hides decrypt errors.
+            // The reply is sealed under the authorize-reply key usage only.
             let encrypted = Bytes::decode(&mut payload.clone(), 0).unwrap();
             osd.decrypt(CEPHX_KEY_USAGE_AUTHORIZE_REPLY, &encrypted)
                 .unwrap();
@@ -1431,6 +1445,126 @@ mod tests {
         #[test]
         fn authorize_reply_aes256k() {
             check_authorize_reply(KeyType::Aes256Krb5);
+        }
+
+        /// `payload` with the first byte of `blob` flipped, which garbles the
+        /// first cipher block (AES) or fails the HMAC (aes256k).
+        fn corrupted(payload: &Bytes, blob: &[u8]) -> Bytes {
+            let at = payload
+                .windows(blob.len())
+                .position(|w| w == blob)
+                .expect("blob in payload");
+            let mut bl = BytesMut::from(payload.as_ref());
+            bl[at] ^= 0xff;
+            bl.freeze()
+        }
+
+        fn auth_done_with_secret(
+            t: KeyType,
+            connection_secret: &[u8],
+        ) -> (CephXClientHandler, Built) {
+            let client_key = random_key(t);
+            let auth_key = random_key(t);
+            let built = build(&client_key, &auth_key, &[], connection_secret);
+            let mut handler = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
+            handler.set_secret_key(client_key);
+            (handler, built)
+        }
+
+        #[test]
+        fn secure_auth_done_with_an_undecryptable_secret_fails() {
+            for t in KEY_TYPES {
+                let (mut handler, built) = auth_done_with_secret(t, &CONNECTION_SECRET);
+                let payload = corrupted(&built.payload, &built.encrypted_connection_secret);
+                assert!(
+                    handler
+                        .handle_auth_done(payload.clone(), GLOBAL_ID, SECURE)
+                        .is_err(),
+                    "{t:?}"
+                );
+                let (session_key, secret) =
+                    handler.handle_auth_done(payload, GLOBAL_ID, CRC).unwrap();
+                assert!(session_key.is_some(), "{t:?}");
+                assert!(secret.is_none(), "{t:?}");
+            }
+        }
+
+        #[test]
+        fn secure_auth_done_with_a_short_or_empty_secret_fails() {
+            for t in KEY_TYPES {
+                for secret in [&[0x5a; 39][..], &[][..]] {
+                    let (mut handler, built) = auth_done_with_secret(t, secret);
+                    let err = handler
+                        .handle_auth_done(built.payload.clone(), GLOBAL_ID, SECURE)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("SECURE mode"), "{t:?}: {err}");
+                    handler
+                        .handle_auth_done(built.payload, GLOBAL_ID, CRC)
+                        .unwrap();
+                }
+                let (mut handler, built) = auth_done_with_secret(t, &[0x5a; 40]);
+                let (_, secret) = handler
+                    .handle_auth_done(built.payload, GLOBAL_ID, SECURE)
+                    .unwrap();
+                assert_eq!(secret.unwrap().len(), 40);
+            }
+        }
+
+        fn service_provider(t: KeyType) -> (ServiceAuthProvider, CryptoKey) {
+            let (handler, keys) = authenticate(t, t, &[(EntityType::OSD, t)]);
+            let osd = keys[&EntityType::OSD.bits()].clone();
+            let mut provider =
+                ServiceAuthProvider::from_shared_handler(Arc::new(Mutex::new(handler)));
+            provider
+                .build_auth_payload(GLOBAL_ID, EntityType::OSD.bits())
+                .unwrap();
+            (provider, osd)
+        }
+
+        #[test]
+        fn secure_authorize_reply_with_an_undecryptable_secret_fails() {
+            for t in KEY_TYPES {
+                let (mut provider, osd) = service_provider(t);
+                let reply =
+                    CephXAuthorizeReply::with_connection_secret(1, Bytes::from_static(&[0x77; 64]));
+                let payload = encrypted_reply(&osd, CEPHX_KEY_USAGE_AUTHORIZE_REPLY, reply);
+                let encrypted = Bytes::decode(&mut payload.clone(), 0).unwrap();
+                let payload = corrupted(&payload, &encrypted);
+                assert!(
+                    provider
+                        .handle_auth_response(payload.clone(), GLOBAL_ID, SECURE)
+                        .is_err(),
+                    "{t:?}"
+                );
+                let (session_key, secret) = provider
+                    .handle_auth_response(payload, GLOBAL_ID, CRC)
+                    .unwrap();
+                assert_eq!(session_key.unwrap(), osd.secret, "{t:?}");
+                assert!(secret.is_none(), "{t:?}");
+            }
+        }
+
+        #[test]
+        fn secure_authorize_reply_with_a_short_or_missing_secret_fails() {
+            for t in KEY_TYPES {
+                let (mut provider, osd) = service_provider(t);
+                for reply in [
+                    CephXAuthorizeReply::with_connection_secret(1, Bytes::from_static(&[0x77; 39])),
+                    CephXAuthorizeReply::new(1),
+                ] {
+                    let payload = encrypted_reply(&osd, CEPHX_KEY_USAGE_AUTHORIZE_REPLY, reply);
+                    assert!(
+                        provider
+                            .handle_auth_response(payload.clone(), GLOBAL_ID, SECURE)
+                            .is_err(),
+                        "{t:?}"
+                    );
+                    provider
+                        .handle_auth_response(payload, GLOBAL_ID, CRC)
+                        .unwrap();
+                }
+            }
         }
 
         const KEY_TYPES: [KeyType; 2] = [KeyType::Aes, KeyType::Aes256Krb5];
@@ -1483,7 +1617,7 @@ mod tests {
                     None,
                 );
                 let extra = ticket_info(EntityType::OSD, &new_auth, &new_osd, 99, Some(&old_osd));
-                let built = build_with(primary, &new_auth, &[extra], &[0x5a; 16]);
+                let built = build_with(primary, &new_auth, &[extra], &CONNECTION_SECRET);
                 handler
                     .handle_auth_done(built.payload, GLOBAL_ID, SECURE)
                     .unwrap();
@@ -1524,7 +1658,7 @@ mod tests {
                     77,
                     Some(&new_auth),
                 );
-                let built = build_with(wrong, &new_auth, &[], &[0x5a; 16]);
+                let built = build_with(wrong, &new_auth, &[], &CONNECTION_SECRET);
                 assert!(
                     handler
                         .handle_auth_done(built.payload, GLOBAL_ID, SECURE)
@@ -1538,7 +1672,7 @@ mod tests {
                     77,
                     Some(&old_auth),
                 );
-                let built = build_with(sealed, &new_auth, &[], &[0x5a; 16]);
+                let built = build_with(sealed, &new_auth, &[], &CONNECTION_SECRET);
                 let (session_key, _) = handler
                     .handle_auth_done(built.payload, GLOBAL_ID, SECURE)
                     .unwrap();
@@ -1557,7 +1691,7 @@ mod tests {
                 let mut handler = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
                 handler.set_secret_key(client_key.clone());
                 let sealed = ticket_info(EntityType::AUTH, &client_key, &auth, 77, Some(&auth));
-                let built = build_with(sealed, &auth, &[], &[0x5a; 16]);
+                let built = build_with(sealed, &auth, &[], &CONNECTION_SECRET);
                 let err = handler
                     .handle_auth_done(built.payload, GLOBAL_ID, SECURE)
                     .unwrap_err()
