@@ -265,12 +265,21 @@ fn normalize_key_name(key: &str) -> Cow<'_, str> {
     }
 }
 
-/// Parse comma-separated auth method names into method constants.
+/// Parse auth method names into method constants, splitting the list on
+/// any of `;,= \t` as C++ `get_str_list()` does.
 ///
 /// Recognizes "cephx", "none", and "gss". Unknown names are silently skipped.
+///
+/// Unlike C++, it lowercases each name before matching it, and
+/// [`CephConfig::get_auth_client_required_for`] falls back to cephx alone
+/// when the list is unset, empty or names no known method. C++ matches
+/// names case-sensitively, defaults an unset `auth_client_required` to
+/// `cephx, none`, and is left with no method from an empty or all-unknown
+/// list (v19.2.6 src/auth/AuthRegistry.cc:76-87,
+/// src/common/options/global.yaml.in:2146).
 fn parse_auth_methods(methods_str: &str) -> Vec<u32> {
     methods_str
-        .split(',')
+        .split([';', ',', '=', ' ', '\t'])
         .filter_map(|s| match s.trim().to_lowercase().as_str() {
             "none" => Some(CEPH_AUTH_NONE),
             "cephx" => Some(CEPH_AUTH_CEPHX),
@@ -396,6 +405,22 @@ mon_dns_srv_name = ceph-mon_example.com
         assert!(sections.contains(&"global"));
         assert!(sections.contains(&"client"));
         assert!(sections.contains(&"mon"));
+    }
+
+    #[test]
+    fn test_auth_method_list_delimiters() {
+        assert_eq!(
+            parse_auth_methods("cephx, none"),
+            [CEPH_AUTH_CEPHX, CEPH_AUTH_NONE]
+        );
+        assert_eq!(
+            parse_auth_methods("none;cephx"),
+            [CEPH_AUTH_NONE, CEPH_AUTH_CEPHX]
+        );
+        assert_eq!(
+            parse_auth_methods("cephx none\tgss"),
+            [CEPH_AUTH_CEPHX, CEPH_AUTH_NONE, CEPH_AUTH_GSS]
+        );
     }
 
     #[test]
