@@ -290,6 +290,47 @@ the list of watchers that did not ack; it is not an error.
   two-client test and a watch that survives an OSD restart.
 - Gates as upstream's CI defines them.
 
+## Upstream Ceph bug registry
+
+Added 2026-09-27 at the owner's request. Work on this fork keeps meeting
+defects in ceph/ceph itself, and a client that must coexist with radosgw
+has to work around them. `docs/superpowers/ceph-upstream-bugs.md` on this
+branch records each one, so the knowledge outlives the plan or review
+that found it.
+
+- What belongs: a defect in ceph/ceph's own behaviour that a correct
+  client meets. That covers a hang, a crash, a wrong result, accounting
+  that drifts, an encoder and decoder that disagree, a race a client must
+  retry around, and code that contradicts its own documentation. A
+  difference between releases belongs only when the older behaviour was
+  a defect that a later release fixed.
+- What does not: bugs in rados-rs, which are fixed here; problems in
+  Rook, rooket or a deployment, which go to their own trackers;
+  intentional release differences, which the release-shapes docs cover;
+  and C++ behaviour that is merely surprising, which the parity notes in
+  the code cover.
+- Every entry records the component, the symptom as a client sees it,
+  the releases affected, and the release and commit that fixed it if
+  any. It also records the evidence, as `tag:path:line` and how it was
+  established: source reading, `ceph-dencoder`, or a named cluster test.
+  Then how rados-rs handles it (a workaround, a doc note, or a test that
+  pins it, naming the commit or PR), who found it and when, and its
+  upstream report status.
+- An entry is `confirmed` only when that evidence is in it; otherwise it
+  is `suspected`, with what still has to be checked. Entries keep stable
+  IDs (`CEPH-BUG-NNN`) and are updated in place: when a later release
+  fixes one, when a claim is corrected, or when it is filed upstream.
+- Whoever confirms a Ceph defect adds or updates its entry in the same
+  session: a plan, an implementer, a reviewer or the controller. A plan
+  that finds one lists the entry in its Roadmap, and the controller
+  checks the registry before closing each package.
+- Reporting a bug on tracker.ceph.com or opening a ceph/ceph PR is
+  outward-facing and needs the owner's explicit instruction for that
+  report. Until then the status is `not filed`.
+- The rgw-go effort shares this cluster layout and meets the same Ceph.
+  New entries are sent to the rgw-go session, and bugs it confirms are
+  added here, verified as for any other entry.
+
 ## Branches and pull requests
 
 Each package is a branch off upstream `main`, reviewed and CI-checked as
