@@ -5120,6 +5120,70 @@ mod tests {
         }
     }
 
+    /// A successful `MOSDOpReply` at object version `version`, echoing
+    /// `retry_attempt`.
+    fn op_reply(retry_attempt: i32, version: u64) -> crate::osdclient::messages::MOSDOpReply {
+        crate::osdclient::messages::MOSDOpReply {
+            _object: ObjectId::new(2, ""),
+            _pgid: crate::osdclient::types::StripedPgId::from_pg(2, 0),
+            _flags: 0,
+            result: 0,
+            _epoch: 10,
+            _version: version,
+            user_version: version,
+            retry_attempt,
+            redirect: None,
+            ops: vec![OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+        }
+    }
+
+    /// The retry_attempt of op `tid` if it is pending on `session`.
+    fn pending_attempt(session: &crate::osdclient::session::OSDSession, tid: u64) -> Option<i32> {
+        session
+            .get_pending_ops_metadata()
+            .into_iter()
+            .find(|(pending, ..)| *pending == tid)
+            .map(|(_, op, ..)| op.retry_attempt)
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_earlier_send_leaves_the_op_waiting() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let mut rx = submit_write(&session, &object_in_pg(8, 5), || true)
+            .await
+            .expect("submitted")
+            .expect("sent");
+        // Skipped epochs resend it through the same session, as
+        // collect_resend_ops and insert_migrated_op do.
+        let op = session.remove_pending_op(77).expect("pending");
+        session.insert_migrated_op(op, 11).await.expect("resent");
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+        assert_eq!(sends.try_recv().expect("resent").tid(), 77);
+
+        // As Objecter ignores it (v19.2.6:src/osdc/Objecter.cc:3448-3459).
+        assert!(
+            session
+                .handle_osd_op_reply(77, op_reply(0, 6))
+                .await
+                .is_none()
+        );
+        assert_eq!(pending_attempt(&session, 77), Some(1), "still waiting");
+        assert!(rx.try_recv().is_err(), "not answered");
+
+        assert!(
+            session
+                .handle_osd_op_reply(77, op_reply(1, 7))
+                .await
+                .is_none()
+        );
+        let result = rx.try_recv().expect("answered").expect("written");
+        assert_eq!(result.version, 7, "by the reply to its latest send");
+    }
+
     #[test]
     fn pgnls_request_encodes_the_namespace() {
         let with_ns = pgnls_front("ns1", 0xef61efce);

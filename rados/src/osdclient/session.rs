@@ -614,7 +614,10 @@ impl OSDSession {
         // Get current session incarnation for stale operation detection
         let current_incarnation = self.incarnation.load(Ordering::Acquire);
 
-        let result = Self::handle_reply(tid, reply, &self.pending_ops, current_incarnation).await;
+        // A stray or stale reply leaves the op, if any, waiting and tracked.
+        let pending_op =
+            Self::take_answered_op(tid, &reply, &self.pending_ops, current_incarnation)?;
+        let result = Self::handle_reply(tid, reply, pending_op);
 
         // If operation completed (not retrying), untrack it
         if result.is_none()
@@ -882,25 +885,34 @@ impl OSDSession {
         Ok(Some(rx))
     }
 
-    /// Handle an operation reply
+    /// Take the op `reply` answers off `pending_ops`: a submitted one
+    /// whose latest send the reply is to. A reply to an earlier send, or
+    /// from an earlier incarnation of the connection, is ignored and the
+    /// op left to wait for its own, as Objecter's `handle_osd_op_reply`
+    /// ignores it (v19.2.6:src/osdc/Objecter.cc:3448-3459).
+    fn take_answered_op(
+        tid: u64,
+        reply: &MOSDOpReply,
+        pending_ops: &DashMap<u64, PendingOp>,
+        current_incarnation: u32,
+    ) -> Option<PendingOp> {
+        // An op not yet submitted has had no frame out under this tid.
+        pending_ops
+            .remove_if(&tid, |_, op| {
+                op.submitted && Self::validate_reply_freshness(tid, reply, op, current_incarnation)
+            })
+            .map(|(_, op)| op)
+    }
+
+    /// Act on `reply` to `pending_op`, taken off the session by
+    /// [`Self::take_answered_op`].
     ///
     /// Returns Some((pending_op, modified_flags)) if the operation should be retried with modified flags
-    async fn handle_reply(
+    fn handle_reply(
         tid: u64,
         reply: MOSDOpReply,
-        pending_ops: &Arc<DashMap<u64, PendingOp>>,
-        current_incarnation: u32,
+        pending_op: PendingOp,
     ) -> Option<(PendingOp, u32)> {
-        // An op not yet submitted has had no frame out under this tid.
-        let pending_op = pending_ops
-            .remove_if(&tid, |_, op| op.submitted)
-            .map(|(_, v)| v)?;
-
-        // Validate operation staleness
-        if !Self::validate_reply_freshness(tid, &reply, &pending_op, current_incarnation) {
-            return None;
-        }
-
         // Handle redirect if present
         if let Some(redirect) = &reply.redirect {
             return Self::handle_redirect(tid, pending_op, redirect);
