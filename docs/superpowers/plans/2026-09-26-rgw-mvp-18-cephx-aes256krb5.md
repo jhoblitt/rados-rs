@@ -1085,7 +1085,12 @@ The PR body:
 > `CEPH_IMAGE` parameter and no make or bash wrapper to rados-rs. The
 > cluster, its ports and its conf path come from rooket; the commands
 > below name them as `$ROOKET_CONF` and `rooket`'s own tooling, to be
-> settled when #58 lands. None of these steps runs in this plan, so none
+> settled when #58 lands. Cluster settings need no rooket feature: the
+> cipher policy goes in the Rook chart's `cephClusterSpec.security.cephx`
+> values, `mon_allow_pool_delete` in its `configOverride`, and extra
+> client keys of a chosen type are made by the test with `ceph auth
+> get-or-create ... --key-type` under the exported admin keyring.
+> None of these steps runs in this plan, so none
 > carries a sandbox label yet; when Part B is scheduled, every step that
 > drives the cluster runs unsandboxed. A Part B plan re-reads this
 > section against the merged Part A before starting.
