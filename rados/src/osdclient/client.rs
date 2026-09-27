@@ -935,9 +935,8 @@ impl OSDClient {
         Ok((linger, rx))
     }
 
-    /// Send a watch's registration, `WATCH{WATCH}`, once. Success marks it
-    /// registered and answers `linger_watch`; an OSD's rejection answers
-    /// it with the error; no answer leaves it pending for a re-send.
+    /// Send a watch's registration, `WATCH{WATCH}`, once, and apply its
+    /// outcome with [`Self::finish_register_send`].
     async fn send_register(&self, linger: &Linger) {
         let LingerKind::Watch { timeout } = linger.kind else {
             return;
@@ -948,14 +947,40 @@ impl OSDClient {
         let sent = std::time::Instant::now();
         let op = OSDOp::watch(linger.cookie, WatchOp::Watch, timeout);
         let seq = linger.begin_send();
-        match self.send_linger_op(linger, op, "watch", seq).await {
+        let outcome = self.send_linger_op(linger, op, "watch", seq).await;
+        Self::finish_register_send(linger, seq, sent, outcome);
+    }
+
+    /// Apply the outcome of registration send `seq` of a watch, sent at
+    /// `sent`. Success marks it registered and answers `linger_watch`; an
+    /// OSD's rejection answers it with the error; no answer leaves it
+    /// pending for a re-send. A send a later one superseded changes
+    /// nothing, as [`Self::finish_notify_send`] has it: the later send
+    /// cancels it if it is still pending, as `_send_linger` does
+    /// (v19.2.2:src/osdc/Objecter.cc:586-594), so `_linger_commit`
+    /// never sees its reply, but here the reply may already have come.
+    fn finish_register_send(
+        linger: &Linger,
+        seq: u64,
+        sent: std::time::Instant,
+        outcome: Result<crate::osdclient::types::OpResult>,
+    ) {
+        let mut state = linger.lock_state();
+        if state.send_seq != seq {
+            debug!(
+                "watch {} registration send {} superseded, ignoring {:?}",
+                linger.cookie,
+                seq,
+                outcome.map(|_| ())
+            );
+            return;
+        }
+        match outcome {
             Ok(_) => {
-                {
-                    let mut state = linger.lock_state();
-                    state.registered = true;
-                    state.last_error = None;
-                    state.watch_valid_thru = Some(sent);
-                }
+                state.registered = true;
+                state.last_error = None;
+                state.watch_valid_thru = Some(sent);
+                drop(state);
                 linger.finish_registration(Ok(()));
             }
             Err(e) if is_no_answer(&e) => {
@@ -964,7 +989,10 @@ impl OSDClient {
                     linger.cookie, e
                 );
             }
-            Err(e) => linger.finish_registration(Err(e)),
+            Err(e) => {
+                drop(state);
+                linger.finish_registration(Err(e));
+            }
         }
     }
 
@@ -5723,6 +5751,75 @@ mod tests {
 
         OSDClient::finish_notify_send(&linger, second, Ok(notify_reply(6)));
         assert_eq!(notify_id.load(std::sync::atomic::Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn a_superseded_registration_send_changes_nothing() {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Linger::new(
+            1001,
+            ObjectId::new(1, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        );
+        let (reg_tx, mut reg_rx) = tokio::sync::oneshot::channel();
+        linger.lock_state().registration = Some(reg_tx);
+        let first = linger.begin_send();
+        let second = linger.begin_send();
+        let sent = std::time::Instant::now();
+
+        // The first send's reply came before the second cancelled it.
+        OSDClient::finish_register_send(&linger, first, sent, Ok(notify_reply(0)));
+        assert!(!linger.lock_state().registered);
+        OSDClient::finish_register_send(
+            &linger,
+            first,
+            sent,
+            Err(OSDClientError::OSDError {
+                code: crate::osdclient::error::ENOENT,
+                message: "watch".into(),
+            }),
+        );
+        assert!(reg_rx.try_recv().is_err(), "still pending");
+        {
+            let state = linger.lock_state();
+            assert!(!state.registered);
+            assert_eq!(state.watch_valid_thru, None);
+        }
+
+        OSDClient::finish_register_send(&linger, second, sent, Ok(notify_reply(0)));
+        assert!(linger.lock_state().registered);
+        assert!(matches!(reg_rx.try_recv(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn the_latest_registration_send_fails_the_watch() {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Linger::new(
+            1001,
+            ObjectId::new(1, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        );
+        let (reg_tx, mut reg_rx) = tokio::sync::oneshot::channel();
+        linger.lock_state().registration = Some(reg_tx);
+        let seq = linger.begin_send();
+        OSDClient::finish_register_send(
+            &linger,
+            seq,
+            std::time::Instant::now(),
+            Err(OSDClientError::OSDError {
+                code: crate::osdclient::error::ENOENT,
+                message: "watch".into(),
+            }),
+        );
+        assert!(matches!(
+            reg_rx.try_recv(),
+            Ok(Err(OSDClientError::OSDError { .. }))
+        ));
+        assert!(!linger.lock_state().registered);
     }
 
     #[test]
