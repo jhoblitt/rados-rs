@@ -238,6 +238,13 @@ pub(crate) struct PendingOp {
     /// is cancelled instead, as Objecter clears `Op::should_resend` for
     /// them (v19.2.2:src/osdc/Objecter.cc:583, 715).
     pub should_resend: bool,
+    /// False while `submit_op` has the op pending but has not yet checked
+    /// that its map is still current and claimed it to send. Until then
+    /// no frame of it may go out but the submitter's: the check may take
+    /// it back and place it again under a new tid, and a send under the
+    /// old one would let the OSD run it twice. A rescan may still take
+    /// such an op; the submitter then sends nothing.
+    pub submitted: bool,
 }
 
 impl OSDSession {
@@ -760,13 +767,14 @@ impl OSDSession {
                 sent_incarnation: self.incarnation.load(Ordering::Acquire),
                 redirect_count: 0,
                 should_resend,
+                submitted: false,
             },
         );
         rx
     }
 
     /// [`Self::insert_pending`] for tests, which have no connection to
-    /// send on.
+    /// send on: the op is as if sent.
     #[cfg(test)]
     pub(crate) fn insert_pending_for_test(
         &self,
@@ -774,12 +782,17 @@ impl OSDSession {
         pg_num: u32,
         should_resend: bool,
     ) -> oneshot::Receiver<Result<OpResult>> {
-        self.insert_pending(
+        let tid = op.reqid.tid;
+        let rx = self.insert_pending(
             op,
             crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
             pg_num,
             should_resend,
-        )
+        );
+        if let Some(mut pending) = self.pending_ops.get_mut(&tid) {
+            pending.submitted = true;
+        }
+        rx
     }
 
     /// Whether the session's I/O loop was told to stop.
@@ -803,13 +816,23 @@ impl OSDSession {
     /// Priority is set in the message header (not the MOSDOp payload).
     /// `pg_num` is the op's pool's pg_num in the map it was placed in;
     /// `should_resend` is [`PendingOp::should_resend`].
+    ///
+    /// `still_placed` runs once the op is pending and before its frame is
+    /// queued, and says whether the map it was placed in is still the
+    /// current one. If not, the op is taken back unsent and `None`
+    /// returned for the caller to place it again, unless a map rescan
+    /// took it first: the rescan resends it, and its reply comes on the
+    /// channel returned, with nothing sent here. Until the check passes
+    /// the op is not [`PendingOp::submitted`], and no other path sends
+    /// it.
     pub async fn submit_op(
         &self,
         op: Arc<MOSDOp>,
         priority: i32,
         pg_num: u32,
         should_resend: bool,
-    ) -> Result<oneshot::Receiver<Result<OpResult>>> {
+        still_placed: impl FnOnce() -> bool,
+    ) -> Result<Option<oneshot::Receiver<Result<OpResult>>>> {
         let tid = op.reqid.tid;
 
         // Check if operation is blocked by backoff
@@ -821,6 +844,21 @@ impl OSDSession {
         }
 
         let rx = self.insert_pending(Arc::clone(&op), priority, pg_num, should_resend);
+
+        if !still_placed() {
+            return Ok(
+                match self.pending_ops.remove_if(&tid, |_, op| !op.submitted) {
+                    Some(_) => None,
+                    None => Some(rx),
+                },
+            );
+        }
+
+        // Claim the op to send. A rescan that took it since resends it.
+        match self.pending_ops.get_mut(&tid) {
+            Some(mut pending) if !pending.submitted => pending.submitted = true,
+            _ => return Ok(Some(rx)),
+        }
 
         // Track operation timeout
         if let Some(tracker) = &self.tracker {
@@ -835,12 +873,13 @@ impl OSDSession {
         // Send to channel (non-blocking, like Linux kernel's list_add_tail + queue_con)
         debug!("Submitting operation tid={} to OSD {}", tid, self.osd_id);
 
-        self.send_tx
-            .send(msg)
-            .await
-            .map_err(|_| OSDClientError::Connection("I/O task has exited".into()))?;
+        if self.send_tx.send(msg).await.is_err() {
+            // Nothing went out: the caller may place it again.
+            self.pending_ops.remove(&tid);
+            return Err(OSDClientError::Connection("I/O task has exited".into()));
+        }
 
-        Ok(rx)
+        Ok(Some(rx))
     }
 
     /// Handle an operation reply
@@ -852,7 +891,10 @@ impl OSDSession {
         pending_ops: &Arc<DashMap<u64, PendingOp>>,
         current_incarnation: u32,
     ) -> Option<(PendingOp, u32)> {
-        let pending_op = pending_ops.remove(&tid).map(|(_, v)| v)?;
+        // An op not yet submitted has had no frame out under this tid.
+        let pending_op = pending_ops
+            .remove_if(&tid, |_, op| op.submitted)
+            .map(|(_, v)| v)?;
 
         // Validate operation staleness
         if !Self::validate_reply_freshness(tid, &reply, &pending_op, current_incarnation) {
@@ -1008,8 +1050,9 @@ impl OSDSession {
         // Find all operations in this PG that fall within the backoff range
         for entry in pending_ops.iter() {
             let (tid, pending_op) = entry.pair();
-            // Check if this operation is for the same PG
-            if pending_op.op.pgid != *pgid {
+            // Check if this operation is for the same PG. One not yet
+            // submitted is left to its submitter, which may take it back.
+            if pending_op.op.pgid != *pgid || !pending_op.submitted {
                 continue;
             }
 
@@ -1137,6 +1180,14 @@ impl OSDSession {
         self.pending_ops.remove(&tid).map(|(_, v)| v)
     }
 
+    /// [`Self::remove_pending_op`], only if the op is
+    /// [`PendingOp::submitted`].
+    pub(crate) fn remove_submitted_op(&self, tid: u64) -> Option<PendingOp> {
+        self.pending_ops
+            .remove_if(&tid, |_, op| op.submitted)
+            .map(|(_, v)| v)
+    }
+
     /// Insert a migrated operation from another session
     ///
     /// Used during OSDMap rescanning to insert an operation that was removed
@@ -1166,6 +1217,7 @@ impl OSDSession {
         // Update incarnation to current session incarnation (operation is being resent)
         // This is critical: migrated operations get new incarnation from target session
         pending_op.sent_incarnation = self.incarnation.load(Ordering::Acquire);
+        pending_op.submitted = true;
 
         // Check if operation is blocked by backoff
         if self.is_blocked_by_backoff(&pending_op.op).await {

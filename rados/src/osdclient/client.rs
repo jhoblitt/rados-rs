@@ -155,6 +155,13 @@ pub struct OSDClient {
     /// The session every OSD's ops go to, connected or not.
     #[cfg(test)]
     fake_osd: std::sync::Mutex<Option<Arc<OSDSession>>>,
+    /// Runs as an op, placed, is about to be handed to its session.
+    #[cfg(test)]
+    before_submit: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Runs as an op, pending on its session, is about to have its map
+    /// checked.
+    #[cfg(test)]
+    in_submit_window: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 #[cfg(test)]
@@ -527,6 +534,10 @@ impl OSDClient {
                 fake_linger_submit: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 fake_osd: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                before_submit: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                in_submit_window: std::sync::Mutex::new(None),
             }
         });
 
@@ -2124,62 +2135,94 @@ impl OSDClient {
                 continue;
             }
 
-            // Final pgid re-derivation: between the post-session re-check above
-            // and submit_op below, the OSDMap can still advance (e.g. autoscaler
-            // growing pg_num), which invalidates the seed we just computed.
-            // Re-read the live map once more and recompute spg if the epoch has
-            // moved. If the primary also changed, restart the outer loop so we
-            // pick up the correct session; otherwise just refresh the pgid
-            // before stamping it. Mirrors librados Objecter's rwlock-guarded
-            // "compute target + enqueue" ordering without needing a real lock.
-            let (final_hash, final_spg, final_map) = {
-                let live = self.get_osdmap().await?;
-                if live.epoch != op.osdmap.epoch {
-                    // OSDMap moved between the routing decision above
-                    // and now — re-prune the snapc against any new
-                    // removals before we encode the wire op.
-                    live.prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
-                    let (new_hash, new_spg, new_osds) = Self::replace_pending(&live, msg)?;
-                    if new_osds.first().copied() != Some(primary_osd) {
-                        op.osdmap = live;
-                        continue;
-                    }
-                    (new_hash, new_spg, live)
-                } else {
-                    (hash, spg, Arc::clone(&op.osdmap))
-                }
-            };
-            let final_epoch = final_map.epoch.as_u32();
-
             // Build request ID with fresh TID and stamp pgid
             let tid = session.next_tid();
+            let placed_epoch = op.osdmap.epoch.as_u32();
             {
                 let m = Arc::make_mut(msg);
-                m.object.hash = final_hash;
-                m.pgid = final_spg;
-                m.osdmap_epoch = final_epoch;
+                m.object.hash = hash;
+                m.pgid = spg;
+                m.osdmap_epoch = placed_epoch;
                 m.reqid = crate::osdclient::types::RequestId::new(
                     &self.entity_name,
                     tid,
                     self.config.client_inc as i32,
                 );
             }
-
-            // Submit operation (priority is set in message header).
-            // Arc::clone is a cheap refcount bump; submit_op stores the Arc in
-            // pending_ops and drops it when the reply arrives, so by the time
-            // we reach the next iteration the refcount is back to 1.
-            let pg_num = final_map
+            let pg_num = op
+                .osdmap
                 .pools
                 .get(&msg.object.pool)
                 .map_or(0, |p| p.pg_num);
-            let rx = session
-                .submit_op(Arc::clone(msg), priority, pg_num, op.should_resend)
+
+            #[cfg(test)]
+            if let Some(hook) = self
+                .before_submit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                hook();
+            }
+
+            // Objecter::op_submit holds rwlock shared from _calc_target
+            // through the send, and handle_osd_map holds it unique from
+            // publishing a map through its rescan
+            // (v19.2.2:src/osdc/Objecter.cc:1164, 2278), so an op is
+            // either placed in the new map or pending when the rescan
+            // looks. Here a map published after the placement above may
+            // have been rescanned before the op became pending, which
+            // would miss it: the OSD drops an op of an older interval.
+            // submit_op checks, with the op pending and before its frame
+            // goes out, that the map is still the one it was placed in;
+            // the rescan publishes before it looks, so a map it misses the
+            // op in is one this check sees. If the map moved, the op is
+            // placed again, unsent.
+            let placed = session
+                .submit_op(Arc::clone(msg), priority, pg_num, op.should_resend, || {
+                    #[cfg(test)]
+                    if let Some(hook) = self
+                        .in_submit_window
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_mut()
+                    {
+                        hook();
+                    }
+                    self.current_epoch_u32() == placed_epoch
+                })
                 .await;
+            let rx = match placed {
+                Ok(Some(rx)) => Ok(rx),
+                // A linger send or ping taken back ends as no answer, as a
+                // map change cancels one already out: the linger machinery
+                // sends it again in the new map.
+                Ok(None) if !op.should_resend => {
+                    debug!(
+                        "OSDMap moved past epoch {} before linger tid {} went out; cancelled",
+                        placed_epoch, tid
+                    );
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(Err(OSDClientError::Cancelled));
+                    Ok(rx)
+                }
+                Ok(None) => {
+                    debug!(
+                        "OSDMap moved past epoch {} before tid {} went out; placing it again",
+                        placed_epoch, tid
+                    );
+                    deadline_remaining(deadline, effective_timeout)?;
+                    op.osdmap = self.get_osdmap().await?;
+                    op.osdmap
+                        .prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
+                    continue;
+                }
+                Err(e) => Err(e),
+            };
             return Ok(Submitted {
                 osd: primary_osd,
                 tid,
-                osdmap: final_map,
+                osdmap: Arc::clone(&op.osdmap),
                 rx,
             });
         }
@@ -3330,7 +3373,9 @@ impl OSDClient {
 
         for (tid, msg, ..) in metadata {
             let pool_id = msg.object.pool;
-            let Some(mut pending_op) = old_session.remove_pending_op(tid) else {
+            // One not yet submitted is left to its submitter, which may
+            // take it back; it sends on the old session or fails there.
+            let Some(mut pending_op) = old_session.remove_submitted_op(tid) else {
                 continue;
             };
 
@@ -4773,6 +4818,278 @@ mod tests {
         let names: Vec<_> = listed.entries.iter().map(|e| e.oid.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
         assert_eq!(listed.cursor, None);
+    }
+
+    /// A write of `object` sent through `session` at epoch 10 with 8
+    /// PGs, as route_and_submit places it; `still_placed` as given.
+    async fn submit_write(
+        session: &crate::osdclient::session::OSDSession,
+        object: &ObjectId,
+        still_placed: impl FnOnce() -> bool,
+    ) -> super::Result<
+        Option<tokio::sync::oneshot::Receiver<super::Result<crate::osdclient::types::OpResult>>>,
+    > {
+        let map = one_osd_map(8, 10);
+        let (hash, spg, _) = OSDClient::object_to_osds_in_map(&map, object).unwrap();
+        let mut op = mosdop(
+            object.clone(),
+            vec![crate::osdclient::types::OSDOp::write_full(
+                Bytes::from_static(b"x"),
+            )],
+        );
+        op.object.hash = hash;
+        op.pgid = spg;
+        op.osdmap_epoch = 10;
+        op.reqid = crate::osdclient::types::RequestId::new(&"client.test".into(), 77, 0);
+        session
+            .submit_op(
+                Arc::new(op),
+                crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                8,
+                true,
+                still_placed,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_map_moved_before_it_went_out_is_taken_back() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let placed = submit_write(&session, &object_in_pg(8, 5), || false).await;
+        assert!(matches!(placed, Ok(None)), "to be placed again");
+        assert!(session.get_pending_ops_metadata().is_empty(), "taken back");
+        assert!(sends.try_recv().is_err(), "nothing sent");
+
+        // Still placed: it goes out.
+        let placed = submit_write(&session, &object_in_pg(8, 5), || true).await;
+        assert!(matches!(placed, Ok(Some(_))));
+        assert_eq!(session.get_pending_ops_metadata().len(), 1);
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+    }
+
+    #[tokio::test]
+    async fn an_op_a_rescan_took_first_is_left_to_the_rescan() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        // The rescan ran with the op pending, took it and resends it.
+        let taken = std::sync::Mutex::new(None);
+        let placed = submit_write(&session, &object_in_pg(8, 5), || {
+            *taken.lock().unwrap() = session.remove_pending_op(77);
+            false
+        })
+        .await;
+        let mut rx = placed.expect("submitted").expect("its reply still comes");
+        assert!(sends.try_recv().is_err(), "nothing sent here");
+        let taken = taken.into_inner().unwrap().expect("the rescan had it");
+        let _ = taken
+            .result_tx
+            .send(Ok(pgnls_reply(0, crate::HObject::empty_cursor(2), "")));
+        assert!(matches!(rx.try_recv(), Ok(Ok(_))), "the resend answers it");
+    }
+
+    #[tokio::test]
+    async fn a_write_a_rescan_resent_in_the_submit_window_goes_out_once() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        // With the write pending and its map unchecked, the pool splits on
+        // the same OSD and the rescan resends the write through the same
+        // session, as collect_resend_ops and insert_migrated_op do.
+        let publisher = Arc::clone(&client);
+        let rescan = Arc::clone(&session);
+        let mut fired = false;
+        *client.in_submit_window.lock().unwrap() = Some(Box::new(move || {
+            if std::mem::replace(&mut fired, true) {
+                return;
+            }
+            publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+            let (tid, ..) = rescan.get_pending_ops_metadata()[0];
+            let op = rescan.remove_pending_op(tid).expect("pending");
+            futures::executor::block_on(rescan.insert_migrated_op(op, 11)).expect("resent");
+        }));
+        let write = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .write_full(2, &object_in_pg(16, 13).oid, Bytes::from_static(b"x"))
+                    .await
+            })
+        };
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("the rescan's send")
+            .expect("sends open");
+        let again = tokio::time::timeout(std::time::Duration::from_millis(300), sends.recv()).await;
+        assert!(
+            again.is_err(),
+            "tid {} sent again as tid {:?}",
+            first.tid(),
+            again.ok().flatten().map(|m| m.tid())
+        );
+        let sent = session
+            .remove_pending_op(first.tid())
+            .expect("the op sent is pending");
+        assert_eq!(sent.op.osdmap_epoch, 11);
+        let _ = sent.result_tx.send(Ok(crate::osdclient::types::OpResult {
+            result: 0,
+            version: 1,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+            redirect: None,
+        }));
+        write.await.expect("ran").expect("written");
+    }
+
+    /// Lift a backoff on every object of `object`'s PG at epoch 10 with 8
+    /// PGs, as an OSD's UNBLOCK does, from inside a synchronous hook.
+    fn unblock_pg_of(session: &crate::osdclient::session::OSDSession, object: &ObjectId) {
+        let (_, spg, _) = OSDClient::object_to_osds_in_map(&one_osd_map(8, 10), object).unwrap();
+        let begin = crate::HObject::empty_cursor(2);
+        let mut end = crate::HObject::empty_cursor(2);
+        end.max = true;
+        futures::executor::block_on(session.resend_ops_in_range(&spg, &begin, &end));
+    }
+
+    #[tokio::test]
+    async fn an_unblock_does_not_send_an_op_its_submitter_has_not_checked() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let object = object_in_pg(8, 5);
+
+        // The UNBLOCK lands with the op pending and its map unchecked;
+        // the check then takes it back to place it again under a new tid.
+        let sent_in_window = std::cell::Cell::new(None);
+        let placed = submit_write(&session, &object, || {
+            unblock_pg_of(&session, &object);
+            sent_in_window.set(Some(sends.try_recv().is_ok()));
+            false
+        })
+        .await;
+        assert_eq!(
+            sent_in_window.get(),
+            Some(false),
+            "nothing before the check"
+        );
+        assert!(matches!(placed, Ok(None)), "taken back");
+        assert!(sends.try_recv().is_err(), "tid 77 never went out");
+
+        // With the map unchanged, only the submitter's frame goes out.
+        let placed = submit_write(&session, &object, || {
+            unblock_pg_of(&session, &object);
+            sent_in_window.set(Some(sends.try_recv().is_ok()));
+            true
+        })
+        .await;
+        assert_eq!(sent_in_window.get(), Some(false));
+        assert!(matches!(placed, Ok(Some(_))));
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+        assert!(sends.try_recv().is_err(), "sent once");
+
+        // Once submitted, an UNBLOCK re-sends it.
+        unblock_pg_of(&session, &object);
+        assert_eq!(sends.try_recv().expect("re-sent").tid(), 77);
+    }
+
+    #[tokio::test]
+    async fn an_op_a_rescan_resent_on_its_session_is_not_taken_back() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        // The rescan took the op and resent it through the same session.
+        let placed = submit_write(&session, &object_in_pg(8, 5), || {
+            let op = session.remove_pending_op(77).expect("pending");
+            futures::executor::block_on(session.insert_migrated_op(op, 11)).expect("resent");
+            false
+        })
+        .await;
+        assert!(matches!(placed, Ok(Some(_))), "its reply still comes");
+        let frame = sends.try_recv().expect("the rescan's send");
+        assert_eq!(frame.tid(), 77);
+        assert!(sends.try_recv().is_err(), "nothing sent here");
+        assert_eq!(session.get_pending_ops_metadata().len(), 1, "left pending");
+    }
+
+    #[tokio::test]
+    async fn an_op_is_placed_again_when_a_map_lands_before_it_is_pending() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        // PG 5 of 8, and PG 13 once it splits to 16.
+        let object = object_in_pg(16, 13);
+        // The pool splits after the op is placed and before it is
+        // pending: the rescan of epoch 11 finds nothing to resend.
+        let publisher = Arc::clone(&client);
+        let mut published = false;
+        *client.before_submit.lock().unwrap() = Some(Box::new(move || {
+            if !std::mem::replace(&mut published, true) {
+                publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+            }
+        }));
+        let write = {
+            let client = Arc::clone(&client);
+            let object = object.clone();
+            tokio::spawn(async move {
+                client
+                    .write_full(2, &object.oid, Bytes::from_static(b"x"))
+                    .await
+            })
+        };
+
+        let sent = next_send(&session, &mut sends).await;
+        assert_eq!(sent.op.osdmap_epoch, 11, "placed again in the new map");
+        assert_eq!(sent.op.pgid.seed, 13);
+        assert_eq!(sent.target.pg_num, 16);
+        assert!(
+            sends.try_recv().is_err(),
+            "the first placement never went out"
+        );
+        assert!(session.get_pending_ops_metadata().is_empty());
+        let _ = sent.result_tx.send(Ok(crate::osdclient::types::OpResult {
+            result: 0,
+            version: 1,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+            redirect: None,
+        }));
+        write.await.expect("ran").expect("written");
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_taken_back_is_cancelled_not_placed_again() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        let object = object_in_pg(16, 13);
+        let publisher = Arc::clone(&client);
+        *client.before_submit.lock().unwrap() = Some(Box::new(move || {
+            publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+        }));
+
+        for kind in [super::SubmitKind::Linger, super::SubmitKind::Ping] {
+            let (_, _, osdmap, rx, _) = client
+                .submit_once_in_map(
+                    &object,
+                    vec![crate::osdclient::types::OSDOp::watch_ping(1, 1)],
+                    crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                    crate::osdclient::types::OsdOpFlags::READ,
+                    kind,
+                )
+                .await
+                .expect("routed");
+            assert_eq!(osdmap.epoch.as_u32(), 10, "not placed again");
+            assert!(
+                matches!(rx.await, Ok(Err(OSDClientError::Cancelled))),
+                "no answer"
+            );
+            assert!(sends.try_recv().is_err(), "never sent");
+            assert!(session.get_pending_ops_metadata().is_empty());
+            client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        }
     }
 
     #[test]
