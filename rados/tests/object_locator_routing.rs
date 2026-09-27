@@ -3,8 +3,9 @@
 //! monitor and the C++ `rados` CLI. Run with:
 //!   CEPH_CONF=... cargo test -p rados --test object_locator_routing -- --ignored --nocapture
 //!
-//! `CEPH_EXEC` is the command prefix that runs the v19.2.2 `ceph` and
-//! `rados` binaries (default `docker exec -i ceph-mon`).
+//! `CEPH_EXEC` is the command prefix that runs the cluster's `ceph` and
+//! `rados` binaries (default `docker exec -i ceph-mon`); see `common` for a
+//! rooket cluster's.
 
 mod common;
 
