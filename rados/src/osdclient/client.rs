@@ -149,7 +149,20 @@ pub struct OSDClient {
     next_cookie: AtomicU64,
     /// Cleared by `set_watch_pings_enabled(false)`.
     watch_pings_enabled: AtomicBool,
+    /// Stands in for a linger send's submit, which needs a session.
+    #[cfg(test)]
+    fake_linger_submit: std::sync::Mutex<Option<FakeLingerSubmit>>,
 }
+
+#[cfg(test)]
+type FakeLingerSubmit = Box<
+    dyn FnMut() -> (
+            i32,
+            u64,
+            Arc<crate::osdclient::osdmap::OSDMap>,
+            tokio::sync::oneshot::Receiver<Result<crate::osdclient::types::OpResult>>,
+        ) + Send,
+>;
 
 /// Where an object lives: the hobject hash its MOSDOp carries, and the
 /// pool's PG that contains that hash.
@@ -169,6 +182,8 @@ struct PreparedOp {
     msg: Arc<MOSDOp>,
     osdmap: Arc<crate::osdclient::osdmap::OSDMap>,
     class: OpClass,
+    /// [`crate::osdclient::session::PendingOp::should_resend`].
+    should_resend: bool,
 }
 
 /// What decides which pause and full flags hold an op back.
@@ -207,15 +222,17 @@ enum SubmitKind {
     Op,
     /// A linger send (registration, reconnect, notify): unthrottled, as
     /// Objecter pre-budgets linger sends, and held by the pause flags as
-    /// an ordinary op is.
+    /// an ordinary op is. Never re-sent: the linger layer sends anew.
     Linger,
-    /// A watch ping: unthrottled and held by nothing ([`OpClass::ping`]).
+    /// A watch ping: unthrottled and held by nothing ([`OpClass::ping`]),
+    /// and never re-sent.
     Ping,
 }
 
 /// One send by `route_and_submit`.
 struct Submitted {
     osd: i32,
+    tid: u64,
     /// The map the op was routed in; its epoch is the op's.
     osdmap: Arc<crate::osdclient::osdmap::OSDMap>,
     rx: Result<tokio::sync::oneshot::Receiver<Result<crate::osdclient::types::OpResult>>>,
@@ -430,6 +447,8 @@ impl OSDClient {
                 lingers: dashmap::DashMap::new(),
                 next_cookie: AtomicU64::new(1001),
                 watch_pings_enabled: AtomicBool::new(true),
+                #[cfg(test)]
+                fake_linger_submit: std::sync::Mutex::new(None),
             }
         });
 
@@ -666,26 +685,24 @@ impl OSDClient {
         name: &str,
         seq: u64,
     ) -> Result<crate::osdclient::types::OpResult> {
+        self.cancel_previous_send(linger, seq).await;
         if let Ok(osdmap) = self.get_osdmap().await {
             self.record_target(linger, &osdmap, None);
         }
         let outcome = async {
-            let (osd, osdmap, rx, _permit) = self
-                .submit_once_in_map(
-                    &linger.object,
-                    vec![op],
-                    crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
-                    OsdOpFlags::READ,
-                    SubmitKind::Linger,
-                )
-                .await
-                .map_err(|e| match e {
-                    // Held by a pause until the deadline: never sent.
-                    OSDClientError::Timeout(_) => {
-                        OSDClientError::Connection(format!("not sent: {e}"))
-                    }
-                    e => e,
-                })?;
+            let (osd, tid, osdmap, rx, _permit) = self.submit_linger(linger, op).await?;
+            let superseded = {
+                let mut state = linger.lock_state();
+                if state.send_seq == seq {
+                    state.in_flight = Some((osd, tid));
+                }
+                state.send_seq != seq
+            };
+            if superseded {
+                // A later send began while this one was being routed and
+                // found nothing to cancel.
+                self.cancel_linger_send(osd, tid).await;
+            }
             self.record_target(linger, &osdmap, Some(osd));
             if matches!(linger.kind, LingerKind::Notify { .. }) {
                 // Only a send a session took restarts the notify's bound;
@@ -702,9 +719,85 @@ impl OSDClient {
             if state.send_seq == seq {
                 state.sending = false;
                 state.resend_pending = outcome.as_ref().is_err_and(is_no_answer);
+                state.in_flight = None;
             }
         }
         outcome
+    }
+
+    /// Submit one send of `linger` with [`Self::submit_once_in_map`].
+    async fn submit_linger(
+        &self,
+        linger: &Linger,
+        op: OSDOp,
+    ) -> Result<(
+        i32,
+        u64,
+        Arc<crate::osdclient::osdmap::OSDMap>,
+        tokio::sync::oneshot::Receiver<Result<crate::osdclient::types::OpResult>>,
+        Option<crate::osdclient::throttle::ThrottlePermit<'_>>,
+    )> {
+        #[cfg(test)]
+        if let Some(submit) = self
+            .fake_linger_submit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            let (osd, tid, osdmap, rx) = submit();
+            return Ok((osd, tid, osdmap, rx, None));
+        }
+        self.submit_once_in_map(
+            &linger.object,
+            vec![op],
+            crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+            OsdOpFlags::READ,
+            SubmitKind::Linger,
+        )
+        .await
+        .map_err(|e| match e {
+            // Held by a pause until the deadline: never sent.
+            OSDClientError::Timeout(_) => OSDClientError::Connection(format!("not sent: {e}")),
+            e => e,
+        })
+    }
+
+    /// Cancel the send before `seq` of `linger` if it is still pending, as
+    /// `_send_linger` cancels the op at `register_tid` before it sends
+    /// anew (v19.2.2:src/osdc/Objecter.cc:586-594): its reply would be
+    /// ignored, and a rescan must not send it again.
+    async fn cancel_previous_send(&self, linger: &Linger, seq: u64) {
+        let previous = {
+            let mut state = linger.lock_state();
+            if state.send_seq == seq {
+                state.in_flight.take()
+            } else {
+                None
+            }
+        };
+        if let Some((osd, tid)) = previous {
+            self.cancel_linger_send(osd, tid).await;
+        }
+    }
+
+    /// Cancel linger send `tid` on `osd`'s session if it is still pending.
+    async fn cancel_linger_send(&self, osd: i32, tid: u64) {
+        let session = self.sessions.read().await.get(&osd).cloned();
+        if let Some(session) = session
+            && let Some(op) = session.remove_pending_op(tid)
+        {
+            self.cancel_pending_op(osd, op).await;
+        }
+    }
+
+    /// End `op`, already removed from `osd`'s session, with `Cancelled`:
+    /// Objecter's `_cancel_linger_op` (v19.2.2:src/osdc/Objecter.cc:
+    /// 3157-3167). It clears the op's callback instead; here its sender
+    /// takes `Cancelled` as no answer, and a superseded sender ignores it.
+    async fn cancel_pending_op(&self, osd: i32, op: crate::osdclient::session::PendingOp) {
+        debug!("cancelling linger op tid={} on OSD {}", op.tid, osd);
+        self.tracker.untrack(op.tid, osd).await;
+        let _ = op.result_tx.send(Err(OSDClientError::Cancelled));
     }
 
     /// Register a watch on `object` (`timeout` in seconds, 0 for the OSD's
@@ -1037,7 +1130,7 @@ impl OSDClient {
     }
 
     async fn send_ping(&self, linger: &Linger, generation: u32) -> Result<()> {
-        let (_, _, rx, _) = self
+        let (_, _, _, rx, _) = self
             .submit_once_in_map(
                 &linger.object,
                 vec![OSDOp::watch_ping(linger.cookie, generation)],
@@ -1787,6 +1880,7 @@ impl OSDClient {
                 respects_full,
                 ping: false,
             },
+            should_resend: true,
         })
     }
 
@@ -1923,9 +2017,12 @@ impl OSDClient {
                 .pools
                 .get(&msg.object.pool)
                 .map_or(0, |p| p.pg_num);
-            let rx = session.submit_op(Arc::clone(msg), priority, pg_num).await;
+            let rx = session
+                .submit_op(Arc::clone(msg), priority, pg_num, op.should_resend)
+                .await;
             return Ok(Submitted {
                 osd: primary_osd,
+                tid,
                 osdmap: final_map,
                 rx,
             });
@@ -1951,16 +2048,16 @@ impl OSDClient {
         tokio::sync::oneshot::Receiver<Result<crate::osdclient::types::OpResult>>,
         crate::osdclient::throttle::ThrottlePermit<'_>,
     )> {
-        let (osd, osdmap, rx, permit) = self
+        let (osd, _, osdmap, rx, permit) = self
             .submit_once_in_map(object, ops, priority, extra_flags, SubmitKind::Op)
             .await?;
         let permit = permit.ok_or_else(|| OSDClientError::Internal("op not budgeted".into()))?;
         Ok((osd, osdmap.epoch.as_u32(), rx, permit))
     }
 
-    /// [`Self::submit_once`], returning the map the op was routed in; a
-    /// [`SubmitKind::Linger`] or [`SubmitKind::Ping`] op takes no throttle
-    /// permit.
+    /// [`Self::submit_once`], returning the op's tid and the map it was
+    /// routed in; a [`SubmitKind::Linger`] or [`SubmitKind::Ping`] op
+    /// takes no throttle permit and is never re-sent.
     async fn submit_once_in_map(
         &self,
         object: &ObjectId,
@@ -1970,6 +2067,7 @@ impl OSDClient {
         kind: SubmitKind,
     ) -> Result<(
         i32,
+        u64,
         Arc<crate::osdclient::osdmap::OSDMap>,
         tokio::sync::oneshot::Receiver<Result<crate::osdclient::types::OpResult>>,
         Option<crate::osdclient::throttle::ThrottlePermit<'_>>,
@@ -1982,10 +2080,17 @@ impl OSDClient {
         let deadline = std::time::Instant::now() + effective_timeout;
         let mut op = self.prepare_op(object.clone(), ops, extra_flags).await?;
         op.class.ping = kind == SubmitKind::Ping;
+        op.should_resend = kind == SubmitKind::Op;
         let submitted = self
             .route_and_submit(&mut op, priority, deadline, effective_timeout)
             .await?;
-        Ok((submitted.osd, submitted.osdmap, submitted.rx?, permit))
+        Ok((
+            submitted.osd,
+            submitted.tid,
+            submitted.osdmap,
+            submitted.rx?,
+            permit,
+        ))
     }
 
     /// The throttle permit `ops` need, or none for a linger op.
@@ -2321,6 +2426,7 @@ impl OSDClient {
                 Arc::new(msg),
                 crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
                 pool_info.pg_num,
+                true,
             )
             .await?;
 
@@ -2818,7 +2924,7 @@ impl OSDClient {
 
             // Scan path: only resend if primary changed or pool forced a resend.
             // Drain path (current_osd == None): always resend.
-            let should_resend = match current_osd {
+            let needs_resend = match current_osd {
                 None => true,
                 Some(osd_id) => {
                     // Mirrors Objecter::_calc_target step 4: if last_force_op_resend is in
@@ -2837,7 +2943,15 @@ impl OSDClient {
                 }
             };
 
-            if should_resend && let Some(mut op) = session.remove_pending_op(tid) {
+            if needs_resend && let Some(mut op) = session.remove_pending_op(tid) {
+                // A linger send is cancelled, not re-sent, as handle_osd_map
+                // does (v19.2.2:src/osdc/Objecter.cc:1343-1350): the linger
+                // rescan sends a fresh op for it, and a NOTIFY, a read, is
+                // not deduplicated by its reqid.
+                if !op.should_resend {
+                    self.cancel_pending_op(session.osd_id, op).await;
+                    continue;
+                }
                 // Scan path only: cancel the io_loop so any message already
                 // encoded for this tid is dropped before reaching the wire.
                 // See `cancel_io_loop`'s doc comment for the full rationale.
@@ -3089,6 +3203,13 @@ impl OSDClient {
                 let _ = pending_op
                     .result_tx
                     .send(Err(OSDClientError::PoolNotFound(pool_id)));
+                continue;
+            }
+
+            // As _kick_requests does (v19.2.2:src/osdc/Objecter.cc:
+            // 2087-2092): the reset hook re-sends the linger itself.
+            if !pending_op.should_resend {
+                self.cancel_pending_op(old_session.osd_id, pending_op).await;
                 continue;
             }
 
@@ -3978,10 +4099,12 @@ mod tests {
     }
 
     /// A session to OSD 0 holding a write to `object`, placed and sent at
-    /// epoch 10 when its pool had `pg_num` PGs, with tid 77.
+    /// epoch 10 when its pool had `pg_num` PGs, with tid 77, re-sent on a
+    /// map change or reset if `should_resend`.
     fn session_with_op(
         object: &ObjectId,
         pg_num: u32,
+        should_resend: bool,
     ) -> (
         crate::osdclient::session::OSDSession,
         tokio::sync::oneshot::Receiver<super::Result<crate::osdclient::types::OpResult>>,
@@ -4008,7 +4131,7 @@ mod tests {
         op.pgid = spg;
         op.osdmap_epoch = 10;
         op.reqid = crate::osdclient::types::RequestId::new(&"client.test".into(), 77, 0);
-        let rx = session.insert_pending_for_test(Arc::new(op), pg_num);
+        let rx = session.insert_pending_for_test(Arc::new(op), pg_num, should_resend);
         (session, rx)
     }
 
@@ -4021,7 +4144,7 @@ mod tests {
         new_pg_num: u32,
     ) -> Vec<(i32, crate::osdclient::session::PendingOp)> {
         let client = offline_client().await;
-        let (session, _rx) = session_with_op(object, old_pg_num);
+        let (session, _rx) = session_with_op(object, old_pg_num, true);
         let map = one_osd_map(new_pg_num, 11);
         let mut need_resend = Vec::new();
         client
@@ -4063,6 +4186,115 @@ mod tests {
         assert!(rescan(&object_in_pg(8, 5), 8, 8).await.is_empty());
         // An op that recorded no pg_num is never judged split.
         assert!(rescan(&object_in_pg(8, 5), 0, 16).await.is_empty());
+    }
+
+    /// Rescan one op to `object` sent with 8 PGs, pending on a session
+    /// the scan path takes to be `session_osd`'s, against a map with
+    /// `new_pg_num` PGs whose primary is OSD 0. Returns what was collected,
+    /// whether the op is still pending, and what its sender got.
+    async fn rescan_one(
+        object: &ObjectId,
+        should_resend: bool,
+        session_osd: i32,
+        new_pg_num: u32,
+    ) -> (
+        Vec<(i32, crate::osdclient::session::PendingOp)>,
+        bool,
+        Option<super::Result<crate::osdclient::types::OpResult>>,
+    ) {
+        let client = offline_client().await;
+        let (session, mut rx) = session_with_op(object, 8, should_resend);
+        let map = one_osd_map(new_pg_num, 11);
+        let mut need_resend = Vec::new();
+        client
+            .collect_resend_ops(&session, &map, 11, Some(session_osd), &mut need_resend)
+            .await
+            .expect("placed");
+        let pending = session.get_pending_ops_metadata().len() == 1;
+        (need_resend, pending, rx.try_recv().ok())
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_is_cancelled_not_resent_on_a_split() {
+        let (resent, pending, answer) = rescan_one(&object_in_pg(8, 5), false, 0, 16).await;
+        assert!(resent.is_empty(), "not collected");
+        assert!(!pending, "removed");
+        assert!(matches!(answer, Some(Err(OSDClientError::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_is_cancelled_not_resent_on_a_primary_change() {
+        // The session is OSD 1's; the map's primary is OSD 0.
+        let (resent, pending, answer) = rescan_one(&object_in_pg(8, 5), false, 1, 8).await;
+        assert!(resent.is_empty(), "not collected");
+        assert!(!pending, "removed");
+        assert!(matches!(answer, Some(Err(OSDClientError::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_op_is_still_resent_on_a_primary_change() {
+        let (resent, pending, answer) = rescan_one(&object_in_pg(8, 5), true, 1, 8).await;
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].0, 0, "to the new primary");
+        assert!(!pending && answer.is_none());
+        let (resent, _, answer) = rescan_one(&object_in_pg(8, 5), true, 0, 16).await;
+        assert_eq!(resent.len(), 1, "a split resends");
+        assert!(answer.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_is_cancelled_when_its_session_drains() {
+        let client = offline_client().await;
+        let object = object_in_pg(8, 5);
+        let (session, mut rx) = session_with_op(&object, 8, false);
+        let mut need_resend = Vec::new();
+        let _ = client
+            .collect_resend_ops(&session, &one_osd_map(8, 11), 11, None, &mut need_resend)
+            .await;
+        assert!(need_resend.is_empty());
+        assert!(session.get_pending_ops_metadata().is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Err(OSDClientError::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn a_kick_drops_a_linger_send() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 11))).ok();
+        let object = object_in_pg(8, 5);
+        let (old, mut rx) = session_with_op(&object, 8, false);
+        let (new, _) = session_with_op(&object_in_pg(8, 3), 8, true);
+        new.remove_pending_op(77).expect("emptied");
+        let new = Arc::new(new);
+        client.kick_into_session(&old, &new).await;
+        assert!(old.get_pending_ops_metadata().is_empty());
+        assert!(new.get_pending_ops_metadata().is_empty(), "not moved");
+        assert!(matches!(rx.try_recv(), Ok(Err(OSDClientError::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_cancels_the_one_before_it() {
+        let client = offline_client().await;
+        let object = object_in_pg(8, 5);
+        let (session, mut rx) = session_with_op(&object, 8, false);
+        client.sessions.write().await.insert(0, Arc::new(session));
+        let (watch, _events) = test_watch(&client, 1001, true);
+
+        // The first send went out as tid 77 to OSD 0.
+        let first = watch.begin_send();
+        watch.lock_state().in_flight = Some((0, 77));
+        // A send that is not the latest cancels nothing.
+        watch.lock_state().send_seq += 1;
+        client.cancel_previous_send(&watch, first).await;
+        assert!(rx.try_recv().is_err(), "still pending");
+        watch.lock_state().send_seq -= 1;
+
+        // The next send, a reconnect here, cancels it before it goes out.
+        Arc::clone(&client).send_reconnect(Arc::clone(&watch)).await;
+        assert_eq!(watch.lock_state().send_seq, first + 1, "it was sent");
+        let session = Arc::clone(&client.sessions.read().await[&0]);
+        assert!(session.get_pending_ops_metadata().is_empty(), "removed");
+        assert!(matches!(rx.try_recv(), Ok(Err(OSDClientError::Cancelled))));
+        assert_eq!(watch.lock_state().in_flight, None);
     }
 
     #[test]
@@ -4541,6 +4773,119 @@ mod tests {
             .await
             .expect_err("dropped");
         assert!(matches!(err, OSDClientError::Cancelled), "{err:?}");
+    }
+
+    /// Stand in for a linger send's submit on `client`: tid 77 goes to a
+    /// session to OSD 0, and before the submit returns, `later` begins
+    /// the next send of its linger. Returns the session, and the deadline
+    /// at which the Tracker would time tid 77 out.
+    async fn fake_linger_submit(
+        client: &Arc<OSDClient>,
+        later: Option<Arc<crate::osdclient::watch::Linger>>,
+    ) -> (
+        Arc<crate::osdclient::session::OSDSession>,
+        tokio::time::Instant,
+    ) {
+        let (session, rx) = session_with_op(&ObjectId::new(2, "o"), 8, false);
+        let session = Arc::new(session);
+        client
+            .sessions
+            .write()
+            .await
+            .insert(0, Arc::clone(&session));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        client.tracker.track(77, 0, deadline).await;
+        let mut rx = Some(rx);
+        *client.fake_linger_submit.lock().unwrap() = Some(Box::new(move || {
+            if let Some(later) = &later {
+                later.begin_send();
+            }
+            let map = Arc::new(crate::osdclient::osdmap::OSDMap::new());
+            (0, 77, map, rx.take().expect("one submit"))
+        }));
+        (session, deadline)
+    }
+
+    /// Whether the Tracker still times tid 77 on OSD 0 out at `deadline`:
+    /// a stand-in op with that tid, past the deadline, is still pending.
+    async fn tid_77_untracked(client: &Arc<OSDClient>, deadline: tokio::time::Instant) -> bool {
+        let (probe, mut rx) = session_with_op(&ObjectId::new(2, "o"), 8, false);
+        let probe = Arc::new(probe);
+        client.sessions.write().await.insert(0, Arc::clone(&probe));
+        tokio::time::sleep_until(deadline + std::time::Duration::from_millis(200)).await;
+        rx.try_recv().is_err() && probe.remove_pending_op(77).is_some()
+    }
+
+    #[tokio::test]
+    async fn a_send_a_later_one_superseded_cancels_itself() {
+        use crate::osdclient::types::{OSDOp, WatchOp};
+
+        let client = offline_client().await;
+        let (linger, _events) = test_watch(&client, 1002, false);
+        let (session, deadline) = fake_linger_submit(&client, Some(Arc::clone(&linger))).await;
+        let seq = linger.begin_send();
+        let outcome = client
+            .send_linger_op(&linger, OSDOp::watch(1002, WatchOp::Watch, 0), "watch", seq)
+            .await;
+        assert!(
+            matches!(outcome, Err(OSDClientError::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(
+            session.remove_pending_op(77).is_none(),
+            "it cancelled its own tid"
+        );
+        {
+            let state = linger.lock_state();
+            assert_eq!(state.send_seq, seq + 1);
+            assert!(state.sending, "the later send's state is left alone");
+            assert!(!state.resend_pending);
+            assert_eq!(state.in_flight, None);
+        }
+        assert!(tid_77_untracked(&client, deadline).await);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_current_send_is_left_for_a_resend() {
+        use crate::osdclient::types::{OSDOp, WatchOp};
+
+        let client = offline_client().await;
+        let (linger, _events) = test_watch(&client, 1002, false);
+        let (session, deadline) = fake_linger_submit(&client, None).await;
+        let seq = linger.begin_send();
+        let send = {
+            let client = Arc::clone(&client);
+            let linger = Arc::clone(&linger);
+            tokio::spawn(async move {
+                let op = OSDOp::watch(1002, WatchOp::Watch, 0);
+                client.send_linger_op(&linger, op, "watch", seq).await
+            })
+        };
+        for _ in 0..200 {
+            if linger.lock_state().in_flight.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(linger.lock_state().in_flight, Some((0, 77)));
+
+        // As a rescan cancels a pending linger send it would resend.
+        client.cancel_linger_send(0, 77).await;
+        let outcome = send.await.expect("the send ended");
+        assert!(
+            matches!(outcome, Err(OSDClientError::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(session.remove_pending_op(77).is_none());
+        {
+            let state = linger.lock_state();
+            assert!(state.resend_pending && !state.sending);
+            assert_eq!(state.in_flight, None);
+        }
+        assert!(
+            tid_77_untracked(&client, deadline).await,
+            "the cancel untracked it"
+        );
     }
 
     #[tokio::test]
