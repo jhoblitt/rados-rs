@@ -1,5 +1,6 @@
 //! Ceph configuration file parser and accessor.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -50,11 +51,7 @@ impl CephConfig {
             }
 
             if let Some(eq_pos) = line.find('=') {
-                // Mirrors C++ ConfUtils::normalize_key_name(): whitespace → underscore.
-                let key = line[..eq_pos]
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join("_");
+                let key = normalize_key_name(&line[..eq_pos]).into_owned();
                 // C++ only treats ';' or '#' as a comment start when preceded
                 // by whitespace (so paths like /foo#bar are safe).
                 let raw_value = &line[eq_pos + 1..];
@@ -77,11 +74,13 @@ impl CephConfig {
         Ok(Self { sections })
     }
 
-    /// Get a configuration value from a specific section.
+    /// Get a configuration value from a specific section. `key` is
+    /// normalized as the parser normalizes the file's keys, so `mon host`
+    /// and `mon_host` find the same option.
     pub fn get(&self, section: &str, key: &str) -> Option<&str> {
         self.sections
             .get(section)
-            .and_then(|s| s.get(key))
+            .and_then(|s| s.get(&*normalize_key_name(key)))
             .map(|v| v.as_str())
     }
 
@@ -256,6 +255,16 @@ impl CephConfig {
     }
 }
 
+/// Normalize an option name as C++ `ConfFile::normalize_key_name()` does:
+/// trim it and turn each run of whitespace inside it into one underscore.
+fn normalize_key_name(key: &str) -> Cow<'_, str> {
+    if key.contains(char::is_whitespace) {
+        Cow::Owned(key.split_whitespace().collect::<Vec<_>>().join("_"))
+    } else {
+        Cow::Borrowed(key)
+    }
+}
+
 /// Parse comma-separated auth method names into method constants.
 ///
 /// Recognizes "cephx", "none", and "gss". Unknown names are silently skipped.
@@ -387,6 +396,29 @@ mon_dns_srv_name = ceph-mon_example.com
         assert!(sections.contains(&"global"));
         assert!(sections.contains(&"client"));
         assert!(sections.contains(&"mon"));
+    }
+
+    #[test]
+    fn test_lookup_key_is_normalized() {
+        let config = CephConfig::parse(
+            r#"
+[global]
+mon host = v2:10.0.0.1:3300
+auth_client_required = none
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.get("global", "mon_host"), Some("v2:10.0.0.1:3300"));
+        assert_eq!(config.get("global", "mon host"), Some("v2:10.0.0.1:3300"));
+        assert_eq!(
+            config.get("global", " auth  client\trequired "),
+            Some("none")
+        );
+        assert_eq!(
+            config.get_for("client.admin", "auth client required"),
+            Some("none")
+        );
     }
 
     #[test]
