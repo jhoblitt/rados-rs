@@ -138,6 +138,18 @@ pub struct OSDClient {
     watch_pings_enabled: AtomicBool,
 }
 
+/// Where an object lives: the hobject hash its MOSDOp carries, and the
+/// pool's PG that contains that hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    hash: u32,
+    pg: crate::crush::placement::PgId,
+}
+
+/// Where an op goes: its hobject hash, its PG's `spg_t`, and that PG's
+/// acting OSDs.
+type OpRoute = (u32, StripedPgId, Vec<i32>);
+
 /// An `MOSDOp` built by `prepare_op`, carried across `route_and_submit`
 /// calls with the map it was last routed against.
 struct PreparedOp {
@@ -577,7 +589,7 @@ impl OSDClient {
     /// The current primary OSD of `object`.
     pub(crate) async fn primary_osd(&self, object: &ObjectId) -> Result<i32> {
         let osdmap = self.get_osdmap().await?;
-        let (_, osds) = self.object_to_osds_in_map(&osdmap, object.pool, &object.oid)?;
+        let (_, _, osds) = Self::object_to_osds_in_map(&osdmap, object)?;
         Ok(osds[0])
     }
 
@@ -592,7 +604,7 @@ impl OSDClient {
             .pools
             .get(&object.pool)
             .ok_or(OSDClientError::PoolNotFound(object.pool))?;
-        let pg = Self::object_pg_in_map(osdmap, object.pool, &object.oid)?;
+        let pg = Self::object_pg_in_map(osdmap, object)?.pg;
         let ua = osdmap
             .pg_to_up_acting(&pg)
             .map_err(|e| OSDClientError::Crush(format!("PG->OSD mapping failed: {e}")))?;
@@ -1298,37 +1310,49 @@ impl OSDClient {
             })
     }
 
-    /// The PG an object maps to: every op and every linger's interval is
-    /// placed through here.
+    /// Where `object` lives in `osdmap`, as Ceph's `Objecter::_calc_target`
+    /// computes it (`src/osdc/Objecter.cc:2842-2863`): the raw PG from
+    /// `object_locator_to_pg`, reduced by the pool's `raw_pg_to_pg`.
+    ///
+    /// This is the only way the client places an object: every op, every
+    /// re-placement and every linger's interval comes through here.
     fn object_pg_in_map(
         osdmap: &crate::osdclient::osdmap::OSDMap,
-        pool: u64,
-        oid: &str,
-    ) -> Result<crate::crush::placement::PgId> {
+        object: &ObjectId,
+    ) -> Result<Placement> {
         let pool_info = osdmap
             .pools
-            .get(&pool)
-            .ok_or(OSDClientError::PoolNotFound(pool))?;
-        let locator = ObjectLocator::new(pool);
-        crate::crush::placement::object_to_pg(oid, &locator, pool_info.pg_num)
-            .map_err(|e| OSDClientError::Crush(format!("Object->PG mapping failed: {e}")))
+            .get(&object.pool)
+            .ok_or(OSDClientError::PoolNotFound(object.pool))?;
+        let raw = osdmap
+            .object_locator_to_pg(&object.oid, &ObjectLocator::from(object))
+            .map_err(|e| OSDClientError::Crush(format!("Object->PG mapping failed: {e}")))?;
+        Ok(Placement {
+            hash: raw.seed,
+            pg: pool_info.raw_pg_to_pg(raw),
+        })
     }
 
+    /// `object`'s hobject hash, its PG and the PG's acting OSDs.
     fn object_to_osds_in_map(
-        &self,
         osdmap: &crate::osdclient::osdmap::OSDMap,
-        pool: u64,
-        oid: &str,
-    ) -> Result<(StripedPgId, Vec<i32>)> {
+        object: &ObjectId,
+    ) -> Result<OpRoute> {
+        let placement = Self::object_pg_in_map(osdmap, object)?;
+        let (spg, osds) = Self::pg_to_spg_in_map(osdmap, placement.pg)?;
         debug!(
-            "OSD weights from map (max_osd={}): {:?}",
-            osdmap.max_osd, osdmap.osd_weight
+            "Mapped {}/{}/{} (key {:?}) to PG {spg:?}, OSDs: {osds:?}",
+            object.pool, object.namespace, object.oid, object.key
         );
+        Ok((placement.hash, spg, osds))
+    }
 
-        let pg = Self::object_pg_in_map(osdmap, pool, oid)?;
-
+    /// A PG's wire `spg_t` and its acting OSDs.
+    fn pg_to_spg_in_map(
+        osdmap: &crate::osdclient::osdmap::OSDMap,
+        pg: crate::crush::placement::PgId,
+    ) -> Result<(StripedPgId, Vec<i32>)> {
         let osds = Self::pg_to_osds_in_map(osdmap, pg)?;
-
         // For EC pools the wire spg_t carries a per-PG shard index.  For
         // replicated pools `pg_to_spg_shard` returns NO_SHARD (-1), so
         // this is correct in both cases.  Optimized EC pools currently
@@ -1336,36 +1360,75 @@ impl OSDClient {
         let shard = osdmap
             .pg_to_spg_shard(&pg)
             .map_err(|e| OSDClientError::Crush(format!("EC shard lookup: {e}")))?;
-        let spg = StripedPgId::new(pg.pool, pg.seed, shard.0);
-        debug!(
-            "Mapped {}/{} to PG {:?}, OSDs: {:?}, shard: {}",
-            pool, oid, pg, osds, shard.0
-        );
+        Ok((StripedPgId::new(pg.pool, pg.seed, shard.0), osds))
+    }
 
-        Ok((spg, osds))
+    /// Re-place an op already in flight in `osdmap`: its hobject hash,
+    /// PG and acting OSDs.
+    ///
+    /// A PG op (PGNLS) is placed by the listing cursor's hash it carries,
+    /// which is kept as is and never re-derived from the op's empty name;
+    /// any other op is placed by its object's locator.
+    fn replace_pending(osdmap: &crate::osdclient::osdmap::OSDMap, msg: &MOSDOp) -> Result<OpRoute> {
+        if !Self::is_pg_op(msg) {
+            return Self::object_to_osds_in_map(osdmap, &msg.object);
+        }
+        let pool = msg.object.pool;
+        let pool_info = osdmap
+            .pools
+            .get(&pool)
+            .ok_or(OSDClientError::PoolNotFound(pool))?;
+        let pg = Self::cursor_pg(pool_info, pool, msg.object.hash);
+        let (spg, osds) = Self::pg_to_spg_in_map(osdmap, pg)?;
+        Ok((msg.object.hash, spg, osds))
+    }
+
+    /// The PG a PG op whose hobject hash is `hash` goes to in the map
+    /// `pool_info` comes from: each map re-reduces the same cursor hash
+    /// with `ceph_stable_mod`.
+    fn cursor_pg(
+        pool_info: &crate::osdclient::PgPool,
+        pool: u64,
+        hash: u32,
+    ) -> crate::crush::placement::PgId {
+        pool_info.raw_pg_to_pg(crate::crush::placement::PgId::new(pool, hash))
+    }
+
+    fn is_pg_op(msg: &MOSDOp) -> bool {
+        OsdOpFlags::from_bits_truncate(msg.flags).contains(OsdOpFlags::PGOP)
+    }
+
+    /// The input `object`'s hash is computed from: pool, namespace, and
+    /// the locator key, or the name when the key is empty.
+    fn placement_key(object: &ObjectId) -> (u64, String, String) {
+        let key = if object.key.is_empty() {
+            &object.oid
+        } else {
+            &object.key
+        };
+        (object.pool, object.namespace.clone(), key.clone())
     }
 
     fn cached_rescan_osds(
-        &self,
-        cache: &mut HashMap<(u64, String), (StripedPgId, Vec<i32>)>,
+        cache: &mut HashMap<(u64, String, String), OpRoute>,
         osdmap: &crate::osdclient::osdmap::OSDMap,
-        pool_id: u64,
-        object_id: &str,
-    ) -> Result<(StripedPgId, Vec<i32>)> {
-        let key = (pool_id, object_id.to_owned());
+        msg: &MOSDOp,
+    ) -> Result<OpRoute> {
+        if Self::is_pg_op(msg) {
+            return Self::replace_pending(osdmap, msg);
+        }
+        let key = Self::placement_key(&msg.object);
         if let Some(entry) = cache.get(&key) {
             return Ok(entry.clone());
         }
 
-        let entry = self.object_to_osds_in_map(osdmap, pool_id, object_id)?;
+        let entry = Self::replace_pending(osdmap, msg)?;
         cache.insert(key, entry.clone());
         Ok(entry)
     }
 
     /// Map a PG to its acting OSD set, applying CRUSH placement and all overrides.
     /// Returns `NoOSDs` if the acting set is empty.
-    ///
-    /// Shared helper used by both `object_to_osds_in_map` and `query_pg_objects`.
     fn pg_to_osds_in_map(
         osdmap: &crate::osdclient::osdmap::OSDMap,
         pg: crate::crush::placement::PgId,
@@ -1476,7 +1539,7 @@ impl OSDClient {
     /// Returns the OpResult after handling all redirects
     async fn execute_op(
         &self,
-        mut object: ObjectId,
+        object: ObjectId,
         ops: Vec<OSDOp>,
         timeout: Option<std::time::Duration>,
         priority: i32,
@@ -1486,8 +1549,6 @@ impl OSDClient {
         if self.blocklisted.load(Ordering::Relaxed) {
             return Err(OSDClientError::Blocklisted);
         }
-
-        object.calculate_hash();
 
         // Calculate operation budget and acquire throttle permit
         let budget = calc_op_budget(&ops);
@@ -1605,7 +1666,6 @@ impl OSDClient {
                 // pending_op was dropped when the reply arrived, so refcount is 1 here.
                 let m = Arc::make_mut(&mut op.msg);
                 Self::apply_redirect(m, &redirect);
-                m.object.calculate_hash();
                 continue;
             }
 
@@ -1734,8 +1794,7 @@ impl OSDClient {
             }
 
             // Map to OSDs based on current object (using the osdmap we already have)
-            let (spg, osds) =
-                self.object_to_osds_in_map(&op.osdmap, msg.object.pool, &msg.object.oid)?;
+            let (hash, spg, osds) = Self::object_to_osds_in_map(&op.osdmap, &msg.object)?;
             let primary_osd = osds[0];
             tracing::trace!(
                 target: "rados::osdclient::routing",
@@ -1745,7 +1804,7 @@ impl OSDClient {
                 msg.object.oid,
                 spg,
                 osds,
-                msg.object.hash,
+                hash,
             );
 
             // Get session
@@ -1773,22 +1832,22 @@ impl OSDClient {
             // pick up the correct session; otherwise just refresh the pgid
             // before stamping it. Mirrors librados Objecter's rwlock-guarded
             // "compute target + enqueue" ordering without needing a real lock.
-            let (final_spg, final_map) = {
+            let (final_hash, final_spg, final_map) = {
                 let live = self.get_osdmap().await?;
                 if live.epoch != op.osdmap.epoch {
                     // OSDMap moved between the routing decision above
                     // and now — re-prune the snapc against any new
                     // removals before we encode the wire op.
                     live.prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
-                    let (new_spg, new_osds) =
-                        self.object_to_osds_in_map(&live, msg.object.pool, &msg.object.oid)?;
+                    let (new_hash, new_spg, new_osds) =
+                        Self::object_to_osds_in_map(&live, &msg.object)?;
                     if new_osds.first().copied() != Some(primary_osd) {
                         op.osdmap = live;
                         continue;
                     }
-                    (new_spg, live)
+                    (new_hash, new_spg, live)
                 } else {
-                    (spg, Arc::clone(&op.osdmap))
+                    (hash, spg, Arc::clone(&op.osdmap))
                 }
             };
             let final_epoch = final_map.epoch.as_u32();
@@ -1797,6 +1856,7 @@ impl OSDClient {
             let tid = session.next_tid();
             {
                 let m = Arc::make_mut(msg);
+                m.object.hash = final_hash;
                 m.pgid = final_spg;
                 m.osdmap_epoch = final_epoch;
                 m.reqid = crate::osdclient::types::RequestId::new(
@@ -1864,12 +1924,10 @@ impl OSDClient {
         if self.blocklisted.load(Ordering::Relaxed) {
             return Err(OSDClientError::Blocklisted);
         }
-        let mut object = object.clone();
-        object.calculate_hash();
         let permit = self.acquire_budget(&ops, kind).await?;
         let effective_timeout = self.tracker.operation_timeout();
         let deadline = std::time::Instant::now() + effective_timeout;
-        let mut op = self.prepare_op(object, ops, extra_flags).await?;
+        let mut op = self.prepare_op(object.clone(), ops, extra_flags).await?;
         op.class.ping = kind == SubmitKind::Ping;
         let submitted = self
             .route_and_submit(&mut op, priority, deadline, effective_timeout)
@@ -2106,31 +2164,6 @@ impl OSDClient {
         Ok(())
     }
 
-    /// Compute the PG id that an object hash belongs to.
-    ///
-    /// This mirrors Ceph's `ceph_stable_mod(hash, pg_num, pg_num_mask)`:
-    /// - If `(hash & mask) < pg_num`  →  `hash & mask`
-    /// - Otherwise                    →  `hash & (mask >> 1)`
-    ///
-    /// `pg_num_mask = (1 << ceil_log2(pg_num)) - 1`; for power-of-2 pg_num it equals
-    /// `pg_num - 1`.
-    fn hash_to_pg(hash: u32, pg_num: u32) -> u32 {
-        if pg_num == 0 {
-            return 0;
-        }
-        // pg_num_mask = (1 << cbits(pg_num - 1)) - 1
-        let mask: u32 = if pg_num <= 1 {
-            0
-        } else {
-            (1u32 << (32 - (pg_num - 1).leading_zeros())) - 1
-        };
-        if (hash & mask) < pg_num {
-            hash & mask
-        } else {
-            hash & (mask >> 1)
-        }
-    }
-
     /// Parse a list cursor string into an `HObject` starting position.
     ///
     /// Cursor format: decimal representation of the hobject raw hash.
@@ -2147,6 +2180,16 @@ impl OSDClient {
         }
     }
 
+    /// The object a PGNLS request addresses: no name or key, the listed
+    /// namespace, and the cursor hash as its hobject hash, as Ceph's
+    /// `Objecter::list_nobjects` builds `object_locator_t oloc(pool_id,
+    /// list_context->nspace)` (`src/osdc/Objecter.cc:3854`).
+    fn pgnls_target(pool: u64, cursor_hash: u32, nspace: &str) -> ObjectId {
+        let mut object = ObjectId::with_namespace(pool, "", nspace);
+        object.hash = cursor_hash;
+        object
+    }
+
     /// Query objects from the PG that contains `hobject_cursor`.
     ///
     /// The target PG is derived from `hobject_cursor.hash` using `ceph_stable_mod`, matching
@@ -2157,17 +2200,15 @@ impl OSDClient {
     async fn query_pg_objects(
         &self,
         pool: u64,
+        nspace: &str,
         hobject_cursor: &crate::HObject,
         max_entries: u64,
         pool_info: &crate::osdclient::PgPool,
         osdmap: &Arc<crate::osdclient::osdmap::OSDMap>,
     ) -> Result<(crate::osdclient::PgNlsResponse, i32)> {
         // Derive the target PG from the cursor hash — mirrors Objecter::pg_read(current_pg,…)
-        let current_pg = Self::hash_to_pg(hobject_cursor.hash, pool_info.pg_num);
-        let pg = crate::crush::placement::PgId {
-            pool,
-            seed: current_pg,
-        };
+        let pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash);
+        let current_pg = pg.seed;
 
         let osds = Self::pg_to_osds_in_map(osdmap, pg)?;
         let primary_osd = osds[0];
@@ -2186,11 +2227,9 @@ impl OSDClient {
         // Get session
         let session = self.get_or_create_session(primary_osd).await?;
 
-        // Create object ID (empty for PGNLS).
         // The hash must match the cursor's hash so the OSD's pgid.contains(head)
         // check passes — hash=0 only belongs to PG 0.
-        let mut object = ObjectId::new(pool, "");
-        object.hash = hobject_cursor.hash;
+        let object = Self::pgnls_target(pool, hobject_cursor.hash, nspace);
 
         // Create pgls operation
         let ops = vec![OSDOp::pgls(
@@ -2284,7 +2323,7 @@ impl OSDClient {
         ListResult { entries, cursor }
     }
 
-    /// List objects in a pool
+    /// List objects in a pool's default namespace
     ///
     /// Lists objects in the specified pool using PGNLS, following the cursor returned
     /// by each OSD reply (bitwise-sorted order).  The cursor is the raw hobject hash
@@ -2300,10 +2339,22 @@ impl OSDClient {
         cursor: Option<String>,
         max_entries: u64,
     ) -> Result<ListResult> {
-        debug!(
-            "list pool={} cursor={:?} max_entries={}",
-            pool, cursor, max_entries
-        );
+        self.list_in_namespace(pool, "", cursor, max_entries).await
+    }
+
+    /// List objects in one namespace of a pool, or in every namespace
+    /// when `nspace` is [`ALL_NSPACES`](crate::osdclient::ALL_NSPACES).
+    ///
+    /// As [`OSDClient::list`], whose cursors it shares; each entry carries
+    /// its namespace and locator key.
+    pub async fn list_in_namespace(
+        &self,
+        pool: u64,
+        nspace: &str,
+        cursor: Option<String>,
+        max_entries: u64,
+    ) -> Result<ListResult> {
+        debug!("list pool={pool} nspace={nspace:?} cursor={cursor:?} max_entries={max_entries}");
 
         // Fail immediately if the client has been fenced by the cluster.
         if self.blocklisted.load(Ordering::Relaxed) {
@@ -2358,7 +2409,7 @@ impl OSDClient {
                 });
             }
 
-            let current_pg = Self::hash_to_pg(hobject_cursor.hash, pool_info.pg_num);
+            let current_pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash).seed;
             debug!(
                 "Querying PG {} (hash={:#x}), collected {} entries so far",
                 current_pg,
@@ -2368,7 +2419,7 @@ impl OSDClient {
 
             let remaining = max_entries.saturating_sub(all_entries.len() as u64);
             let (response, _result_code) = match self
-                .query_pg_objects(pool, &hobject_cursor, remaining, pool_info, &osdmap)
+                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, pool_info, &osdmap)
                 .await
             {
                 Ok(result) => result,
@@ -2405,16 +2456,30 @@ impl OSDClient {
         }
     }
 
-    /// Compute the end-of-PG hobject handle for a given PG, matching `pg_t::get_hobj_end`.
+    /// How many low hash bits PG `pg_seed` of a pool with `pg_num` PGs
+    /// owns, as `pg_t::get_split_bits` (`src/osd/osd_types.cc:830-843`):
+    /// with `pg_num` in `[2^(p-1), 2^p)`, a PG that has split owns `p`
+    /// bits and one that has not owns `p - 1`.
+    fn pg_split_bits(pg_seed: u32, pg_num: u32) -> u32 {
+        if pg_num <= 1 {
+            return 0;
+        }
+        let p = 32 - pg_num.leading_zeros();
+        let half = 1u32 << (p - 1);
+        if pg_seed % half < pg_num % half {
+            p
+        } else {
+            p - 1
+        }
+    }
+
+    /// Compute the end-of-PG hobject handle for a given PG, matching
+    /// `pg_t::get_hobj_end` (`src/osd/osd_types.cc:879-894`).
     ///
     /// This is used to skip over a PG that has no OSDs so we can advance to the
     /// next PG in bitwise-sorted order without issuing an OSD request.
     fn pg_hobj_end(pool: u64, pg_seed: u32, pg_num: u32) -> crate::HObject {
-        let bits = if pg_num <= 1 {
-            0u32
-        } else {
-            32 - (pg_num - 1).leading_zeros()
-        };
+        let bits = Self::pg_split_bits(pg_seed, pg_num);
         let rev_start = pg_seed.reverse_bits();
         let rev_end: u64 = (rev_start as u64) | (0xffff_ffffu64 >> bits);
         let rev_end = rev_end + 1;
@@ -2685,13 +2750,14 @@ impl OSDClient {
         let mut placement_cache = HashMap::new();
         let mut any_migrated = false;
 
-        for (tid, pool_id, object_id, op_osdmap_epoch) in metadata {
+        for (tid, msg, op_osdmap_epoch) in metadata {
+            let pool_id = msg.object.pool;
             if Self::fail_if_pool_deleted(session, tid, pool_id, osdmap).await {
                 continue;
             }
 
-            let (new_spg, new_osds) =
-                self.cached_rescan_osds(&mut placement_cache, osdmap, pool_id, &object_id)?;
+            let (new_hash, new_spg, new_osds) =
+                Self::cached_rescan_osds(&mut placement_cache, osdmap, &msg)?;
             let new_primary = new_osds.first().copied().unwrap_or(-1);
 
             // Scan path: only resend if primary changed or pool forced a resend.
@@ -2726,6 +2792,7 @@ impl OSDClient {
                 // target OSD (ENXIO in prod, assertion with debug_misdirected).
                 {
                     let msg = Arc::make_mut(&mut op.op);
+                    msg.object.hash = new_hash;
                     msg.pgid = new_spg;
                     msg.osdmap_epoch = new_epoch;
                 }
@@ -2816,11 +2883,8 @@ impl OSDClient {
             // when the primary OSD is unchanged, so keeping the old pgid would
             // send a stale seed to the fresh session.
             let new_osdmap = self.get_osdmap().await?;
-            let (new_spg, osds) = match self.object_to_osds_in_map(
-                &new_osdmap,
-                pending_op.op.object.pool,
-                &pending_op.op.object.oid,
-            ) {
+            let placed = Self::replace_pending(&new_osdmap, &pending_op.op);
+            let (new_hash, new_spg, osds) = match placed {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(
@@ -2840,6 +2904,7 @@ impl OSDClient {
             epoch_for_op = new_osdmap.epoch.as_u32();
             {
                 let msg = Arc::make_mut(&mut pending_op.op);
+                msg.object.hash = new_hash;
                 msg.pgid = new_spg;
                 msg.osdmap_epoch = epoch_for_op;
             }
@@ -2947,7 +3012,8 @@ impl OSDClient {
 
         let new_epoch = osdmap.epoch.as_u32();
 
-        for (tid, pool_id, _, _) in metadata {
+        for (tid, msg, _) in metadata {
+            let pool_id = msg.object.pool;
             let Some(mut pending_op) = old_session.remove_pending_op(tid) else {
                 continue;
             };
@@ -3290,7 +3356,7 @@ impl OSDClient {
     async fn fail_all_pending_ops_blocklisted(&self) {
         let session_snapshot = self.collect_session_snapshot().await;
         for (_osd_id, session) in session_snapshot {
-            for (tid, _, _, _) in session.get_pending_ops_metadata() {
+            for (tid, _, _) in session.get_pending_ops_metadata() {
                 if let Some(op) = session.remove_pending_op(tid) {
                     let _ = op.result_tx.send(Err(OSDClientError::Blocklisted));
                 }
@@ -3535,7 +3601,7 @@ impl OSDClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{OSDClient, OSDClientConfig};
+    use super::{MOSDOp, OSDClient, OSDClientConfig, ObjectLocator};
     use crate::osdclient::error::OSDClientError;
     use crate::osdclient::types::ObjectId;
     use crate::osdclient::types::{OpReply, OpResult};
@@ -3569,6 +3635,339 @@ mod tests {
         assert!(matches!(err, OSDClientError::OSDError { code: -2, .. }));
         let err = OSDClient::check_op_result(&result(0, -125), "t").expect_err("per-op");
         assert!(matches!(err, OSDClientError::OSDError { code: -125, .. }));
+    }
+
+    fn map_with_pool(id: u64, pg_num: u32) -> crate::osdclient::osdmap::OSDMap {
+        let mut map = crate::osdclient::osdmap::OSDMap::new();
+        map.pools.insert(
+            id,
+            crate::osdclient::PgPool {
+                object_hash: crate::crush::hash::CEPH_STR_HASH_RJENKINS,
+                pg_num,
+                pgp_num: pg_num,
+                size: 1,
+                ..Default::default()
+            },
+        );
+        map
+    }
+
+    /// `map_with_pool` plus a one-host CRUSH map over two OSDs, so its
+    /// PGs map to OSDs.
+    fn map_with_crush(id: u64, pg_num: u32) -> crate::osdclient::osdmap::OSDMap {
+        use crate::crush::{
+            BucketAlgorithm, BucketData, CrushBucket, CrushMap, CrushRule, CrushRuleStep, RuleOp,
+            RuleType,
+        };
+        let mut crush = CrushMap::new();
+        crush.max_devices = 2;
+        crush.max_buckets = 1;
+        crush.buckets = vec![Some(CrushBucket {
+            id: -1,
+            bucket_type: 1,
+            alg: BucketAlgorithm::Straw2,
+            hash: 0,
+            weight: 0x20000,
+            size: 2,
+            items: vec![0, 1],
+            data: BucketData::Straw2 {
+                item_weights: vec![0x10000; 2],
+            },
+        })];
+        crush.rules = vec![Some(CrushRule {
+            rule_id: 0,
+            rule_type: RuleType::Replicated,
+            steps: vec![
+                CrushRuleStep {
+                    op: RuleOp::Take,
+                    arg1: -1,
+                    arg2: 0,
+                },
+                CrushRuleStep {
+                    op: RuleOp::ChooseLeafFirstN,
+                    arg1: 1,
+                    arg2: 0,
+                },
+                CrushRuleStep {
+                    op: RuleOp::Emit,
+                    arg1: 0,
+                    arg2: 0,
+                },
+            ],
+        })];
+        let mut map = map_with_pool(id, pg_num);
+        map.max_osd = 2;
+        map.osd_weight = vec![0x10000; 2];
+        map.crush = Some(crush);
+        map
+    }
+
+    fn keyed(pool: u64, oid: &str, key: &str, ns: &str) -> ObjectId {
+        let mut object = ObjectId::with_namespace(pool, oid, ns);
+        object.key = key.to_string();
+        object
+    }
+
+    fn mosdop(object: ObjectId, ops: Vec<crate::osdclient::types::OSDOp>) -> MOSDOp {
+        let flags = MOSDOp::calculate_flags(&ops);
+        MOSDOp::new(
+            1,
+            1,
+            flags,
+            object,
+            crate::osdclient::types::StripedPgId::from_pg(0, 0),
+            ops,
+            crate::osdclient::types::RequestId::new(&"client.test".into(), 1, 0),
+            0,
+        )
+    }
+
+    #[test]
+    fn object_pg_in_map_uses_namespace_and_key() {
+        use crate::crush::PgId;
+        let map = map_with_pool(2, 32);
+        let place = |object: &ObjectId| {
+            let p = OSDClient::object_pg_in_map(&map, object).unwrap();
+            (p.hash, p.pg)
+        };
+        assert_eq!(
+            place(&ObjectId::with_namespace(2, "foo", "ns1")),
+            (0xf4569544, PgId::new(2, 4))
+        );
+        assert_eq!(
+            place(&ObjectId::new(2, "foo")),
+            (0x7fc1f406, PgId::new(2, 6))
+        );
+        assert_eq!(
+            place(&keyed(2, "_multipart_obj.2~abc.1", "obj", "")),
+            (0xaabc5e21, PgId::new(2, 1))
+        );
+        assert!(matches!(
+            OSDClient::object_pg_in_map(&map, &ObjectId::new(3, "foo")),
+            Err(OSDClientError::PoolNotFound(3))
+        ));
+    }
+
+    #[test]
+    fn object_to_osds_in_map_places_by_the_locator() {
+        let map = map_with_crush(2, 32);
+        let route = |object: &ObjectId| {
+            let (hash, spg, osds) = OSDClient::object_to_osds_in_map(&map, object).unwrap();
+            (hash, spg.seed, osds)
+        };
+        // Each pair lands on a different OSD, so a client placing by the
+        // name alone would send the op to the wrong one.
+        let namespaced = route(&ObjectId::with_namespace(2, "bar", "ns1"));
+        let name_only = route(&ObjectId::new(2, "bar"));
+        assert_eq!(namespaced, (0x73a75142, 2, vec![1]));
+        assert_eq!(name_only, (0xefe6384b, 11, vec![0]));
+
+        let with_key = route(&keyed(2, "_multipart_foo.1", "foo", ""));
+        let name_only = route(&ObjectId::new(2, "_multipart_foo.1"));
+        assert_eq!(with_key, (0x7fc1f406, 6, vec![1]));
+        assert_eq!(name_only, (0xfa7582cc, 12, vec![0]));
+        assert_eq!(with_key, route(&ObjectId::new(2, "foo")));
+    }
+
+    #[test]
+    fn placement_key_separates_namespaces() {
+        assert_ne!(
+            OSDClient::placement_key(&ObjectId::new(2, "foo")),
+            OSDClient::placement_key(&ObjectId::with_namespace(2, "foo", "ns1"))
+        );
+        assert_eq!(
+            OSDClient::placement_key(&keyed(2, "a", "obj", "ns1")),
+            OSDClient::placement_key(&keyed(2, "b", "obj", "ns1"))
+        );
+    }
+
+    /// The end hash of every PG of a `pg_num`-PG pool, or `None` for
+    /// the pool's end.
+    fn pg_end_hashes(pg_num: u32) -> Vec<Option<u32>> {
+        (0..pg_num)
+            .map(|seed| {
+                let end = OSDClient::pg_hobj_end(2, seed, pg_num);
+                (!end.max).then_some(end.hash)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pg_split_bits_for_twelve_pgs() {
+        let bits: Vec<u32> = (0..12).map(|s| OSDClient::pg_split_bits(s, 12)).collect();
+        assert_eq!(bits, [4, 4, 4, 4, 3, 3, 3, 3, 4, 4, 4, 4]);
+        assert_eq!(OSDClient::pg_split_bits(0, 1), 0);
+        assert!((0..8).all(|s| OSDClient::pg_split_bits(s, 8) == 3));
+    }
+
+    #[test]
+    fn pg_hobj_end_twelve_pgs() {
+        // PGs 4-7 have not split, so each ends where its 3-bit range does;
+        // PG 7's range runs to the end of the hash space.
+        assert_eq!(
+            pg_end_hashes(12),
+            [
+                Some(0x8),
+                Some(0x9),
+                Some(0xa),
+                Some(0xb),
+                Some(0x2),
+                Some(0x3),
+                Some(0x1),
+                None,
+                Some(0x4),
+                Some(0x5),
+                Some(0x6),
+                Some(0x7),
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_hobj_end_eight_pgs() {
+        assert_eq!(
+            pg_end_hashes(8),
+            [
+                Some(0x4),
+                Some(0x5),
+                Some(0x6),
+                Some(0x7),
+                Some(0x2),
+                Some(0x3),
+                Some(0x1),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_hobj_end_walks_every_pg_once() {
+        let map = map_with_pool(2, 12);
+        let pool = &map.pools[&2];
+        let mut cursor = crate::HObject::new(2, String::new(), 0);
+        let mut visited = Vec::new();
+        while !cursor.max {
+            let pg = OSDClient::cursor_pg(pool, 2, cursor.hash).seed;
+            assert!(visited.len() < 12, "revisited PGs: {visited:?} then {pg}");
+            visited.push(pg);
+            cursor = OSDClient::pg_hobj_end(2, pg, 12);
+        }
+        assert_eq!(visited, [0, 8, 4, 2, 10, 6, 1, 9, 5, 3, 11, 7]);
+    }
+
+    #[test]
+    fn pgls_reduction_is_stable_mod() {
+        let map = map_with_pool(2, 12);
+        let pool = &map.pools[&2];
+        assert_eq!(OSDClient::cursor_pg(pool, 2, 0xef61efce).seed, 6);
+    }
+
+    #[test]
+    fn replace_pending_keeps_a_pgnls_cursor() {
+        let map = map_with_crush(2, 12);
+        let mut object = ObjectId::new(2, "");
+        object.hash = 0xef61efce;
+        let cursor = crate::HObject::new(2, String::new(), 0xef61efce);
+        let op = mosdop(
+            object,
+            vec![crate::osdclient::types::OSDOp::pgls(8, cursor, 1).unwrap()],
+        );
+        assert!(OSDClient::is_pg_op(&op));
+        let (hash, spg, _) = OSDClient::replace_pending(&map, &op).unwrap();
+        assert_eq!(hash, 0xef61efce);
+        assert_eq!((spg.pool, spg.seed), (2, 6));
+    }
+
+    #[test]
+    fn replace_pending_uses_the_locator() {
+        let map = map_with_crush(2, 32);
+        let cases = [
+            (ObjectId::with_namespace(2, "foo", "ns1"), 0xf4569544, 4),
+            (keyed(2, "_multipart_obj.2~abc.1", "obj", ""), 0xaabc5e21, 1),
+        ];
+        for (mut object, want_hash, want_seed) in cases {
+            object.hash = 0x12345678;
+            let op = mosdop(object, vec![crate::osdclient::types::OSDOp::stat()]);
+            assert!(!OSDClient::is_pg_op(&op));
+            let (hash, spg, _) = OSDClient::replace_pending(&map, &op).unwrap();
+            assert_eq!(hash, want_hash);
+            assert_eq!((spg.pool, spg.seed), (2, want_seed));
+        }
+    }
+
+    /// The front of a PGNLS request in `nspace` at cursor hash `hash`.
+    fn pgnls_front(nspace: &str, hash: u32) -> bytes::Bytes {
+        use crate::msgr2::ceph_message::{CephMessage, CrcFlags};
+        let object = OSDClient::pgnls_target(2, hash, nspace);
+        let cursor = crate::HObject::new(2, String::new(), hash);
+        let op = mosdop(
+            object,
+            vec![crate::osdclient::types::OSDOp::pgls(8, cursor, 1).unwrap()],
+        );
+        CephMessage::from_payload(&op, 0, CrcFlags::ALL)
+            .unwrap()
+            .front
+    }
+
+    fn encoded_locator(nspace: &str) -> Vec<u8> {
+        use crate::Denc;
+        let loc = ObjectLocator {
+            pool_id: 2,
+            key: String::new(),
+            namespace: nspace.to_string(),
+            hash: -1,
+        };
+        let mut buf = bytes::BytesMut::new();
+        loc.encode(&mut buf, 0).unwrap();
+        buf.to_vec()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn pgnls_target_carries_the_namespace() {
+        let target = OSDClient::pgnls_target(2, 0xef61efce, "ns1");
+        assert_eq!(target.namespace, "ns1");
+        assert_eq!(target.oid, "");
+        assert_eq!(target.key, "");
+        assert_eq!(target.hash, 0xef61efce);
+        assert_eq!(
+            ObjectLocator::from(&target),
+            ObjectLocator {
+                pool_id: 2,
+                key: String::new(),
+                namespace: "ns1".to_string(),
+                hash: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn pgnls_request_encodes_the_namespace() {
+        let with_ns = pgnls_front("ns1", 0xef61efce);
+        let without = pgnls_front("", 0xef61efce);
+        assert!(contains(&with_ns, &encoded_locator("ns1")));
+        assert!(contains(&without, &encoded_locator("")));
+        assert_eq!(with_ns.len(), without.len() + "ns1".len());
+    }
+
+    #[test]
+    fn pgnls_request_all_namespaces() {
+        let front = pgnls_front(crate::osdclient::ALL_NSPACES, 0xef61efce);
+        let locator = encoded_locator(crate::osdclient::ALL_NSPACES);
+        // The namespace is the locator's last string before its i64 hash.
+        let tail = [&[1u8, 0, 0, 0, 0x01][..], &(-1i64).to_le_bytes()].concat();
+        assert!(locator.ends_with(&tail));
+        assert!(contains(&front, &locator));
+    }
+
+    #[test]
+    fn pgnls_target_default_namespace_is_unnamespaced() {
+        let mut unnamespaced = ObjectId::new(2, "");
+        unnamespaced.hash = 0xef61efce;
+        assert_eq!(OSDClient::pgnls_target(2, 0xef61efce, ""), unnamespaced);
     }
 
     /// An `OSDClient` whose MonClient never connects: enough for the

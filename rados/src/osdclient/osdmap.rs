@@ -922,6 +922,37 @@ impl PgPool {
     /// has to reverse the transform to compute the right `spg_t` shard.
     pub const FLAG_EC_OPTIMIZATIONS: u64 = 1 << 19;
 
+    /// Hash an object's placement key with this pool's `object_hash`, as
+    /// Ceph's `pg_pool_t::hash_key`: `key` alone in the default
+    /// namespace, otherwise `ns + 0x1f + key`.
+    ///
+    /// An unknown hash type is an error, where Ceph hashes to `-1` and
+    /// places the object anyway.
+    pub fn hash_key(&self, key: &str, ns: &str) -> Result<u32, RadosError> {
+        crate::crush::hash::hash_key(self.object_hash, key, ns).ok_or_else(|| {
+            RadosError::Protocol(format!(
+                "pool object_hash {} is not a known string hash",
+                self.object_hash
+            ))
+        })
+    }
+
+    /// `pg_pool_t::pg_num_mask`: the smallest all-ones mask covering
+    /// `pg_num - 1`.
+    pub fn pg_num_mask(&self) -> u32 {
+        crate::crush::placement::pg_num_mask(self.pg_num)
+    }
+
+    /// Reduce a raw PG to one of this pool's PGs, as Ceph's
+    /// `pg_pool_t::raw_pg_to_pg`, with `ceph_stable_mod`.
+    pub fn raw_pg_to_pg(&self, pg: PgId) -> PgId {
+        let mask = self.pg_num_mask();
+        PgId::new(
+            pg.pool,
+            crate::crush::placement::ceph_stable_mod(pg.seed, self.pg_num, mask),
+        )
+    }
+
     pub fn is_replicated(&self) -> bool {
         self.pool_type == Self::TYPE_REPLICATED
     }
@@ -3409,39 +3440,63 @@ impl OSDMap {
         self.pools.get(&pool_id).map(|p| p.crush_rule)
     }
 
-    /// Simplified object → PG mapping (no namespace, no locator key).
+    /// Map an object to its raw PG, as Ceph's
+    /// `OSDMap::object_locator_to_pg` and `OSDMap::map_to_pg`.
     ///
-    /// **Not for production I/O.** Use `OSDClient::execute_op` which handles
-    /// namespace hashing, hashpspool, upmap, and pg_temp overrides.
-    pub fn object_to_pg(&self, pool_id: u64, object_name: &str) -> Result<PgId, RadosError> {
-        // Get the pool
+    /// A locator hash of zero or more is the PG seed as given; otherwise
+    /// the pool hashes the locator's key, or `oid` when the key is empty,
+    /// in the locator's namespace. The pool must exist either way.
+    ///
+    /// The seed is the full 32-bit hash the MOSDOp carries as its
+    /// hobject hash. It is not yet one of the pool's PGs: pass the result
+    /// through [`OSDMap::raw_pg_to_pg`] before CRUSH.
+    pub fn object_locator_to_pg(
+        &self,
+        oid: &str,
+        loc: &crate::crush::ObjectLocator,
+    ) -> Result<PgId, RadosError> {
         let pool = self
-            .get_pool(pool_id)
-            .ok_or_else(|| RadosError::Protocol(format!("Pool {pool_id} not found")))?;
-
-        // Create a simple object locator
-        let locator = crate::crush::ObjectLocator::new(pool_id);
-
-        // Calculate the PG using the CRUSH placement function
-        let pg = crate::crush::object_to_pg(object_name, &locator, pool.pg_num)
-            .map_err(|e| RadosError::Protocol(format!("PG calculation failed: {e}")))?;
-
-        Ok(PgId {
-            pool: pg.pool as u64,
-            seed: pg.seed,
-        })
+            .get_pool(loc.pool_id)
+            .ok_or_else(|| RadosError::Protocol(format!("Pool {} not found", loc.pool_id)))?;
+        if loc.hash >= 0 {
+            return Ok(PgId::new(loc.pool_id, loc.hash as u32));
+        }
+        let key = if loc.key.is_empty() { oid } else { &loc.key };
+        Ok(PgId::new(loc.pool_id, pool.hash_key(key, &loc.namespace)?))
     }
 
-    /// Simplified object → OSD mapping (CRUSH only, no overrides).
-    ///
-    /// **Not for production I/O.** Skips upmap, pg_temp, and
-    /// pg_upmap_primaries overrides. Use `OSDClient::execute_op` instead.
-    pub fn object_to_osds(&self, pool_id: u64, object_name: &str) -> Result<Vec<i32>, RadosError> {
-        // First, map object to PG
-        let pg = self.object_to_pg(pool_id, object_name)?;
+    /// Reduce a raw PG to one of its pool's PGs, as Ceph's
+    /// `OSDMap::raw_pg_to_pg`.
+    pub fn raw_pg_to_pg(&self, pg: PgId) -> Result<PgId, RadosError> {
+        let pool = self
+            .get_pool(pg.pool)
+            .ok_or_else(|| RadosError::Protocol(format!("Pool {} not found", pg.pool)))?;
+        Ok(pool.raw_pg_to_pg(pg))
+    }
 
-        // Then, map PG to OSDs using CRUSH
-        self.pg_to_osds(&pg)
+    /// Map a default-namespace, unkeyed object name to its PG.
+    ///
+    /// A name alone cannot place a namespaced or keyed object; use
+    /// [`OSDMap::object_locator_to_pg`] and [`OSDMap::raw_pg_to_pg`].
+    #[deprecated(
+        note = "places default-namespace, unkeyed objects only; use OSDMap::object_locator_to_pg and raw_pg_to_pg"
+    )]
+    pub fn object_to_pg(&self, pool_id: u64, object_name: &str) -> Result<PgId, RadosError> {
+        let loc = crate::crush::ObjectLocator::new(pool_id);
+        self.raw_pg_to_pg(self.object_locator_to_pg(object_name, &loc)?)
+    }
+
+    /// Map a default-namespace, unkeyed object name to its OSDs by CRUSH
+    /// alone, without upmap, pg_temp or primary overrides.
+    ///
+    /// A name alone cannot place a namespaced or keyed object; use
+    /// [`OSDMap::object_locator_to_pg`] and [`OSDMap::raw_pg_to_pg`].
+    #[deprecated(
+        note = "places default-namespace, unkeyed objects only; use OSDMap::object_locator_to_pg and raw_pg_to_pg"
+    )]
+    pub fn object_to_osds(&self, pool_id: u64, object_name: &str) -> Result<Vec<i32>, RadosError> {
+        let loc = crate::crush::ObjectLocator::new(pool_id);
+        self.pg_to_osds(&self.raw_pg_to_pg(self.object_locator_to_pg(object_name, &loc)?)?)
     }
 
     /// Raw CRUSH PG → OSD mapping (no upmap / pg_temp overrides).
@@ -3613,6 +3668,151 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use serde_json::json;
+
+    fn map_with_pool(id: u64, pg_num: u32, object_hash: u8) -> OSDMap {
+        let mut map = OSDMap::new();
+        map.pools.insert(
+            id,
+            PgPool {
+                object_hash,
+                pg_num,
+                pgp_num: pg_num,
+                ..Default::default()
+            },
+        );
+        map
+    }
+
+    fn locator(pool: u64, key: &str, ns: &str) -> crate::crush::ObjectLocator {
+        crate::crush::ObjectLocator {
+            pool_id: pool,
+            key: key.to_string(),
+            namespace: ns.to_string(),
+            hash: -1,
+        }
+    }
+
+    // `ceph osd map test-pool <object> [<nspace>]` on a v19.2.2 cluster
+    // (rjenkins, pg_num 32): (nspace, object, raw ps, pg).
+    const MON_VECTORS: [(&str, &str, u32, u32); 15] = [
+        ("", "foo", 0x7fc1f406, 0x6),
+        ("ns1", "foo", 0xf4569544, 0x4),
+        ("", "bar", 0xefe6384b, 0xb),
+        ("ns1", "bar", 0x73a75142, 0x2),
+        ("users.uid", "testuser", 0xa13aa4c1, 0x1),
+        ("gc", "gc.0", 0x031bb659, 0x19),
+        ("", "gc.0", 0x990e66d8, 0x18),
+        ("control", "notify.0", 0x4eeacd0a, 0xa),
+        ("rgw", "foo", 0x0ecb73a9, 0x9),
+        ("", "obj", 0xaabc5e21, 0x1),
+        ("ns1", "obj", 0x37eda02a, 0xa),
+        ("", "_shadow_obj.1", 0xe5f42c1a, 0x1a),
+        ("", "e", 0xef61efce, 0xe),
+        ("", "c", 0x4fa4bedb, 0x1b),
+        ("", "a", 0x29eec818, 0x18),
+    ];
+
+    #[test]
+    fn object_locator_to_pg_matches_ceph() {
+        let map = map_with_pool(2, 32, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        for (ns, name, raw, pg) in MON_VECTORS {
+            let got = map.object_locator_to_pg(name, &locator(2, "", ns)).unwrap();
+            assert_eq!(got, PgId::new(2, raw), "{ns}/{name}");
+            assert_eq!(
+                map.raw_pg_to_pg(got).unwrap(),
+                PgId::new(2, pg),
+                "{ns}/{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_pg_to_pg_is_stable_mod() {
+        // `osdmaptool --createsimple 3 --pg-bits 2 --pgp-bits 2` (pool 1,
+        // pg_num 12) on v19.2.2.
+        let map = map_with_pool(1, 12, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        let vectors = [
+            ("foo", 0x6),
+            ("bar", 0xb),
+            ("gc.0", 0x8),
+            ("obj", 0x1),
+            ("_shadow_obj.1", 0xa),
+            ("e", 0x6),
+            ("c", 0xb),
+            ("a", 0x8),
+        ];
+        for (name, pg) in vectors {
+            let raw = map.object_locator_to_pg(name, &locator(1, "", "")).unwrap();
+            assert_eq!(map.raw_pg_to_pg(raw).unwrap(), PgId::new(1, pg), "{name}");
+        }
+    }
+
+    #[test]
+    fn locator_key_replaces_the_name() {
+        let map = map_with_pool(2, 32, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        let multipart = map
+            .object_locator_to_pg("_multipart_obj.2~abc.1", &locator(2, "obj", ""))
+            .unwrap();
+        assert_eq!(multipart, PgId::new(2, 0xaabc5e21));
+        let namespaced = map
+            .object_locator_to_pg("x", &locator(2, "obj", "ns1"))
+            .unwrap();
+        assert_eq!(namespaced, PgId::new(2, 0x37eda02a));
+        assert_eq!(
+            map.object_locator_to_pg("foo", &locator(2, "foo", "ns1"))
+                .unwrap(),
+            map.object_locator_to_pg("foo", &locator(2, "", "ns1"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn hash_override_skips_hashing() {
+        let map = map_with_pool(2, 32, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        let loc = crate::crush::ObjectLocator::with_hash(2, 0x7fc1f406);
+        let raw = map.object_locator_to_pg("anything", &loc).unwrap();
+        assert_eq!(raw, PgId::new(2, 0x7fc1f406));
+        assert_eq!(map.raw_pg_to_pg(raw).unwrap(), PgId::new(2, 6));
+    }
+
+    #[test]
+    fn missing_pool_is_an_error() {
+        let map = map_with_pool(2, 32, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        assert!(
+            map.object_locator_to_pg("foo", &locator(3, "", ""))
+                .is_err()
+        );
+        let loc = crate::crush::ObjectLocator::with_hash(3, 0x7fc1f406);
+        assert!(map.object_locator_to_pg("foo", &loc).is_err());
+        assert!(map.raw_pg_to_pg(PgId::new(3, 0)).is_err());
+    }
+
+    #[test]
+    fn linux_hash_pool() {
+        let map = map_with_pool(2, 32, crate::crush::hash::CEPH_STR_HASH_LINUX);
+        let raw = map
+            .object_locator_to_pg("foo", &locator(2, "", ""))
+            .unwrap();
+        assert_eq!(raw, PgId::new(2, 0x0024db2a));
+        let unknown = map_with_pool(2, 32, 9);
+        assert!(
+            unknown
+                .object_locator_to_pg("foo", &locator(2, "", ""))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn object_to_pg_uses_stable_mod() {
+        let map = map_with_pool(1, 12, crate::crush::hash::CEPH_STR_HASH_RJENKINS);
+        assert_eq!(map.object_to_pg(1, "e").unwrap(), PgId::new(1, 6));
+        let linux = map_with_pool(1, 32, crate::crush::hash::CEPH_STR_HASH_LINUX);
+        assert_eq!(
+            linux.object_to_pg(1, "foo").unwrap(),
+            PgId::new(1, 0x0024db2a & 31)
+        );
+    }
 
     fn make_osdmap_with_states(states: Vec<u32>) -> OSDMap {
         let max_osd = states.len() as i32;

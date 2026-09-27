@@ -201,7 +201,8 @@ pub struct ObjectId {
     pub oid: String,
     /// Snapshot ID (SNAP_HEAD for current version)
     pub snap: u64,
-    /// Hash for CRUSH placement
+    /// The hobject hash: the object's raw placement hash, stamped when
+    /// the op is routed.
     pub hash: u32,
     /// Namespace (usually empty)
     pub namespace: String,
@@ -219,7 +220,7 @@ impl ObjectId {
             pool,
             oid: oid.to_string(),
             snap: SNAP_HEAD,
-            hash: 0, // Will be calculated from oid
+            hash: 0,
             namespace: String::new(),
             key: String::new(),
         }
@@ -237,32 +238,25 @@ impl ObjectId {
         }
     }
 
-    /// Calculate the hash for CRUSH placement using Ceph's rjenkins hash.
+    /// Set `hash` to the object's raw placement hash.
     ///
     /// Mirrors `OSDMap::map_to_pg` / `pg_pool_t::hash_key`:
     /// - If a locator `key` is set, hash the key instead of the oid.
     /// - If a `namespace` is set, prepend `ns + '\x1f'` before hashing.
+    ///
+    /// This assumes the pool hashes with rjenkins, as every pool a v19
+    /// monitor creates does. `OSDMap::object_locator_to_pg` honours the
+    /// pool's own hash type.
     pub fn calculate_hash(&mut self) {
-        use crate::crush::hash::ceph_str_hash_rjenkins;
+        use crate::crush::hash::{CEPH_STR_HASH_RJENKINS, hash_key};
 
-        let target = if self.key.is_empty() {
+        let key = if self.key.is_empty() {
             &self.oid
         } else {
             &self.key
         };
-
-        self.hash = if self.namespace.is_empty() {
-            ceph_str_hash_rjenkins(target.as_bytes())
-        } else {
-            // Matches pg_pool_t::hash_key: ns + '\x1f' + key_or_oid
-            let ns = self.namespace.as_bytes();
-            let tgt = target.as_bytes();
-            let mut buf = Vec::with_capacity(ns.len() + 1 + tgt.len());
-            buf.extend_from_slice(ns);
-            buf.push(0x1f);
-            buf.extend_from_slice(tgt);
-            ceph_str_hash_rjenkins(&buf)
-        };
+        self.hash = hash_key(CEPH_STR_HASH_RJENKINS, key, &self.namespace)
+            .expect("rjenkins is a known string hash");
     }
 }
 
@@ -1571,6 +1565,15 @@ pub struct PoolInfo {
 
 // Re-export ListObjectImpl as ListObjectEntry
 pub use crate::osdclient::pg_nls_response::ListObjectImpl as ListObjectEntry;
+
+/// The namespace that lists objects in every namespace: librados's
+/// `LIBRADOS_ALL_NSPACES` (`src/include/rados/rados_types.h:39`), which
+/// the OSD's PGNLS matches against any namespace
+/// (`src/osd/PrimaryLogPG.cc:1366-1369`).
+///
+/// It is meaningful for listing only: as in librados, an object op on a
+/// context set to it hashes the literal byte as the namespace.
+pub const ALL_NSPACES: &str = "\u{1}";
 
 /// Result of a list operation
 #[derive(Debug, Clone)]

@@ -431,7 +431,9 @@ impl IoCtx {
         Ok(())
     }
 
-    /// List objects in the pool with pagination
+    /// List the names of objects in this context's namespace, or in every
+    /// namespace when the namespace is
+    /// [`ALL_NSPACES`](crate::osdclient::ALL_NSPACES), with pagination.
     ///
     /// # Arguments
     ///
@@ -451,10 +453,7 @@ impl IoCtx {
             self.pool_id, cursor, max_entries
         );
 
-        let result = self
-            .client
-            .list(self.pool_id, cursor, max_entries as u64)
-            .await?;
+        let result = self.list_object_entries(cursor, max_entries).await?;
 
         // Extract object names from entries
         let object_names: Vec<String> = result.entries.into_iter().map(|entry| entry.oid).collect();
@@ -462,14 +461,28 @@ impl IoCtx {
         Ok((object_names, result.cursor))
     }
 
-    /// List all objects in the pool
+    /// As [`IoCtx::list_objects`], returning each entry's namespace, name
+    /// and locator key, which tells one name in two namespaces apart under
+    /// [`ALL_NSPACES`](crate::osdclient::ALL_NSPACES).
+    pub async fn list_object_entries(
+        &self,
+        cursor: Option<String>,
+        max_entries: usize,
+    ) -> Result<crate::osdclient::types::ListResult> {
+        self.client
+            .list_in_namespace(self.pool_id, &self.namespace, cursor, max_entries as u64)
+            .await
+    }
+
+    /// List all objects in this context's namespace
     ///
-    /// This method automatically handles pagination and returns all objects in the pool.
-    /// It's equivalent to the C++ librados `ls` command.
+    /// This method automatically handles pagination and returns all objects in the
+    /// namespace, as [`IoCtx::list_objects`] does. It's equivalent to the C++
+    /// librados `ls` command.
     ///
     /// # Returns
     ///
-    /// Returns a vector of all object names in the pool
+    /// Returns a vector of all object names in the namespace
     ///
     /// # Example
     ///
