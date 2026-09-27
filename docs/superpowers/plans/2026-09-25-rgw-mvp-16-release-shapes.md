@@ -851,7 +851,13 @@ model. The PR body:
   `bucket_complete_op` and the OLH writes only, not `bucket_list`,
   `bucket_check_index` or `dir_suggest_changes` (verify in
   `rgw_rados.cc` at v19.2.2) and the module doc of `rgw::index` should
-  say which calls, not "every index write".
+  say which calls, not "every index write". The set is per release:
+  from Tentacle radosgw also sends `assert_exists`, then the guard,
+  then `dir_suggest_changes` in both listing paths (v20.2.4
+  `rgw_rados.cc:10823` and `:11061`; v19.2.6 `:9902` and `:10138` send
+  the suggestion bare). The doc names both sets, and a gateway at
+  Tentacle level guards its listing-time suggestions. Listing, index
+  check/rebuild and init stay unguarded in both releases.
 - Duplicate keys in a decoded map (settled by the rgw-go session with
   ceph-dencoder on v19.2.6 and v20.2.4 using crafted inputs): when the
   key or the value is a struct with its own encode/decode, C++ decodes
