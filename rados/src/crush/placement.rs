@@ -215,18 +215,16 @@ impl VersionedEncode for ObjectLocator {
 
 crate::denc::impl_denc_for_versioned!(ObjectLocator);
 
-/// Calculate PG ID from object name
+/// Map an object to its PG in a pool of `pg_num` PGs.
 ///
-/// This hashes the object name and maps it to a placement group
-/// within the specified pool using Ceph's rjenkins hash function.
+/// Hashes the locator's key, or `object_name` when the key is empty, in
+/// the locator's namespace, and reduces the hash with [`ceph_stable_mod`].
+/// The locator's hash override is ignored.
 ///
-/// # Arguments
-/// * `object_name` - Name of the object
-/// * `locator` - Object locator with pool and namespace info
-/// * `pg_num` - Number of PGs in the pool
-///
-/// # Returns
-/// PG ID (pool + seed)
+/// This assumes the pool hashes with rjenkins, as every pool a v19
+/// monitor creates does, and returns the reduced PG, not the raw hash.
+/// `OSDMap::object_locator_to_pg` honours the pool's own hash type and
+/// returns the raw hash the MOSDOp carries.
 pub fn object_to_pg(
     object_name: &str,
     locator: &ObjectLocator,
@@ -248,7 +246,7 @@ pub fn object_to_pg(
     let hash = hash_key(CEPH_STR_HASH_RJENKINS, key, &locator.namespace)
         .expect("rjenkins is a known string hash");
 
-    let pg_seed = hash % pg_num;
+    let pg_seed = ceph_stable_mod(hash, pg_num, pg_num_mask(pg_num));
 
     Ok(PgId::new(locator.pool_id, pg_seed))
 }
@@ -349,7 +347,10 @@ pub fn pg_to_pps(pg: PgId, pgp_num: u32, hashpspool: bool) -> u32 {
 
 /// Map an object directly to OSDs
 ///
-/// This is a convenience function that combines object_to_pg and pg_to_osds.
+/// This is a convenience function that combines [`object_to_pg`] and
+/// [`pg_to_osds`], so it shares `object_to_pg`'s rjenkins assumption and
+/// returns the reduced PG; `OSDMap::object_locator_to_pg` honours the
+/// pool's own hash type.
 ///
 /// # Arguments
 /// * `crush_map` - The CRUSH map
@@ -578,6 +579,15 @@ mod tests {
         let (pg2, osds2) = result2.unwrap();
         assert_eq!(pg, pg2);
         assert_eq!(osds, osds2);
+    }
+
+    #[test]
+    fn test_object_to_pg_stable_mod() {
+        // `hash % 12` puts `e` in PG 0xa and `c` in 7; Ceph's reduction
+        // does not.
+        let locator = ObjectLocator::new(1);
+        assert_eq!(object_to_pg("e", &locator, 12).unwrap(), PgId::new(1, 6));
+        assert_eq!(object_to_pg("c", &locator, 12).unwrap(), PgId::new(1, 0xb));
     }
 
     #[test]

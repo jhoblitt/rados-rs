@@ -1057,20 +1057,14 @@ impl OSDSession {
 
     /// Get metadata for all pending operations
     ///
-    /// Returns (tid, pool_id, object_id, osdmap_epoch) for each pending operation.
-    /// Used by OSDClient to determine which operations need rescanning.
-    /// Note: object_id is cloned here, but this is only called during OSDMap updates (infrequent).
-    pub fn get_pending_ops_metadata(&self) -> Vec<(u64, u64, String, u32)> {
+    /// Returns (tid, op, osdmap_epoch) for each pending operation. Used by
+    /// OSDClient to determine which operations need rescanning.
+    pub fn get_pending_ops_metadata(&self) -> Vec<(u64, Arc<MOSDOp>, u32)> {
         self.pending_ops
             .iter()
             .map(|entry| {
                 let (tid, op) = entry.pair();
-                (
-                    *tid,
-                    op.op.object.pool,
-                    op.op.object.oid.clone(),
-                    op.osdmap_epoch,
-                )
+                (*tid, Arc::clone(&op.op), op.osdmap_epoch)
             })
             .collect()
     }

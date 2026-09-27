@@ -201,7 +201,8 @@ pub struct ObjectId {
     pub oid: String,
     /// Snapshot ID (SNAP_HEAD for current version)
     pub snap: u64,
-    /// Hash for CRUSH placement
+    /// The hobject hash: the object's raw placement hash, stamped when
+    /// the op is routed.
     pub hash: u32,
     /// Namespace (usually empty)
     pub namespace: String,
@@ -219,7 +220,7 @@ impl ObjectId {
             pool,
             oid: oid.to_string(),
             snap: SNAP_HEAD,
-            hash: 0, // Will be calculated from oid
+            hash: 0,
             namespace: String::new(),
             key: String::new(),
         }
@@ -237,11 +238,15 @@ impl ObjectId {
         }
     }
 
-    /// Calculate the hash for CRUSH placement using Ceph's rjenkins hash.
+    /// Set `hash` to the object's raw placement hash.
     ///
     /// Mirrors `OSDMap::map_to_pg` / `pg_pool_t::hash_key`:
     /// - If a locator `key` is set, hash the key instead of the oid.
     /// - If a `namespace` is set, prepend `ns + '\x1f'` before hashing.
+    ///
+    /// This assumes the pool hashes with rjenkins, as every pool a v19
+    /// monitor creates does. `OSDMap::object_locator_to_pg` honours the
+    /// pool's own hash type.
     pub fn calculate_hash(&mut self) {
         use crate::crush::hash::{CEPH_STR_HASH_RJENKINS, hash_key};
 
