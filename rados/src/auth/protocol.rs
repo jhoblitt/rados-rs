@@ -117,13 +117,24 @@ pub struct EncryptedServiceTicket {
 /// - `service_id: u32` - Service type (MON=6, OSD=4, MDS=2, MGR=32)
 /// - `encrypted_service_ticket: EncryptedServiceTicket` - Encrypted ticket
 /// - `ticket_enc: u8` - Ticket encoding type (1 = encrypted, 0 = unencrypted)
-/// - `ticket_blob: CephXTicketBlob` - The actual ticket blob for the service
+/// - `ticket_blob` - The ticket blob for the service, see [`TicketBlobField`]
 #[derive(Debug, Clone)]
 pub struct ServiceTicketInfo {
     pub service_id: u32,
     pub encrypted_service_ticket: EncryptedServiceTicket,
     pub ticket_enc: u8,
-    pub ticket_blob: CephXTicketBlob,
+    pub ticket_blob: TicketBlobField,
+}
+
+/// The ticket blob of a [`ServiceTicketInfo`], a length-prefixed buffer.
+#[derive(Debug, Clone)]
+pub enum TicketBlobField {
+    /// `ticket_enc == 0`: an encoded [`CephXTicketBlob`].
+    Clear(CephXTicketBlob),
+    /// `ticket_enc != 0`: the encoded blob in an encrypted envelope, under
+    /// usage `CEPHX_KEY_USAGE_TICKET_BLOB` and the session key the client held
+    /// for the service before this reply. Only that client can open it.
+    Encrypted(Bytes),
 }
 
 impl Denc for ServiceTicketInfo {
@@ -132,11 +143,16 @@ impl Denc for ServiceTicketInfo {
         self.encrypted_service_ticket.encode(buf, features)?;
         self.ticket_enc.encode(buf, 0)?;
 
-        // C++ encode(bufferlist, bl): outer length prefix around the ticket blob
-        let mut temp_buf =
-            bytes::BytesMut::with_capacity(self.ticket_blob.encoded_size(features).unwrap_or(64));
-        self.ticket_blob.encode(&mut temp_buf, features)?;
-        temp_buf.freeze().encode(buf, 0)?;
+        match &self.ticket_blob {
+            TicketBlobField::Clear(blob) => {
+                // C++ encode(bufferlist, bl): outer length prefix around the ticket blob
+                let mut temp_buf =
+                    bytes::BytesMut::with_capacity(blob.encoded_size(features).unwrap_or(64));
+                blob.encode(&mut temp_buf, features)?;
+                temp_buf.freeze().encode(buf, 0)?;
+            }
+            TicketBlobField::Encrypted(ciphertext) => ciphertext.encode(buf, 0)?,
+        }
 
         Ok(())
     }
@@ -147,7 +163,14 @@ impl Denc for ServiceTicketInfo {
         let ticket_enc = u8::decode(buf, 0)?;
 
         let ticket_blob_bytes = Bytes::decode(buf, 0)?;
-        let ticket_blob = CephXTicketBlob::decode(&mut ticket_blob_bytes.as_ref(), features)?;
+        let ticket_blob = if ticket_enc == 0 {
+            TicketBlobField::Clear(CephXTicketBlob::decode(
+                &mut ticket_blob_bytes.as_ref(),
+                features,
+            )?)
+        } else {
+            TicketBlobField::Encrypted(ticket_blob_bytes)
+        };
 
         Ok(Self {
             service_id,
@@ -158,12 +181,16 @@ impl Denc for ServiceTicketInfo {
     }
 
     fn encoded_size(&self, features: u64) -> Option<usize> {
+        let blob_len = match &self.ticket_blob {
+            TicketBlobField::Clear(blob) => blob.encoded_size(features)?,
+            TicketBlobField::Encrypted(ciphertext) => ciphertext.len(),
+        };
         Some(
             4 + // service_id
             self.encrypted_service_ticket.encoded_size(features)? +
             1 + // ticket_enc
             4 + // outer length prefix
-            self.ticket_blob.encoded_size(features)?,
+            blob_len,
         )
     }
 }
@@ -566,12 +593,13 @@ mod tests {
                 version: 1,
                 encrypted_data: encrypted_data.clone(),
             },
-            ticket_enc: 1,
-            ticket_blob: CephXTicketBlob::new(42, ticket_blob_data.clone()),
+            ticket_enc: 0,
+            ticket_blob: TicketBlobField::Clear(CephXTicketBlob::new(42, ticket_blob_data.clone())),
         };
 
         let mut buf = BytesMut::new();
         info.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), info.encoded_size(0).unwrap());
 
         let mut read_buf = buf.freeze();
         let decoded = ServiceTicketInfo::decode(&mut read_buf, 0).unwrap();
@@ -581,9 +609,39 @@ mod tests {
             decoded.encrypted_service_ticket.encrypted_data,
             encrypted_data
         );
+        assert_eq!(decoded.ticket_enc, 0);
+        let TicketBlobField::Clear(blob) = decoded.ticket_blob else {
+            panic!("clear ticket blob decoded as encrypted");
+        };
+        assert_eq!(blob.secret_id, 42);
+        assert_eq!(blob.blob, ticket_blob_data);
+        assert_eq!(read_buf.remaining(), 0);
+    }
+
+    #[test]
+    fn test_service_ticket_info_keeps_an_encrypted_blob() {
+        let ciphertext = Bytes::from(vec![9u8; 48]);
+        let info = ServiceTicketInfo {
+            service_id: 32, // AUTH
+            encrypted_service_ticket: EncryptedServiceTicket {
+                version: 1,
+                encrypted_data: Bytes::from(vec![1, 2, 3, 4]),
+            },
+            ticket_enc: 1,
+            ticket_blob: TicketBlobField::Encrypted(ciphertext.clone()),
+        };
+
+        let mut buf = BytesMut::new();
+        info.encode(&mut buf, 0).unwrap();
+        assert_eq!(buf.len(), info.encoded_size(0).unwrap());
+
+        let mut read_buf = buf.freeze();
+        let decoded = ServiceTicketInfo::decode(&mut read_buf, 0).unwrap();
         assert_eq!(decoded.ticket_enc, 1);
-        assert_eq!(decoded.ticket_blob.secret_id, 42);
-        assert_eq!(decoded.ticket_blob.blob, ticket_blob_data);
+        let TicketBlobField::Encrypted(bytes) = decoded.ticket_blob else {
+            panic!("encrypted ticket blob decoded as clear");
+        };
+        assert_eq!(bytes, ciphertext);
         assert_eq!(read_buf.remaining(), 0);
     }
 
@@ -597,8 +655,8 @@ mod tests {
                 version: 1,
                 encrypted_data: encrypted_data.clone(),
             },
-            ticket_enc: 1,
-            ticket_blob: CephXTicketBlob::new(42, ticket_blob_data.clone()),
+            ticket_enc: 0,
+            ticket_blob: TicketBlobField::Clear(CephXTicketBlob::new(42, ticket_blob_data.clone())),
         };
 
         let reply = ServiceTicketReply {
