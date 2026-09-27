@@ -446,10 +446,13 @@ against v19.2.2.
   (`rados-cls/src/otp.rs`, 5b8fe0c, PR #17), tested by
   `zero_step_size_is_refused_before_sending`.
 - **Found:** rados-rs cls_otp research, with a liboath probe, 2026-09-25.
-- **Upstream:** not filed, by the owner's decision of 2026-09-27: leave it
-  public and do not report it. It was already public in rados-rs's
-  `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123) from
-  2026-09-26.
+- **Upstream:** filed 2026-09-27 as tracker #80948 (rgw, Bug, New), by the
+  rgw-go session at the owner's direction there; the rados-rs session had
+  recorded "leave public, no report" earlier the same day. Already public in
+  rados-rs's `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123)
+  from 2026-09-26. Reachable only by a privileged actor: RADOS write caps on
+  the OTP pool, or radosgw's admin API with the metadata=write cap; no S3
+  end-user path (rgw-go's analysis).
 
 ## CEPH-BUG-013: cls_otp records the wrong replay index for a past-step match
 
@@ -479,10 +482,11 @@ against v19.2.2.
 - **rados-rs:** documented in `rados-cls/src/otp.rs` (5b8fe0c, PR #17) and
   pinned by `otp_past_step_quirk` (9ce2255, PR #17).
 - **Found:** rados-rs cls_otp research, 2026-09-25.
-- **Upstream:** not filed, by the owner's decision of 2026-09-27: leave it
-  public and do not report it. It was already public in rados-rs's
-  `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123) from
-  2026-09-26.
+- **Upstream:** filed 2026-09-27 as tracker #80949 (rgw, Bug, New), by the
+  rgw-go session at the owner's direction there; the rados-rs session had
+  recorded "leave public, no report" earlier the same day. Already public in
+  rados-rs's `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123)
+  from 2026-09-26.
 
 ## CEPH-BUG-014: cls_version's client header documents EAGAIN, but the class returns ECANCELED
 
