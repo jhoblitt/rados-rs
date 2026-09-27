@@ -761,6 +761,77 @@ impl CephXClientHandler {
         Ok(payload.freeze())
     }
 
+    /// The services whose tickets are due for renewal, for a
+    /// `CEPHX_GET_PRINCIPAL_SESSION_KEY` request. AUTH is never included:
+    /// Ceph's client does not ask for it there and the monitor skips it.
+    pub fn service_keys_due(&self) -> EntityType {
+        let Some(session) = self.session.as_ref() else {
+            return EntityType::empty();
+        };
+        session
+            .ticket_handlers
+            .iter()
+            .filter(|(service, handler)| **service != EntityType::AUTH && handler.need_key())
+            .fold(EntityType::empty(), |keys, (service, _)| keys | *service)
+    }
+
+    /// Mark every service ticket except AUTH as due for renewal, keeping its
+    /// blob, as C++ `invalidate_all_tickets` does when the monmap's auth epoch
+    /// rises. The AUTH ticket stays valid: the wipe that raises the epoch keeps
+    /// the AUTH rotating keys, and it authorizes the renewal request.
+    pub fn invalidate_service_tickets(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        for (service, handler) in session.ticket_handlers.iter_mut() {
+            if *service != EntityType::AUTH {
+                handler.renew_after = Some(std::time::UNIX_EPOCH);
+            }
+        }
+    }
+
+    /// Store the tickets of a monitor's reply to a
+    /// `CEPHX_GET_PRINCIPAL_SESSION_KEY` request (an `MAuthReply`'s
+    /// `result_bl`). The ticket list is encrypted under the AUTH session key.
+    /// Returns the services whose tickets were stored.
+    pub fn handle_principal_reply(&mut self, mut reply: Bytes) -> Result<EntityType> {
+        use crate::auth::protocol::{CEPHX_GET_PRINCIPAL_SESSION_KEY, CephXResponseHeader};
+
+        let header = CephXResponseHeader::decode(&mut reply, 0)?;
+        if header.request_type != CEPHX_GET_PRINCIPAL_SESSION_KEY {
+            debug!(
+                "Ignoring cephx reply of type 0x{:04x} outside authentication",
+                header.request_type
+            );
+            return Ok(EntityType::empty());
+        }
+        if header.status != 0 {
+            return Err(CephXError::AuthenticationFailed(format!(
+                "principal session key request failed with status {}",
+                header.status
+            )));
+        }
+
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| CephXError::AuthenticationFailed("No session available".into()))?;
+        let global_id = session.global_id;
+        let auth_session_key = session
+            .ticket_handlers
+            .get(&EntityType::AUTH)
+            .map(|handler| handler.session_key.clone())
+            .ok_or_else(|| CephXError::AuthenticationFailed("No AUTH ticket".into()))?;
+
+        let tickets = self.decode_extra_tickets(&mut reply, &auth_session_key)?;
+        debug!("Principal reply renewed {} tickets", tickets.len());
+        let stored = tickets.iter().fold(EntityType::empty(), |keys, ticket| {
+            keys | ticket.service_type
+        });
+        self.store_ticket_handlers(tickets, global_id)?;
+        Ok(stored)
+    }
+
     pub fn reset(&mut self) {
         debug!("Resetting CephX client handler");
         self.server_challenge = None;
@@ -1493,6 +1564,163 @@ mod tests {
                     .to_string();
                 assert!(err.contains("no previous session key"), "{err}");
             }
+        }
+
+        fn principal_reply(status: i32, request_type: u16, tickets: &[ServiceTicketInfo]) -> Bytes {
+            let mut bl = BytesMut::new();
+            CephXResponseHeader {
+                request_type,
+                status,
+            }
+            .encode(&mut bl, 0)
+            .unwrap();
+            bl.extend_from_slice(&ticket_list(tickets));
+            bl.freeze()
+        }
+
+        fn stored_services(handler: &CephXClientHandler) -> Vec<u32> {
+            let mut services: Vec<u32> = handler
+                .get_session()
+                .unwrap()
+                .ticket_handlers
+                .keys()
+                .map(|s| s.bits())
+                .collect();
+            services.sort();
+            services
+        }
+
+        #[test]
+        fn principal_reply_replaces_service_tickets() {
+            use crate::auth::protocol::CEPHX_GET_PRINCIPAL_SESSION_KEY;
+            for t in KEY_TYPES {
+                let (mut handler, keys) =
+                    authenticate(t, t, &[(EntityType::OSD, t), (EntityType::MGR, t)]);
+                let services_before = stored_services(&handler);
+                let auth = keys[&EntityType::AUTH.bits()].clone();
+                let old_osd = keys[&EntityType::OSD.bits()].clone();
+                let new_osd = random_key(t);
+                let new_mgr = random_key(t);
+
+                let reply = principal_reply(
+                    0,
+                    CEPHX_GET_PRINCIPAL_SESSION_KEY,
+                    &[
+                        ticket_info(EntityType::OSD, &auth, &new_osd, 55, None),
+                        // A sealed blob opens with the previous MGR key.
+                        ticket_info(
+                            EntityType::MGR,
+                            &auth,
+                            &new_mgr,
+                            56,
+                            Some(&keys[&EntityType::MGR.bits()]),
+                        ),
+                    ],
+                );
+                assert_eq!(
+                    handler.handle_principal_reply(reply).unwrap(),
+                    EntityType::OSD | EntityType::MGR
+                );
+
+                assert_eq!(stored_services(&handler), services_before);
+                let (key, secret_id) = stored(&handler, EntityType::OSD);
+                assert_eq!(key.crypto_type, new_osd.crypto_type);
+                assert_eq!(key.secret, new_osd.secret);
+                assert_ne!(key.secret, old_osd.secret);
+                assert_eq!(secret_id, 55);
+                let (key, secret_id) = stored(&handler, EntityType::MGR);
+                assert_eq!(key.secret, new_mgr.secret);
+                assert_eq!(secret_id, 56);
+                let (key, _) = stored(&handler, EntityType::AUTH);
+                assert_eq!(key.secret, auth.secret);
+            }
+        }
+
+        #[test]
+        fn principal_reply_of_another_type_is_ignored() {
+            let (mut handler, keys) = authenticate(
+                KeyType::Aes,
+                KeyType::Aes,
+                &[(EntityType::OSD, KeyType::Aes)],
+            );
+            let auth = keys[&EntityType::AUTH.bits()].clone();
+            let reply = principal_reply(
+                0,
+                CEPHX_GET_AUTH_SESSION_KEY,
+                &[ticket_info(
+                    EntityType::OSD,
+                    &auth,
+                    &random_key(KeyType::Aes),
+                    55,
+                    None,
+                )],
+            );
+            assert!(handler.handle_principal_reply(reply).unwrap().is_empty());
+            let (key, _) = stored(&handler, EntityType::OSD);
+            assert_eq!(key.secret, keys[&EntityType::OSD.bits()].secret);
+        }
+
+        #[test]
+        fn principal_reply_with_an_error_status_fails() {
+            use crate::auth::protocol::CEPHX_GET_PRINCIPAL_SESSION_KEY;
+            let (mut handler, _) = authenticate(KeyType::Aes, KeyType::Aes, &[]);
+            let reply = principal_reply(-13, CEPHX_GET_PRINCIPAL_SESSION_KEY, &[]);
+            assert!(handler.handle_principal_reply(reply).is_err());
+        }
+
+        #[test]
+        fn invalidation_leaves_auth_valid_and_keeps_blobs() {
+            let (mut handler, _) = authenticate(
+                KeyType::Aes256Krb5,
+                KeyType::Aes256Krb5,
+                &[
+                    (EntityType::OSD, KeyType::Aes256Krb5),
+                    (EntityType::MGR, KeyType::Aes),
+                ],
+            );
+            assert!(handler.service_keys_due().is_empty());
+
+            handler.invalidate_service_tickets();
+
+            let session = handler.get_session().unwrap();
+            for (service, th) in &session.ticket_handlers {
+                assert_eq!(th.need_key(), *service != EntityType::AUTH, "{service:?}");
+                assert!(th.ticket_blob.is_some(), "{service:?}");
+            }
+            assert_eq!(
+                handler.service_keys_due(),
+                EntityType::OSD | EntityType::MGR
+            );
+        }
+
+        #[test]
+        fn renewal_request_never_asks_for_auth() {
+            let (mut handler, _) = authenticate(
+                KeyType::Aes,
+                KeyType::Aes,
+                &[
+                    (EntityType::OSD, KeyType::Aes),
+                    (EntityType::MGR, KeyType::Aes),
+                ],
+            );
+            for th in handler
+                .get_session_mut()
+                .unwrap()
+                .ticket_handlers
+                .values_mut()
+            {
+                th.renew_after = Some(std::time::UNIX_EPOCH);
+            }
+            let needed = handler.service_keys_due();
+            assert_eq!(needed, EntityType::OSD | EntityType::MGR);
+
+            // The request ends with CephXServiceTicketRequest: struct_v, keys.
+            let request = handler
+                .build_ticket_renewal_request(GLOBAL_ID, needed)
+                .unwrap();
+            let keys = u32::from_le_bytes(request[request.len() - 4..].try_into().unwrap());
+            assert_eq!(keys, (EntityType::OSD | EntityType::MGR).bits());
+            assert_eq!(keys & EntityType::AUTH.bits(), 0);
         }
     }
 }
