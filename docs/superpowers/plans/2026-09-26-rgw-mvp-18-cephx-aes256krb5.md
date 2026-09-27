@@ -1316,7 +1316,16 @@ cluster's CLI):
   live.
 - **Mutual authentication of the OSD.** rados-rs never checks the OSD's
   `nonce_plus_one` reply (C++ `verify_reply`, `CephxProtocol.cc:594`),
-  so the OSD is not authenticated to the client. Pre-existing.
+  so the OSD is not authenticated to the client. Pre-existing. C++
+  also fails the connection when the authorizer reply does not decrypt,
+  in every mode; rados-rs ignores that in CRC mode (`provider.rs`,
+  found by the Part A review). Fix both together.
+- **The msgr2 server side does not cross its SECURE nonces.**
+  `StateMachine::setup_encryption` always uses rx for RX and tx for TX;
+  C++ `finish_auth` passes `crossed=true` (`ProtocolV2.cc`,
+  `crypto_onwire.cc`). Unreachable today (no cephx mock server completes
+  a handshake) and it fails closed on the first GCM tag; fix before any
+  server-side SECURE use.
 - **A second mon handshake starts in the wrong phase.** On the shared
   handler it reuses the stale `server_challenge`: `reset()`
   (`client.rs:718-723`) has no production caller, and `build_auth_payload`
