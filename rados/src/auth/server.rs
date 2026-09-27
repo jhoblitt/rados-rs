@@ -4,11 +4,13 @@ use crate::Denc;
 use crate::auth::error::{CephXError, Result};
 use crate::auth::keyring::Keyring;
 use crate::auth::protocol::{
-    AES_KEY_LEN, AuthMode, CEPHX_GET_AUTH_SESSION_KEY, CephXAuthenticate, CephXRequestHeader,
-    CephXServerChallenge,
+    AES_KEY_LEN, AuthMode, CEPHX_GET_AUTH_SESSION_KEY, CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET,
+    CEPHX_KEY_USAGE_TICKET_INFO, CEPHX_KEY_USAGE_TICKET_SESSION_KEY, CephXAuthenticate,
+    CephXRequestHeader, CephXServerChallenge,
 };
 use crate::auth::types::{
     AuthCapsInfo, AuthTicket, CephXServiceTicketInfo, CephXTicketBlob, CryptoKey, EntityName,
+    KeyType,
 };
 use bytes::{Bytes, BytesMut};
 use rand::RngCore;
@@ -20,6 +22,8 @@ use tracing::{debug, info, warn};
 const DEFAULT_INITIAL_GLOBAL_ID: u64 = 1000;
 /// Default service ticket TTL in seconds (1 hour)
 const DEFAULT_SERVICE_TICKET_TTL_SECS: u64 = 3600;
+/// Connection secret length; it does not depend on the key type.
+const CONNECTION_SECRET_LEN: usize = 16;
 
 /// Server-side authentication handler for CephX protocol
 ///
@@ -63,10 +67,23 @@ impl CephXServerHandler {
         self.service_secrets.insert(service_id, secret);
     }
 
-    fn random_aes_key() -> CryptoKey {
-        let mut bytes = vec![0u8; AES_KEY_LEN];
+    fn random_bytes(len: usize) -> Bytes {
+        let mut bytes = vec![0u8; len];
         rand::thread_rng().fill_bytes(&mut bytes);
-        CryptoKey::new(Bytes::from(bytes))
+        Bytes::from(bytes)
+    }
+
+    fn random_key(key_type: KeyType) -> Result<CryptoKey> {
+        let len = match key_type {
+            KeyType::Aes => AES_KEY_LEN,
+            KeyType::Aes256Krb5 => crate::auth::aes256krb5::KEY_LEN,
+            KeyType::None => {
+                return Err(CephXError::CryptographicError(
+                    "cannot generate a session key of type none".into(),
+                ));
+            }
+        };
+        CryptoKey::new(key_type, Self::random_bytes(len))
     }
 
     fn allocate_global_id(&mut self) -> u64 {
@@ -136,7 +153,7 @@ impl CephXServerHandler {
         entity_name: &EntityName,
         global_id: u64,
         payload: &[u8],
-    ) -> Result<(CryptoKey, CryptoKey, Bytes)> {
+    ) -> Result<(CryptoKey, Bytes, Bytes)> {
         let mut buf = Bytes::copy_from_slice(payload);
 
         let header = CephXRequestHeader::decode(&mut buf, 0)?;
@@ -176,7 +193,7 @@ impl CephXServerHandler {
         })? + 1;
 
         let key_bytes = authenticate.key.to_le_bytes();
-        let decrypted = client_secret.decrypt(&key_bytes)?;
+        let decrypted = client_secret.decrypt(0, &key_bytes)?;
 
         if decrypted.len() < std::mem::size_of::<u64>() {
             return Err(CephXError::AuthenticationFailed(
@@ -199,19 +216,25 @@ impl CephXServerHandler {
 
         info!("Server: Client {} authenticated successfully", entity_name);
 
-        let session_key = Self::random_aes_key();
+        let client_key_type = client_secret.key_type()?;
+        let session_key = Self::random_key(client_key_type)?;
 
         debug!("Server: Generated session key: {} bytes", session_key.len());
 
-        let service_tickets =
-            self.generate_service_tickets(entity_name, global_id, authenticate.other_keys)?;
+        let service_tickets = self.generate_service_tickets(
+            entity_name,
+            global_id,
+            client_key_type,
+            authenticate.other_keys,
+        )?;
 
         let mut response = BytesMut::new();
-        let encrypted_session_key = client_secret.encrypt(&session_key.secret)?;
+        let encrypted_session_key =
+            client_secret.encrypt(CEPHX_KEY_USAGE_TICKET_SESSION_KEY, &session_key.secret)?;
         encrypted_session_key.encode(&mut response, 0)?;
         service_tickets.encode(&mut response, 0)?;
 
-        let connection_secret = Self::random_aes_key();
+        let connection_secret = Self::random_bytes(CONNECTION_SECRET_LEN);
 
         debug!(
             "Server: Generated connection_secret: {} bytes",
@@ -225,6 +248,7 @@ impl CephXServerHandler {
         &self,
         entity_name: &EntityName,
         global_id: u64,
+        client_key_type: KeyType,
         requested_services: u32,
     ) -> Result<Vec<CephXTicketBlob>> {
         let mut tickets = Vec::with_capacity(self.service_secrets.len());
@@ -247,7 +271,7 @@ impl CephXServerHandler {
 
             debug!("Server: Generating ticket for service_id: {}", service_id);
 
-            let service_key = Self::random_aes_key();
+            let service_key = Self::random_key(client_key_type.min(service_secret.key_type()?))?;
 
             let mut ticket = AuthTicket::new(entity_name.clone(), global_id);
             ticket.set_validity(valid_from, valid_until);
@@ -259,7 +283,8 @@ impl CephXServerHandler {
             let mut encoded_ticket = BytesMut::new();
             ticket_info.encode(&mut encoded_ticket, 0)?;
 
-            let encrypted_ticket = service_secret.encrypt(&encoded_ticket)?;
+            let encrypted_ticket =
+                service_secret.encrypt(CEPHX_KEY_USAGE_TICKET_INFO, &encoded_ticket)?;
             let ticket_blob = CephXTicketBlob::new(0, encrypted_ticket);
 
             tickets.push(ticket_blob);
@@ -276,7 +301,7 @@ impl CephXServerHandler {
         global_id: u64,
         connection_mode: u8,
         session_key: &CryptoKey,
-        connection_secret: &CryptoKey,
+        connection_secret: &[u8],
         service_tickets: Bytes,
     ) -> Result<Bytes> {
         let mut response = BytesMut::new();
@@ -284,7 +309,8 @@ impl CephXServerHandler {
         connection_mode.encode(&mut response, 0)?;
         response.extend_from_slice(&service_tickets);
 
-        let encrypted_connection_secret = session_key.encrypt(&connection_secret.secret)?;
+        let encrypted_connection_secret =
+            session_key.encrypt(CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET, connection_secret)?;
         encrypted_connection_secret.encode(&mut response, 0)?;
 
         // Empty extra_tickets
@@ -301,7 +327,7 @@ mod tests {
 
     const CLIENT_KEYRING: &str = r#"
 [client.admin]
-    key = AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==
+    key = AQAAAAAAAAAAABAAAAECAwQFBgcICQoLDA0ODw==
 "#;
 
     fn test_keyring() -> Keyring {
@@ -309,7 +335,8 @@ mod tests {
     }
 
     fn test_secret(seed: u8) -> CryptoKey {
-        CryptoKey::new(Bytes::from(vec![seed; AES_KEY_LEN]))
+        CryptoKey::new(KeyType::Aes, Bytes::from(vec![seed; AES_KEY_LEN]))
+            .expect("16-byte AES secret is valid")
     }
 
     fn decode_ticket_services(
@@ -322,7 +349,8 @@ mod tests {
             let mut matched = None;
 
             for (service_type, secret) in service_secrets {
-                let Ok(decrypted) = secret.decrypt(&ticket.blob) else {
+                let Ok(decrypted) = secret.decrypt(CEPHX_KEY_USAGE_TICKET_INFO, &ticket.blob)
+                else {
                     continue;
                 };
                 let mut decrypted_buf = decrypted.as_ref();
@@ -361,6 +389,7 @@ mod tests {
             .generate_service_tickets(
                 &"client.admin".parse().expect("entity name should parse"),
                 4242,
+                KeyType::Aes,
                 requested_services.bits(),
             )
             .expect("ticket generation should succeed");

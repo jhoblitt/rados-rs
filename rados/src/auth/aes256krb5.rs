@@ -7,7 +7,6 @@
 //! under `Ke`, and `H` is HMAC-SHA384 under `Ki` over a zero IV and `C`,
 //! truncated to 24 bytes. `Ke` and `Ki` are derived from the whole secret for
 //! each key usage.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::auth::error::{CephXError, Result};
 use aes::Aes256;
@@ -26,6 +25,7 @@ pub(crate) const MIN_CIPHERTEXT_LEN: usize = CONFOUNDER_LEN + MAC_LEN;
 
 /// Derivation kinds of RFC 3961: checksum (`Kc`), encryption (`Ke`) and
 /// integrity (`Ki`).
+#[cfg(test)]
 pub(crate) const KIND_CHECKSUM: u8 = 0x99;
 pub(crate) const KIND_ENCRYPTION: u8 = 0xAA;
 pub(crate) const KIND_INTEGRITY: u8 = 0x55;

@@ -237,7 +237,12 @@ impl ServiceAuthProvider {
         let sess_key = session_key?;
         let mut buf = payload.clone();
         let encrypted_data = Bytes::decode(&mut buf, 0).ok()?;
-        let mut decrypted = sess_key.decrypt(&encrypted_data).ok()?;
+        let mut decrypted = sess_key
+            .decrypt(
+                crate::auth::protocol::CEPHX_KEY_USAGE_AUTHORIZE_REPLY,
+                &encrypted_data,
+            )
+            .ok()?;
         let envelope = crate::auth::protocol::CephXEncryptedEnvelope::<
             crate::auth::protocol::CephXAuthorizeReply,
         >::decode(&mut decrypted, 0)
@@ -281,13 +286,13 @@ impl AuthProvider for ServiceAuthProvider {
             CephXError::ProtocolError("No service_type set in ServiceAuthProvider".into())
         })?;
 
-        // AUTH_REPLY_MORE carries an encrypted authorize challenge (u32 length
-        // prefix + 2 AES blocks = 36 bytes).  AUTH_DONE carries the authorize
-        // reply, which in CRC mode is also 36 bytes (nonce_plus_one only, no
-        // connection secret).  Distinguishing by payload size is therefore
-        // ambiguous: use con_mode == 0 instead, which is only set by the
-        // AUTH_REPLY_MORE call path (handle_auth_reply_more passes global_id=0,
-        // con_mode=0, while handle_auth_done always passes the real con_mode ≥ 1).
+        // AUTH_REPLY_MORE carries an encrypted authorize challenge, and AUTH_DONE
+        // the authorize reply, which in CRC mode has no connection secret. Their
+        // sizes can coincide (both are 36 bytes under an AES key), so
+        // distinguishing them by payload size is ambiguous: use con_mode == 0
+        // instead, which is only set by the AUTH_REPLY_MORE call path
+        // (handle_auth_reply_more passes global_id=0, con_mode=0, while
+        // handle_auth_done always passes the real con_mode ≥ 1).
         if con_mode == 0 {
             debug!("Received encrypted authorize challenge, decrypting...");
 

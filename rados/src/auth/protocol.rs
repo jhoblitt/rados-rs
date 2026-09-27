@@ -14,6 +14,17 @@ pub const CEPH_AUTH_GSS: u32 = 0x4;
 pub const CEPHX_GET_AUTH_SESSION_KEY: u16 = 0x0100;
 pub const CEPHX_GET_PRINCIPAL_SESSION_KEY: u16 = 0x0200;
 
+/// Cephx key usages (`CephxProtocol.h`). The aes256k cipher derives its keys
+/// per usage; AES ignores it. C++'s plain `encrypt`/`decrypt` is usage 0.
+pub const CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET: u32 = 0x03;
+pub const CEPHX_KEY_USAGE_TICKET_SESSION_KEY: u32 = 0x04;
+pub const CEPHX_KEY_USAGE_TICKET_BLOB: u32 = 0x05;
+pub const CEPHX_KEY_USAGE_AUTHORIZE: u32 = 0x10;
+pub const CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE: u32 = 0x11;
+pub const CEPHX_KEY_USAGE_AUTHORIZE_REPLY: u32 = 0x12;
+pub const CEPHX_KEY_USAGE_ROTATING_SECRET: u32 = 0x20;
+pub const CEPHX_KEY_USAGE_TICKET_INFO: u32 = 0x30;
+
 /// AES-128 key length in bytes
 pub const AES_KEY_LEN: usize = 16;
 /// AES block size in bytes
@@ -491,6 +502,7 @@ impl Denc for CephXAuthorizeReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::types::test_keys::AES_TEST_KEY;
     use bytes::BytesMut;
     use serde_json::json;
     use std::time::Duration;
@@ -512,9 +524,7 @@ mod tests {
 
     #[test]
     fn test_service_ticket_encode_decode() {
-        let key =
-            CryptoKey::from_base64("AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==")
-                .unwrap();
+        let key = CryptoKey::from_base64(AES_TEST_KEY).unwrap();
         let validity = Duration::from_secs(3600);
         let ticket = CephXServiceTicket::new(key.clone(), validity);
 

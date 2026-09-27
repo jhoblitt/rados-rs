@@ -454,7 +454,7 @@ impl AuthServer {
                 global_id,
                 connection_mode,
                 session_key: Some(session_key.secret.clone()),
-                connection_secret: Some(connection_secret.secret.clone()),
+                connection_secret: Some(connection_secret),
             },
             Some(done_frame),
         ))

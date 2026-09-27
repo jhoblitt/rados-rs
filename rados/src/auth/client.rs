@@ -3,10 +3,14 @@
 use crate::Denc;
 use crate::auth::error::{CephXError, Result};
 use crate::auth::protocol::{
-    AuthMode, CEPHX_GET_AUTH_SESSION_KEY, CephXAuthenticate, CephXRequestHeader,
+    AuthMode, CEPHX_GET_AUTH_SESSION_KEY, CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET,
+    CEPHX_KEY_USAGE_AUTHORIZE, CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE, CEPHX_KEY_USAGE_TICKET_BLOB,
+    CEPHX_KEY_USAGE_TICKET_SESSION_KEY, CephXAuthenticate, CephXRequestHeader,
     CephXServerChallenge,
 };
-use crate::auth::types::{CephXSession, CephXTicketBlob, CryptoKey, EntityName, EntityType};
+use crate::auth::types::{
+    CephXSession, CephXTicketBlob, CryptoKey, EntityName, EntityType, KeyType,
+};
 use bytes::{Buf, Bytes, BytesMut};
 use rand::RngCore;
 use std::time::Duration;
@@ -177,6 +181,11 @@ impl CephXClientHandler {
             server_challenge, client_challenge
         );
 
+        let key_type = secret_key.key_type()?;
+        if key_type != KeyType::Aes {
+            return Err(CephXError::UnsupportedKeyType(key_type.as_u16()));
+        }
+
         let envelope = CephXEncryptedEnvelope {
             payload: CephXChallengeBlob {
                 server_challenge,
@@ -187,7 +196,7 @@ impl CephXClientHandler {
         let mut bl = BytesMut::with_capacity(32);
         envelope.encode(&mut bl, 0)?;
 
-        let ciphertext = secret_key.encrypt(&bl)?;
+        let ciphertext = secret_key.encrypt(0, &bl)?;
 
         // C++ encode_encrypt() adds a u32 length prefix before XOR folding
         let mut folding_buffer = BytesMut::with_capacity(4 + ciphertext.len());
@@ -243,7 +252,10 @@ impl CephXClientHandler {
     ) -> Result<(CryptoKey, Duration)> {
         use crate::auth::protocol::CephXEncryptedEnvelope;
 
-        let mut decrypted_data = secret_key.decrypt(&encrypted_ticket.encrypted_data)?;
+        let mut decrypted_data = secret_key.decrypt(
+            CEPHX_KEY_USAGE_TICKET_SESSION_KEY,
+            &encrypted_ticket.encrypted_data,
+        )?;
 
         let envelope = CephXEncryptedEnvelope::<crate::auth::protocol::CephXServiceTicket>::decode(
             &mut decrypted_data,
@@ -315,7 +327,7 @@ impl CephXClientHandler {
         let ticket_enc = u8::decode(buf, 0)?;
         let mut ticket_blob_bytes = if ticket_enc != 0 {
             let encrypted_bl = Bytes::decode(buf, 0)?;
-            session_key.decrypt(&encrypted_bl)?
+            session_key.decrypt(CEPHX_KEY_USAGE_TICKET_BLOB, &encrypted_bl)?
         } else {
             Bytes::decode(buf, 0)?
         };
@@ -347,7 +359,8 @@ impl CephXClientHandler {
             return Ok(None);
         }
 
-        let mut decrypted_secret = session_key.decrypt(&encrypted_secret)?;
+        let mut decrypted_secret =
+            session_key.decrypt(CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET, &encrypted_secret)?;
 
         let envelope = CephXEncryptedEnvelope::<Bytes>::decode(&mut decrypted_secret, 0)?;
 
@@ -564,7 +577,9 @@ impl CephXClientHandler {
         let encrypted_data = Bytes::decode(&mut encrypted_payload, 0)?;
         trace!("encrypted_len: {}", encrypted_data.len());
 
-        let mut dec_buf = handler.session_key.decrypt(&encrypted_data)?;
+        let mut dec_buf = handler
+            .session_key
+            .decrypt(CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE, &encrypted_data)?;
 
         let envelope = CephXEncryptedEnvelope::<CephXAuthorizeReply>::decode(&mut dec_buf, 0)?;
 
@@ -659,7 +674,7 @@ impl CephXClientHandler {
         let mut envelope_buf = BytesMut::with_capacity(64);
         envelope.encode(&mut envelope_buf, 0)?;
 
-        let ciphertext = session_key.encrypt(&envelope_buf)?;
+        let ciphertext = session_key.encrypt(CEPHX_KEY_USAGE_AUTHORIZE, &envelope_buf)?;
 
         let mut result = BytesMut::with_capacity(4 + ciphertext.len());
         (ciphertext.len() as u32).encode(&mut result, 0)?;
@@ -727,6 +742,7 @@ impl CephXClientHandler {
 mod tests {
     use super::*;
     use crate::auth::protocol::AuthMode;
+    use crate::auth::types::test_keys::AES_TEST_KEY;
     use crate::auth::types::{CephXSession, CryptoKey};
 
     #[test]
@@ -749,9 +765,7 @@ mod tests {
     #[test]
     fn test_set_secret_key() {
         let mut handler = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
-        let key =
-            CryptoKey::from_base64("AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==")
-                .unwrap();
+        let key = CryptoKey::from_base64(AES_TEST_KEY).unwrap();
 
         handler.set_secret_key(key.clone());
         assert!(handler.secret_key.is_some());
@@ -761,7 +775,7 @@ mod tests {
     #[test]
     fn test_set_secret_key_from_base64() {
         let mut handler = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
-        let base64_key = "AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==";
+        let base64_key = AES_TEST_KEY;
 
         handler.set_secret_key_from_base64(base64_key).unwrap();
         assert!(handler.secret_key.is_some());
@@ -835,8 +849,7 @@ mod tests {
         handler.session = Some(CephXSession::new(
             entity_name,
             12345,
-            CryptoKey::from_base64("AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==")
-                .unwrap(),
+            CryptoKey::from_base64(AES_TEST_KEY).unwrap(),
         ));
 
         handler.reset();
@@ -847,11 +860,9 @@ mod tests {
 
     #[test]
     fn test_crypto_key_decrypt_invalid_ciphertext() {
-        let key =
-            CryptoKey::from_base64("AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==")
-                .unwrap();
+        let key = CryptoKey::from_base64(AES_TEST_KEY).unwrap();
 
-        let result = key.decrypt(&[1, 2, 3, 4]);
+        let result = key.decrypt(0, &[1, 2, 3, 4]);
         assert!(result.is_err());
     }
 
@@ -888,11 +899,9 @@ mod tests {
 
     #[test]
     fn test_crypto_key_decrypt_empty_ciphertext() {
-        let key =
-            CryptoKey::from_base64("AQAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAABAgMEBQYHCA==")
-                .unwrap();
+        let key = CryptoKey::from_base64(AES_TEST_KEY).unwrap();
 
-        let result = key.decrypt(&[]);
+        let result = key.decrypt(0, &[]);
         assert!(result.is_err());
     }
 }
