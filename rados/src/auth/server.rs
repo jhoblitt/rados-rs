@@ -1,6 +1,7 @@
 //! CephX server-side authentication handler
 
 use crate::Denc;
+use crate::auth::client::cephx_calc_client_server_challenge;
 use crate::auth::error::{CephXError, Result};
 use crate::auth::keyring::Keyring;
 use crate::auth::protocol::{
@@ -29,6 +30,8 @@ const CONNECTION_SECRET_LEN: usize = 16;
 ///
 /// This handler verifies client credentials, generates session keys,
 /// and creates service tickets for authenticated clients.
+/// Its AUTH_DONE layout is neither Ceph's nor the one
+/// `CephXClientHandler::handle_auth_done` decodes.
 #[derive(Debug)]
 pub struct CephXServerHandler {
     /// Keyring containing client secrets
@@ -188,29 +191,21 @@ impl CephXServerHandler {
                 CephXError::AuthenticationFailed(format!("No secret for {entity_name}"))
             })?;
 
-        let expected_response = self.server_challenge.ok_or_else(|| {
+        let server_challenge = self.server_challenge.ok_or_else(|| {
             CephXError::ProtocolError("Server challenge not set before authenticate".to_string())
-        })? + 1;
-
-        let key_bytes = authenticate.key.to_le_bytes();
-        let decrypted = client_secret.decrypt(0, &key_bytes)?;
-
-        if decrypted.len() < std::mem::size_of::<u64>() {
-            return Err(CephXError::AuthenticationFailed(
-                "Invalid challenge response".to_string(),
-            ));
-        }
-
-        let mut decrypted_buf = decrypted.as_ref();
-        let client_response = u64::decode(&mut decrypted_buf, 0)?;
-
-        if client_response != expected_response {
+        })?;
+        let expected = cephx_calc_client_server_challenge(
+            client_secret,
+            server_challenge,
+            authenticate.client_challenge,
+        )?;
+        if expected != authenticate.key {
             warn!(
-                "Server: Challenge verification failed - expected {}, got {}",
-                expected_response, client_response
+                "Server: Challenge verification failed for {}: expected 0x{:016x}, got 0x{:016x}",
+                entity_name, expected, authenticate.key
             );
             return Err(CephXError::AuthenticationFailed(
-                "Challenge verification failed".to_string(),
+                "challenge verification failed".to_string(),
             ));
         }
 
@@ -441,5 +436,125 @@ mod tests {
             generate_and_decode_tickets(EntityType::empty(), &configured_services);
 
         assert!(decoded_services.is_empty());
+    }
+
+    mod challenge {
+        use super::*;
+        use crate::auth::client::CephXClientHandler;
+        use crate::auth::types::test_keys::{AES_TEST_KEY, AES256K_TEST_KEY};
+
+        const OTHER_AES_KEY: &str = "AQAAAAAAAAAAABAAERERERERERERERERERERERE=";
+        const OTHER_AES256K_KEY: &str =
+            "AgAAAAAAAAAAACAAIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
+
+        fn keyring(key: &str) -> Keyring {
+            Keyring::from_string(&format!("[client.admin]\n    key = {key}\n")).unwrap()
+        }
+
+        /// Runs the first round against `server` and returns the client's
+        /// authenticate payload, built with `client_key`.
+        fn client_payload(
+            server: &mut CephXServerHandler,
+            client_key: &str,
+        ) -> (EntityName, u64, Bytes) {
+            let mut client = CephXClientHandler::new("client.admin", AuthMode::Mon).unwrap();
+            client.set_secret_key_from_base64(client_key).unwrap();
+            let initial = client.build_initial_request(0).unwrap();
+            let (entity, global_id, challenge) = server.handle_initial_request(&initial).unwrap();
+
+            let mut reply = BytesMut::new();
+            (challenge.len() as u32).encode(&mut reply, 0).unwrap();
+            reply.extend_from_slice(&challenge);
+            client.handle_auth_response(reply.freeze()).unwrap();
+            (
+                entity,
+                global_id,
+                client.build_authenticate_request().unwrap(),
+            )
+        }
+
+        fn authenticate(server_key: &str, client_key: &str) -> Result<()> {
+            let mut server = CephXServerHandler::new(keyring(server_key));
+            let (entity, global_id, payload) = client_payload(&mut server, client_key);
+            server
+                .handle_authenticate(&entity, global_id, &payload)
+                .map(|_| ())
+        }
+
+        #[test]
+        fn accepts_the_client_response() {
+            authenticate(AES_TEST_KEY, AES_TEST_KEY).unwrap();
+            authenticate(AES256K_TEST_KEY, AES256K_TEST_KEY).unwrap();
+        }
+
+        #[test]
+        fn rejects_a_different_key_of_the_same_type() {
+            for (server_key, client_key) in [
+                (OTHER_AES_KEY, AES_TEST_KEY),
+                (OTHER_AES256K_KEY, AES256K_TEST_KEY),
+            ] {
+                let err = authenticate(server_key, client_key).unwrap_err();
+                assert!(
+                    err.to_string().contains("challenge verification failed"),
+                    "{err}"
+                );
+            }
+        }
+
+        fn with_key(payload: &Bytes, key: impl FnOnce(u64) -> u64) -> Bytes {
+            let mut buf = payload.clone();
+            let header = CephXRequestHeader::decode(&mut buf, 0).unwrap();
+            let mut authenticate = CephXAuthenticate::decode(&mut buf, 0).unwrap();
+            authenticate.key = key(authenticate.key);
+            let mut out = BytesMut::new();
+            header.encode(&mut out, 0).unwrap();
+            authenticate.encode(&mut out, 0).unwrap();
+            out.freeze()
+        }
+
+        #[test]
+        fn rejects_a_response_off_by_one() {
+            for key in [AES_TEST_KEY, AES256K_TEST_KEY] {
+                let mut server = CephXServerHandler::new(keyring(key));
+                let (entity, global_id, payload) = client_payload(&mut server, key);
+                let bad = with_key(&payload, |k| k.wrapping_add(1));
+                assert!(
+                    server
+                        .handle_authenticate(&entity, global_id, &bad)
+                        .is_err()
+                );
+                server
+                    .handle_authenticate(&entity, global_id, &payload)
+                    .unwrap();
+            }
+        }
+
+        // The literal is the Python-computed fold of the client challenge test.
+        #[test]
+        fn aes256k_recomputed_response_matches_the_literal() {
+            let mut server = CephXServerHandler::new(keyring(AES256K_TEST_KEY));
+            server.server_challenge = Some(0x0123456789abcdef);
+            let entity: EntityName = "client.admin".parse().unwrap();
+            let payload = |key| {
+                let mut out = BytesMut::new();
+                CephXRequestHeader {
+                    request_type: CEPHX_GET_AUTH_SESSION_KEY,
+                }
+                .encode(&mut out, 0)
+                .unwrap();
+                CephXAuthenticate::new(0xfedcba9876543210, key, CephXTicketBlob::default(), 0)
+                    .encode(&mut out, 0)
+                    .unwrap();
+                out.freeze()
+            };
+            server
+                .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d33))
+                .unwrap();
+            assert!(
+                server
+                    .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d32))
+                    .is_err()
+            );
+        }
     }
 }
