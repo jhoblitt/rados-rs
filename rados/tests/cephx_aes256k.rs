@@ -32,7 +32,7 @@ fn keyring_path() -> String {
     let conf = std::env::var("CEPH_CONF").unwrap_or_else(|_| "/etc/ceph/ceph.conf".to_owned());
     CephConfig::from_file(&conf)
         .expect("ceph.conf")
-        .keyring()
+        .keyring_for(ENTITY)
         .expect("keyring in ceph.conf")
 }
 
