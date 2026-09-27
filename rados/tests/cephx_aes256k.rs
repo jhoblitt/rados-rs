@@ -1,18 +1,25 @@
-//! Cephx key-type cluster test: I/O with the keyring's key, then the ticket
-//! types the monitor issued. Run with:
+//! Cephx key-type cluster tests: I/O with the keyring's key, then the ticket
+//! types the monitor issued; and an aes and an aes256k client side by side.
+//! Run with:
 //!   CEPH_CONF=... cargo test -p rados --test cephx_aes256k -- --ignored --nocapture
 //!
 //! `CEPH_TEST_EXPECT_KEY_TYPE` pins the keyring key's type (1 = aes,
 //! 2 = aes256k), and `CEPH_TEST_EXPECT_OSD_TICKET_TYPE` the OSD ticket's; the
 //! OSD ticket defaults to the key's type when only the first is set.
+//!
+//! These tests change no cluster policy, so they may run alongside other
+//! suites. See `common` for running them against a rooket cluster.
 
+mod cephx;
 mod common;
 
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use bytes::Bytes;
 use common::{build_test_client, test_pool_name};
-use rados::{CephConfig, EntityType, Keyring, WatchEvent};
+use futures::FutureExt;
+use rados::{CephConfig, Client, EntityType, IoCtx, Keyring, WatchEvent};
 
 const ENTITY: &str = "client.admin";
 
@@ -117,4 +124,127 @@ async fn keyring_key_type_end_to_end() {
     }
 
     ioctx.remove(&oid).await.expect("remove");
+}
+
+/// `watcher_io` watches `oid`, `notifier_io` notifies it, and the notify
+/// gets the watcher's one ack.
+async fn watch_and_notify(watcher_io: &IoCtx, notifier_io: &IoCtx, oid: &str) {
+    let mut watcher = watcher_io.watch(oid).await.expect("watch");
+    let ack = async {
+        match tokio::time::timeout(Duration::from_secs(15), watcher.recv())
+            .await
+            .expect("a notify in time")
+            .expect("watch channel open")
+        {
+            WatchEvent::Notify { notify_id, .. } => watcher
+                .notify_ack(notify_id, Bytes::from_static(b"ack"))
+                .await
+                .expect("notify_ack"),
+            other => panic!("expected a notify, got {other:?}"),
+        }
+    };
+    let (result, ()) = tokio::join!(notifier_io.notify(oid, Bytes::from_static(b"ping"), 0), ack);
+    let result = result.expect("notify");
+    assert_eq!(result.acks.len(), 1, "{result:?}");
+    assert_eq!(result.acks[0].reply, Bytes::from_static(b"ack"));
+    watcher.unwatch().await.expect("unwatch");
+}
+
+async fn side_by_side(
+    admin: &Client,
+    service_cipher: u16,
+    entities: &mut Vec<cephx::Entity>,
+    objects: &[String; 2],
+) {
+    entities.push(cephx::create_entity(admin, "aes", "aes").await);
+    entities.push(cephx::create_entity(admin, "aes256k", "aes256k").await);
+    let aes = cephx::client_for(&entities[0]).await.expect("aes client");
+    let aes256k = cephx::client_for(&entities[1])
+        .await
+        .expect("aes256k client");
+
+    assert_eq!(
+        cephx::ticket_types(&aes).await,
+        (1, 1.min(service_cipher)),
+        "the aes client's AUTH and OSD ticket types"
+    );
+    assert_eq!(
+        cephx::ticket_types(&aes256k).await,
+        (2, 2.min(service_cipher)),
+        "the aes256k client's AUTH and OSD ticket types"
+    );
+
+    let pool = test_pool_name();
+    let aes_io = aes.open_pool(&pool).await.expect("aes pool");
+    let aes256k_io = aes256k.open_pool(&pool).await.expect("aes256k pool");
+    let [aes_obj, aes256k_obj] = objects;
+    aes_io
+        .write_full(aes_obj, Bytes::from_static(b"aes"))
+        .await
+        .expect("aes write");
+    aes256k_io
+        .write_full(aes256k_obj, Bytes::from_static(b"aes256k"))
+        .await
+        .expect("aes256k write");
+    let read = aes_io.read(aes256k_obj, 0, 64).await.expect("aes read");
+    assert_eq!(read.data, Bytes::from_static(b"aes256k"));
+    let read = aes256k_io.read(aes_obj, 0, 64).await.expect("aes256k read");
+    assert_eq!(read.data, Bytes::from_static(b"aes"));
+
+    watch_and_notify(&aes256k_io, &aes_io, aes256k_obj).await;
+    watch_and_notify(&aes_io, &aes256k_io, aes_obj).await;
+}
+
+/// Rook v1.20.7 allows both key types, keeps CSI's key AES and makes new
+/// keys aes256k: one entity of each type, both clients up at once.
+#[tokio::test]
+#[ignore]
+async fn two_key_types_side_by_side() {
+    common::init_tracing();
+
+    let admin = build_test_client().await.expect("admin client");
+    let Some(policy) = cephx::mon_auth(&admin).await else {
+        println!("skipped: the monmap has no cephx policy (Ceph before v19.2.6)");
+        return;
+    };
+    if !(policy.allowed.contains(&1) && policy.allowed.contains(&2)) {
+        println!(
+            "skipped: auth_allowed_ciphers {:?} lacks aes or aes256k",
+            policy.allowed
+        );
+        return;
+    }
+
+    let objects = [
+        cephx::unique("side-by-side-aes"),
+        cephx::unique("side-by-side-aes256k"),
+    ];
+    let mut entities = Vec::new();
+    let result = AssertUnwindSafe(side_by_side(
+        &admin,
+        policy.service_cipher,
+        &mut entities,
+        &objects,
+    ))
+    .catch_unwind()
+    .await;
+
+    match admin.open_pool(&test_pool_name()).await {
+        Ok(ioctx) => {
+            for oid in &objects {
+                if let Err(e) = cephx::remove_object(&ioctx, oid).await {
+                    eprintln!("cleanup: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("cleanup: opening the pool: {e}"),
+    }
+    for entity in &entities {
+        if let Err(e) = cephx::remove_entity(&admin, &entity.name).await {
+            eprintln!("cleanup: {e}");
+        }
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

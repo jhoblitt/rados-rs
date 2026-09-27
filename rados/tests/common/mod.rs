@@ -8,6 +8,55 @@
 //! The `#[allow(dead_code)]` attributes silence warnings in test binaries
 //! that only use a subset of the helpers — cargo compiles this module fresh
 //! for each test file.
+//!
+//! # Running against a rooket cluster
+//!
+//! The cluster suites, `rados-cls`'s included, need only `CEPH_CONF` and,
+//! for the two that call the C++ CLI (`object_locator_routing` and
+//! `osdclient_split_merge`), `CEPH_EXEC`. [rooket] provides both for a
+//! Rook-managed cluster, which is how the aes256k cluster tests are run.
+//!
+//! In any directory, write two files:
+//!
+//! ```text
+//! config.yaml                    profiles: [host-network]
+//! values/rook-ceph-cluster.yaml  cephImage: {tag: v19.2.6}
+//! ```
+//!
+//! Host networking puts the mons and OSDs on addresses the host can reach;
+//! `rooket ceph-config` refuses a cluster without it. The pinned image is
+//! the Ceph release under test. Then:
+//!
+//! ```text
+//! rooket up --rook-version v1.20.7 --workers 1 --config-dir <dir> --wait
+//! rooket ceph-config --out <conf-dir>
+//! export CEPH_CONF=<conf-dir>/ceph.conf
+//! export CEPH_EXEC="rooket k -n rook-ceph exec -i deploy/rook-ceph-tools --"
+//! ```
+//!
+//! `ceph-config` writes `ceph.conf` and the admin keyring it names; re-run
+//! it whenever the cluster is recreated, which makes a new admin key.
+//! `CEPH_EXEC` runs the cluster's `ceph` and `rados` in Rook's toolbox. Its
+//! default in the two CLI suites is compose's `docker exec -i ceph-mon`, so
+//! on a rooket cluster it must be set, and `-i` is required because `rados
+//! put` reads stdin.
+//!
+//! No pool setting is needed: rooket's one-worker base sets
+//! `osd_pool_default_size = 1`, and Rook allows pool deletion and size-one
+//! pools by default.
+//!
+//! Run the suites as `.github/workflows/test-with-ceph.yml` lists them.
+//! `osdclient_integration_test` creates `test-pool`, and every later suite,
+//! the `cephx_*` ones included, opens it without creating it, so it runs
+//! first. `cephx_policy` changes the cluster's auth policy and runs only as
+//! its own docs say.
+//!
+//! Compose sets `mon_max_pg_per_osd = 1000`, while Rook's single OSD keeps
+//! Squid's 250. The suites fit within it, so a PG-limit refusal would be a
+//! limit of this setup, not a regression. Nothing else here is
+//! compose-specific.
+//!
+//! [rooket]: https://github.com/jhoblitt/rooket
 
 #![allow(dead_code)]
 

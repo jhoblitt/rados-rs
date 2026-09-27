@@ -4,8 +4,8 @@
 //! resend recovers it. Run with:
 //!   CEPH_CONF=... cargo test -p rados --test osdclient_split_merge -- --ignored --nocapture
 //!
-//! `CEPH_EXEC` is the command prefix that runs the v19.2.2 `ceph` binary
-//! (default `docker exec -i ceph-mon`).
+//! `CEPH_EXEC` is the command prefix that runs the cluster's `ceph` binary
+//! (default `docker exec -i ceph-mon`); see `common` for a rooket cluster's.
 
 mod common;
 
