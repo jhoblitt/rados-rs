@@ -39,7 +39,7 @@ pub use msgr2::{
     MapMessage, MapReceiver, MapSender, MessageThrottle, Msgr2Error, ThrottleConfig, map_channel,
 };
 pub use osdclient::{
-    ALL_NSPACES, AllocHintFlags, BuiltOp, CmpOp, IoCtx, ListObjectEntry, ListResult,
+    ALL_NSPACES, AllocHintFlags, BuiltOp, CephRelease, CmpOp, IoCtx, ListObjectEntry, ListResult,
     ListWatchersReply, LockFlags, LockRequest, LockType, NotifyAck, NotifyResult, NotifyTimeout,
     OSDClient, OSDClientConfig, OSDClientError, OSDMap, OSDMapIncremental, ObjectId, ObjectLocator,
     ObjectstorePerfStat, OmapAssertion, OmapKey, OmapKeySet, OmapKeys, OmapMap, OmapVals,

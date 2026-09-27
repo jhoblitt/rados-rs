@@ -16,6 +16,7 @@ use crate::denc::{Denc, VersionedEncode};
 use crate::osdclient::backoff::BackoffEntry;
 use crate::osdclient::error::{ETIMEDOUT, OSDClientError, Result};
 use crate::osdclient::messages::MOSDOp;
+use crate::osdclient::osdmap::CephRelease;
 use crate::osdclient::session::OSDSession;
 use crate::osdclient::throttle::Throttle;
 use crate::osdclient::tracker::{Tracker, TrackerConfig};
@@ -57,6 +58,10 @@ pub struct OSDClientConfig {
     /// redundant.  Setting this to false avoids a full CRC32c pass over
     /// every write payload.
     pub ms_crc_data: bool,
+    /// Overrides [`OSDClient::require_osd_release`] for testing: the
+    /// release a caller selects request shapes by. The stored map is
+    /// never changed.
+    pub assume_osd_release: Option<CephRelease>,
 }
 
 /// Derive a `client_inc` value suitable for `OSDClientConfig::client_inc`.
@@ -80,8 +85,16 @@ impl Default for OSDClientConfig {
             max_inflight_ops: crate::osdclient::throttle::DEFAULT_MAX_OPS,
             max_inflight_bytes: crate::osdclient::throttle::DEFAULT_MAX_BYTES,
             ms_crc_data: true,
+            assume_osd_release: None,
         }
     }
+}
+
+fn effective_release(
+    assumed: Option<CephRelease>,
+    map: Option<&crate::osdclient::osdmap::OSDMap>,
+) -> Option<CephRelease> {
+    assumed.or(map.map(|m| CephRelease(m.require_osd_release)))
 }
 
 /// Main OSD client for performing object operations
@@ -1100,6 +1113,23 @@ impl OSDClient {
             .borrow()
             .clone()
             .ok_or_else(|| OSDClientError::Connection("OSDMap not available".to_string()))
+    }
+
+    /// The cluster's `require_osd_release`, or
+    /// [`OSDClientConfig::assume_osd_release`] when that is set.
+    ///
+    /// The map's value is kept current through incrementals. `None` means
+    /// no map has arrived yet; this does not wait for one, whereas
+    /// librados's `get_min_compatible_osd`
+    /// (`src/librados/RadosClient.cc:436-447@main`) does.
+    /// `Some(CephRelease::UNKNOWN)` is a map whose release was never set,
+    /// which no v19 mon creates: a fresh v19 mon writes `squid` in
+    /// `create_initial` (`src/mon/OSDMonitor.cc:677-687@v19.2.2`).
+    pub fn require_osd_release(&self) -> Option<CephRelease> {
+        effective_release(
+            self.config.assume_osd_release,
+            self.osdmap_rx.borrow().as_deref(),
+        )
     }
 
     /// Return the current OSDMap epoch, or 0 if no map has been received yet.
@@ -3635,6 +3665,27 @@ mod tests {
         assert!(matches!(err, OSDClientError::OSDError { code: -2, .. }));
         let err = OSDClient::check_op_result(&result(0, -125), "t").expect_err("per-op");
         assert!(matches!(err, OSDClientError::OSDError { code: -125, .. }));
+    }
+
+    #[test]
+    fn effective_release_prefers_the_override() {
+        use super::effective_release;
+        use crate::osdclient::osdmap::{CephRelease, OSDMap};
+        let mut map = OSDMap::new();
+        map.require_osd_release = 19;
+        assert_eq!(effective_release(None, None), None);
+        assert_eq!(
+            effective_release(None, Some(&map)),
+            Some(CephRelease::SQUID)
+        );
+        assert_eq!(
+            effective_release(Some(CephRelease::TENTACLE), Some(&map)),
+            Some(CephRelease::TENTACLE)
+        );
+        assert_eq!(
+            effective_release(Some(CephRelease::UMBRELLA), None),
+            Some(CephRelease::UMBRELLA)
+        );
     }
 
     fn map_with_pool(id: u64, pg_num: u32) -> crate::osdclient::osdmap::OSDMap {
