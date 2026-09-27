@@ -243,26 +243,15 @@ impl ObjectId {
     /// - If a locator `key` is set, hash the key instead of the oid.
     /// - If a `namespace` is set, prepend `ns + '\x1f'` before hashing.
     pub fn calculate_hash(&mut self) {
-        use crate::crush::hash::ceph_str_hash_rjenkins;
+        use crate::crush::hash::{CEPH_STR_HASH_RJENKINS, hash_key};
 
-        let target = if self.key.is_empty() {
+        let key = if self.key.is_empty() {
             &self.oid
         } else {
             &self.key
         };
-
-        self.hash = if self.namespace.is_empty() {
-            ceph_str_hash_rjenkins(target.as_bytes())
-        } else {
-            // Matches pg_pool_t::hash_key: ns + '\x1f' + key_or_oid
-            let ns = self.namespace.as_bytes();
-            let tgt = target.as_bytes();
-            let mut buf = Vec::with_capacity(ns.len() + 1 + tgt.len());
-            buf.extend_from_slice(ns);
-            buf.push(0x1f);
-            buf.extend_from_slice(tgt);
-            ceph_str_hash_rjenkins(&buf)
-        };
+        self.hash = hash_key(CEPH_STR_HASH_RJENKINS, key, &self.namespace)
+            .expect("rjenkins is a known string hash");
     }
 }
 

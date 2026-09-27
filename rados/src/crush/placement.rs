@@ -232,7 +232,7 @@ pub fn object_to_pg(
     locator: &ObjectLocator,
     pg_num: u32,
 ) -> crate::crush::error::Result<PgId> {
-    use crate::crush::hash::ceph_str_hash_rjenkins;
+    use crate::crush::hash::{CEPH_STR_HASH_RJENKINS, hash_key};
 
     if pg_num == 0 {
         return Err(crate::crush::error::CrushError::DecodeError(
@@ -240,25 +240,13 @@ pub fn object_to_pg(
         ));
     }
 
-    let hash_key = if !locator.key.is_empty() {
-        locator.key.as_str()
-    } else {
+    let key = if locator.key.is_empty() {
         object_name
-    };
-
-    // Hash the key, prepending "namespace\x1f" when a namespace is set.
-    // Matches pg_pool_t::hash_key(): ns + '\037' + key_or_oid.
-    let hash = if locator.namespace.is_empty() {
-        ceph_str_hash_rjenkins(hash_key.as_bytes())
     } else {
-        let ns = locator.namespace.as_bytes();
-        let key = hash_key.as_bytes();
-        let mut hash_input = Vec::with_capacity(ns.len() + 1 + key.len());
-        hash_input.extend_from_slice(ns);
-        hash_input.push(b'\x1f');
-        hash_input.extend_from_slice(key);
-        ceph_str_hash_rjenkins(&hash_input)
+        locator.key.as_str()
     };
+    let hash = hash_key(CEPH_STR_HASH_RJENKINS, key, &locator.namespace)
+        .expect("rjenkins is a known string hash");
 
     let pg_seed = hash % pg_num;
 
