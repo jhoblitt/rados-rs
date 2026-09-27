@@ -203,7 +203,7 @@ impl MOSDMap {
     /// Compatibility version (from MOSDMap.h COMPAT_VERSION)
     const COMPAT_VERSION: u16 = 3;
 
-    /// Get the first (oldest) epoch in this message
+    /// The oldest epoch this message carries a map for, or 0.
     pub fn get_first(&self) -> u32 {
         self.incremental_maps
             .keys()
@@ -213,9 +213,28 @@ impl MOSDMap {
             .unwrap_or(0)
     }
 
-    /// Get the last (newest) epoch in this message
+    /// The newest epoch this message carries a map for, or 0, as
+    /// `MOSDMap::get_last` (v19.2.2:src/messages/MOSDMap.h:62-70). It is
+    /// not `newest_map`, the sender's newest: the mon sends a long range
+    /// in messages of `osd_map_message_max` epochs each, every one with
+    /// the same `newest_map` (v19.2.2:src/mon/OSDMonitor.cc:4457,
+    /// 4557-4575).
     pub fn get_last(&self) -> u32 {
-        self.newest_map
+        self.incremental_maps
+            .keys()
+            .chain(self.maps.keys())
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Decode `msg`, a `CEPH_MSG_OSD_MAP`, by its own header version.
+    pub fn from_message(
+        msg: &crate::msgr2::message::Message,
+    ) -> std::result::Result<Self, crate::msgr2::Msgr2Error> {
+        use crate::msgr2::ceph_message::{CephMessagePayload, CephMsgHeader};
+        let header = CephMsgHeader::new(Self::msg_type(), msg.header.version.get());
+        Self::decode_payload(&header, &msg.front, &msg.middle, &msg.data)
     }
 }
 
@@ -246,8 +265,12 @@ impl crate::msgr2::ceph_message::CephMessagePayload for MOSDMap {
         Err(crate::msgr2::Msgr2Error::Serialization)
     }
 
+    /// As `MOSDMap::decode_payload` (v19.2.2:src/messages/MOSDMap.h:
+    /// 81-99): version 2 added the trim lower bound and the newest map.
+    /// The octopus-removed `gap_removed_snaps` of version 4 trails them
+    /// and is left undecoded.
     fn decode_payload(
-        _header: &crate::msgr2::ceph_message::CephMsgHeader,
+        header: &crate::msgr2::ceph_message::CephMsgHeader,
         front: &[u8],
         _middle: &[u8],
         _data: &[u8],
@@ -259,16 +282,10 @@ impl crate::msgr2::ceph_message::CephMessagePayload for MOSDMap {
         let incremental_maps = HashMap::<u32, Bytes>::decode(&mut data, 0)?;
         let maps = HashMap::<u32, Bytes>::decode(&mut data, 0)?;
 
-        // Optional trailing fields: present only in newer wire versions; default to 0.
-        let cluster_osdmap_trim_lower_bound = if data.len() >= 4 {
-            u32::decode(&mut data, 0)?
+        let (cluster_osdmap_trim_lower_bound, newest_map) = if header.version.get() >= 2 {
+            (u32::decode(&mut data, 0)?, u32::decode(&mut data, 0)?)
         } else {
-            0
-        };
-        let newest_map = if data.len() >= 4 {
-            u32::decode(&mut data, 0)?
-        } else {
-            0
+            (0, 0)
         };
 
         Ok(Self {
@@ -856,5 +873,52 @@ mod tests {
         assert_eq!(msg_type, CEPH_MSG_MON_GET_VERSION);
         assert_eq!(version, MMonGetVersion::msg_version(0));
         assert!(!msg.front.is_empty());
+    }
+
+    /// An MOSDMap front: a zero fsid, incrementals at `inc`, full maps
+    /// at `full`, then `trailer`'s u32s.
+    fn mosdmap_front(inc: &[u32], full: &[u32], trailer: &[u32]) -> Vec<u8> {
+        let mut front = vec![0u8; 16];
+        for epochs in [inc, full] {
+            front.extend_from_slice(&(epochs.len() as u32).to_le_bytes());
+            for e in epochs {
+                front.extend_from_slice(&e.to_le_bytes());
+                front.extend_from_slice(&1u32.to_le_bytes());
+                front.push(0xaa);
+            }
+        }
+        for v in trailer {
+            front.extend_from_slice(&v.to_le_bytes());
+        }
+        front
+    }
+
+    fn decode_mosdmap(version: u16, front: &[u8]) -> MOSDMap {
+        use crate::msgr2::ceph_message::{CephMessagePayload, CephMsgHeader};
+        let header = CephMsgHeader::new(MOSDMap::msg_type(), version);
+        MOSDMap::decode_payload(&header, front, &[], &[]).unwrap()
+    }
+
+    #[test]
+    fn mosdmap_last_is_its_own_newest_epoch() {
+        // One batch of a longer range: the sender's newest is 90.
+        let m = decode_mosdmap(4, &mosdmap_front(&[41, 42, 43], &[40], &[5, 90, 0]));
+        assert_eq!(m.get_first(), 40);
+        assert_eq!(m.get_last(), 43);
+        assert_eq!(m.cluster_osdmap_trim_lower_bound, 5);
+        assert_eq!(m.newest_map, 90);
+    }
+
+    #[test]
+    fn mosdmap_decodes_its_trailer_by_version() {
+        // Version 1 has no trailer, whatever bytes follow the maps.
+        let m = decode_mosdmap(1, &mosdmap_front(&[7], &[], &[3, 9]));
+        assert_eq!((m.cluster_osdmap_trim_lower_bound, m.newest_map), (0, 0));
+        let m = decode_mosdmap(2, &mosdmap_front(&[7], &[], &[3, 9]));
+        assert_eq!((m.cluster_osdmap_trim_lower_bound, m.newest_map), (3, 9));
+        assert_eq!(
+            decode_mosdmap(4, &mosdmap_front(&[], &[], &[3, 9, 0])).get_last(),
+            0
+        );
     }
 }

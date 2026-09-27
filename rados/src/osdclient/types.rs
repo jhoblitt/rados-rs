@@ -525,6 +525,7 @@ const CEPH_OSD_OP_MODE_RD: u16 = 0x1000; // Read mode
 const CEPH_OSD_OP_MODE_WR: u16 = 0x2000; // Write mode
 
 // OSD operation types (from Ceph's rados.h)
+const CEPH_OSD_OP_TYPE: u16 = 0x0f00; // The type field, not a bit set
 const CEPH_OSD_OP_TYPE_DATA: u16 = 0x0200; // Data operations
 const CEPH_OSD_OP_TYPE_ATTR: u16 = 0x0300; // Attribute operations
 const CEPH_OSD_OP_TYPE_EXEC: u16 = 0x0400; // Exec/CLS operations (object class methods)
@@ -667,7 +668,7 @@ impl OpCode {
 
     /// Check if this is a PG operation (operates on placement group, not object)
     pub fn is_pg_op(self) -> bool {
-        (self as u16) & CEPH_OSD_OP_TYPE_PG != 0
+        (self as u16) & CEPH_OSD_OP_TYPE == CEPH_OSD_OP_TYPE_PG
     }
 }
 
@@ -1594,6 +1595,20 @@ pub struct ListResult {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pg_op_is_the_type_field_not_a_bit() {
+        // `ceph_osd_op_type_pg`, v19.2.2 src/include/rados.h:392-395
+        assert!(OpCode::Pgls.is_pg_op());
+        assert!(OpCode::Pgnls.is_pg_op());
+        for op in [
+            OpCode::GetXattr,
+            OpCode::SetXattr,
+            OpCode::Call,
+            OpCode::WriteFull,
+        ] {
+            assert!(!op.is_pg_op(), "{op:?}");
+        }
+    }
     #[test]
     fn test_opcode_encodings_against_rados_h() {
         // Values computed from ceph/src/include/rados.h's __CEPH_FORALL_OSD_OPS

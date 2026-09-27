@@ -152,6 +152,16 @@ pub struct OSDClient {
     /// Stands in for a linger send's submit, which needs a session.
     #[cfg(test)]
     fake_linger_submit: std::sync::Mutex<Option<FakeLingerSubmit>>,
+    /// The session every OSD's ops go to, connected or not.
+    #[cfg(test)]
+    fake_osd: std::sync::Mutex<Option<Arc<OSDSession>>>,
+    /// Runs as an op, placed, is about to be handed to its session.
+    #[cfg(test)]
+    before_submit: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Runs as an op, pending on its session, is about to have its map
+    /// checked.
+    #[cfg(test)]
+    in_submit_window: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 #[cfg(test)]
@@ -245,6 +255,74 @@ struct MapBatch {
     /// Some epochs in between were never seen (a gap, or a full map that
     /// jumps), so an interval change may have gone unnoticed.
     skipped: bool,
+    /// The message lacked this epoch, which the mon still holds: ask
+    /// for the maps from it.
+    request_from: Option<u32>,
+}
+
+/// Advance `working`, at `from`, through `mosdmap`'s epochs as
+/// `Objecter::handle_osd_map` does (v19.2.2:src/osdc/Objecter.cc:
+/// 1202-1241): each epoch from its incremental when that follows the
+/// map so far, else from its full map. `incremental` and `full` build
+/// the epoch's map, or fail with `None`.
+///
+/// An epoch neither builds is missing. If the mon still holds it (it is
+/// at or above the message's trim lower bound), the walk stops and asks
+/// for the maps from the one after the last it has. Otherwise the mon
+/// trimmed it: the walk jumps to the lower bound, whose full map must
+/// be in the message, and flags the batch skipped.
+fn walk_map_epochs(
+    mosdmap: &crate::monclient::messages::MOSDMap,
+    from: u32,
+    mut working: Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    mut incremental: impl FnMut(
+        u32,
+        &Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    ) -> Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+    mut full: impl FnMut(u32) -> Option<Arc<crate::osdclient::osdmap::OSDMap>>,
+) -> MapBatch {
+    let mut batch = MapBatch::default();
+    let lower_bound = mosdmap.cluster_osdmap_trim_lower_bound;
+    let mut e = from + 1;
+    while e <= mosdmap.get_last() {
+        let working_epoch = working.as_ref().map_or(from, |m| m.epoch.as_u32());
+        let contiguous = working_epoch == e - 1;
+        let next = if contiguous && mosdmap.incremental_maps.contains_key(&e) {
+            incremental(e, &working)
+        } else if mosdmap.maps.contains_key(&e) {
+            // A full map that does not follow the previous epoch jumps
+            // over maps nobody here has seen.
+            batch.skipped |= !contiguous;
+            full(e)
+        } else {
+            None
+        };
+        match next {
+            Some(map) => {
+                working = Some(Arc::clone(&map));
+                batch.maps.push(map);
+                e += 1;
+            }
+            None if e >= lower_bound => {
+                warn!(
+                    "Missing epoch {}; requesting maps from {}",
+                    e,
+                    working_epoch + 1
+                );
+                batch.request_from = Some(working_epoch + 1);
+                break;
+            }
+            None => {
+                warn!(
+                    "Missing epoch {}, trimmed by the mon; jumping to {}",
+                    e, lower_bound
+                );
+                e = lower_bound;
+                batch.skipped = true;
+            }
+        }
+    }
+    batch
 }
 
 /// The OSD's `osd_default_notify_timeout`, which it applies to a wire
@@ -454,6 +532,12 @@ impl OSDClient {
                 watch_pings_enabled: AtomicBool::new(true),
                 #[cfg(test)]
                 fake_linger_submit: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                fake_osd: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                before_submit: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                in_submit_window: std::sync::Mutex::new(None),
             }
         });
 
@@ -573,7 +657,7 @@ impl OSDClient {
         if self.shutdown_token.is_cancelled() {
             return false;
         }
-        tokio::spawn(Arc::clone(self).relinger_after_reset(osd_id));
+        self.spawn_until_shutdown(Arc::clone(self).relinger_after_reset(osd_id));
         true
     }
 
@@ -851,9 +935,8 @@ impl OSDClient {
         Ok((linger, rx))
     }
 
-    /// Send a watch's registration, `WATCH{WATCH}`, once. Success marks it
-    /// registered and answers `linger_watch`; an OSD's rejection answers
-    /// it with the error; no answer leaves it pending for a re-send.
+    /// Send a watch's registration, `WATCH{WATCH}`, once, and apply its
+    /// outcome with [`Self::finish_register_send`].
     async fn send_register(&self, linger: &Linger) {
         let LingerKind::Watch { timeout } = linger.kind else {
             return;
@@ -864,14 +947,40 @@ impl OSDClient {
         let sent = std::time::Instant::now();
         let op = OSDOp::watch(linger.cookie, WatchOp::Watch, timeout);
         let seq = linger.begin_send();
-        match self.send_linger_op(linger, op, "watch", seq).await {
+        let outcome = self.send_linger_op(linger, op, "watch", seq).await;
+        Self::finish_register_send(linger, seq, sent, outcome);
+    }
+
+    /// Apply the outcome of registration send `seq` of a watch, sent at
+    /// `sent`. Success marks it registered and answers `linger_watch`; an
+    /// OSD's rejection answers it with the error; no answer leaves it
+    /// pending for a re-send. A send a later one superseded changes
+    /// nothing, as [`Self::finish_notify_send`] has it: the later send
+    /// cancels it if it is still pending, as `_send_linger` does
+    /// (v19.2.2:src/osdc/Objecter.cc:586-594), so `_linger_commit`
+    /// never sees its reply, but here the reply may already have come.
+    fn finish_register_send(
+        linger: &Linger,
+        seq: u64,
+        sent: std::time::Instant,
+        outcome: Result<crate::osdclient::types::OpResult>,
+    ) {
+        let mut state = linger.lock_state();
+        if state.send_seq != seq {
+            debug!(
+                "watch {} registration send {} superseded, ignoring {:?}",
+                linger.cookie,
+                seq,
+                outcome.map(|_| ())
+            );
+            return;
+        }
+        match outcome {
             Ok(_) => {
-                {
-                    let mut state = linger.lock_state();
-                    state.registered = true;
-                    state.last_error = None;
-                    state.watch_valid_thru = Some(sent);
-                }
+                state.registered = true;
+                state.last_error = None;
+                state.watch_valid_thru = Some(sent);
+                drop(state);
                 linger.finish_registration(Ok(()));
             }
             Err(e) if is_no_answer(&e) => {
@@ -880,7 +989,10 @@ impl OSDClient {
                     linger.cookie, e
                 );
             }
-            Err(e) => linger.finish_registration(Err(e)),
+            Err(e) => {
+                drop(state);
+                linger.finish_registration(Err(e));
+            }
         }
     }
 
@@ -1176,7 +1288,7 @@ impl OSDClient {
             return;
         }
         for (linger, generation) in watches_to_ping(&self.lingers) {
-            tokio::spawn(Arc::clone(self).ping_watch(linger, generation));
+            self.spawn_until_shutdown(Arc::clone(self).ping_watch(linger, generation));
         }
     }
 
@@ -1381,6 +1493,15 @@ impl OSDClient {
 
     /// Get or create a session for an OSD
     async fn get_or_create_session(&self, osd_id: i32) -> Result<Arc<OSDSession>> {
+        #[cfg(test)]
+        if let Some(session) = self
+            .fake_osd
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Ok(session);
+        }
         // Get OSD address early (before acquiring any locks)
         // This reduces lock contention by doing I/O outside critical section
         let current_addr = self.get_osd_address(osd_id).await?;
@@ -2010,8 +2131,9 @@ impl OSDClient {
                 continue;
             }
 
-            // Map to OSDs based on current object (using the osdmap we already have)
-            let (hash, spg, osds) = Self::object_to_osds_in_map(&op.osdmap, &msg.object)?;
+            // Map to OSDs based on current object (using the osdmap we
+            // already have), or a PG op by its cursor.
+            let (hash, spg, osds) = Self::replace_pending(&op.osdmap, msg)?;
             let primary_osd = osds[0];
             tracing::trace!(
                 target: "rados::osdclient::routing",
@@ -2041,63 +2163,94 @@ impl OSDClient {
                 continue;
             }
 
-            // Final pgid re-derivation: between the post-session re-check above
-            // and submit_op below, the OSDMap can still advance (e.g. autoscaler
-            // growing pg_num), which invalidates the seed we just computed.
-            // Re-read the live map once more and recompute spg if the epoch has
-            // moved. If the primary also changed, restart the outer loop so we
-            // pick up the correct session; otherwise just refresh the pgid
-            // before stamping it. Mirrors librados Objecter's rwlock-guarded
-            // "compute target + enqueue" ordering without needing a real lock.
-            let (final_hash, final_spg, final_map) = {
-                let live = self.get_osdmap().await?;
-                if live.epoch != op.osdmap.epoch {
-                    // OSDMap moved between the routing decision above
-                    // and now — re-prune the snapc against any new
-                    // removals before we encode the wire op.
-                    live.prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
-                    let (new_hash, new_spg, new_osds) =
-                        Self::object_to_osds_in_map(&live, &msg.object)?;
-                    if new_osds.first().copied() != Some(primary_osd) {
-                        op.osdmap = live;
-                        continue;
-                    }
-                    (new_hash, new_spg, live)
-                } else {
-                    (hash, spg, Arc::clone(&op.osdmap))
-                }
-            };
-            let final_epoch = final_map.epoch.as_u32();
-
             // Build request ID with fresh TID and stamp pgid
             let tid = session.next_tid();
+            let placed_epoch = op.osdmap.epoch.as_u32();
             {
                 let m = Arc::make_mut(msg);
-                m.object.hash = final_hash;
-                m.pgid = final_spg;
-                m.osdmap_epoch = final_epoch;
+                m.object.hash = hash;
+                m.pgid = spg;
+                m.osdmap_epoch = placed_epoch;
                 m.reqid = crate::osdclient::types::RequestId::new(
                     &self.entity_name,
                     tid,
                     self.config.client_inc as i32,
                 );
             }
-
-            // Submit operation (priority is set in message header).
-            // Arc::clone is a cheap refcount bump; submit_op stores the Arc in
-            // pending_ops and drops it when the reply arrives, so by the time
-            // we reach the next iteration the refcount is back to 1.
-            let pg_num = final_map
+            let pg_num = op
+                .osdmap
                 .pools
                 .get(&msg.object.pool)
                 .map_or(0, |p| p.pg_num);
-            let rx = session
-                .submit_op(Arc::clone(msg), priority, pg_num, op.should_resend)
+
+            #[cfg(test)]
+            if let Some(hook) = self
+                .before_submit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                hook();
+            }
+
+            // Objecter::op_submit holds rwlock shared from _calc_target
+            // through the send, and handle_osd_map holds it unique from
+            // publishing a map through its rescan
+            // (v19.2.2:src/osdc/Objecter.cc:1164, 2278), so an op is
+            // either placed in the new map or pending when the rescan
+            // looks. Here a map published after the placement above may
+            // have been rescanned before the op became pending, which
+            // would miss it: the OSD drops an op of an older interval.
+            // submit_op checks, with the op pending and before its frame
+            // goes out, that the map is still the one it was placed in;
+            // the rescan publishes before it looks, so a map it misses the
+            // op in is one this check sees. If the map moved, the op is
+            // placed again, unsent.
+            let placed = session
+                .submit_op(Arc::clone(msg), priority, pg_num, op.should_resend, || {
+                    #[cfg(test)]
+                    if let Some(hook) = self
+                        .in_submit_window
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_mut()
+                    {
+                        hook();
+                    }
+                    self.current_epoch_u32() == placed_epoch
+                })
                 .await;
+            let rx = match placed {
+                Ok(Some(rx)) => Ok(rx),
+                // A linger send or ping taken back ends as no answer, as a
+                // map change cancels one already out: the linger machinery
+                // sends it again in the new map.
+                Ok(None) if !op.should_resend => {
+                    debug!(
+                        "OSDMap moved past epoch {} before linger tid {} went out; cancelled",
+                        placed_epoch, tid
+                    );
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(Err(OSDClientError::Cancelled));
+                    Ok(rx)
+                }
+                Ok(None) => {
+                    debug!(
+                        "OSDMap moved past epoch {} before tid {} went out; placing it again",
+                        placed_epoch, tid
+                    );
+                    deadline_remaining(deadline, effective_timeout)?;
+                    op.osdmap = self.get_osdmap().await?;
+                    op.osdmap
+                        .prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
+                    continue;
+                }
+                Err(e) => Err(e),
+            };
             return Ok(Submitted {
                 osd: primary_osd,
                 tid,
-                osdmap: final_map,
+                osdmap: Arc::clone(&op.osdmap),
                 rx,
             });
         }
@@ -2422,11 +2575,16 @@ impl OSDClient {
         object
     }
 
-    /// Query objects from the PG that contains `hobject_cursor`.
+    /// Query objects from the PG that contains `hobject_cursor` in the
+    /// current map, one page of a listing.
     ///
-    /// The target PG is derived from `hobject_cursor.hash` using `ceph_stable_mod`, matching
-    /// exactly how Ceph's Objecter routes PGNLS requests.  Using the cursor hash as the
-    /// object hash in the MOSDOp satisfies the OSD's `pgid.contains(head)` assertion.
+    /// The op goes out as any other, placed and stamped with the map
+    /// current when it is sent and re-placed on a map change, as
+    /// `Objecter::list_nobjects` sends each page through `pg_read` and
+    /// `op_submit` (v19.2.2:src/osdc/Objecter.cc:3793-3862). The PG
+    /// comes from `hobject_cursor.hash` with `ceph_stable_mod` in that map
+    /// ([`Self::replace_pending`]), and the cursor hash is the op's
+    /// hobject hash, so the OSD's `pgid.contains(head)` check passes.
     ///
     /// Returns the decoded response and result code from the OSD.
     async fn query_pg_objects(
@@ -2435,77 +2593,28 @@ impl OSDClient {
         nspace: &str,
         hobject_cursor: &crate::HObject,
         max_entries: u64,
-        pool_info: &crate::osdclient::PgPool,
-        osdmap: &Arc<crate::osdclient::osdmap::OSDMap>,
+        osdmap: &crate::osdclient::osdmap::OSDMap,
     ) -> Result<(crate::osdclient::PgNlsResponse, i32)> {
-        // Derive the target PG from the cursor hash — mirrors Objecter::pg_read(current_pg,…)
-        let pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash);
-        let current_pg = pg.seed;
-
-        let osds = Self::pg_to_osds_in_map(osdmap, pg)?;
-        let primary_osd = osds[0];
-
-        // For replicated pools `pg_to_spg_shard` returns NO_SHARD; for
-        // non-optimised EC it returns the primary's position; for
-        // optimised EC it runs `pgtemp_undo_primaryfirst`.  Sending a
-        // PGNLS scan with the wrong shard would land on a replica that
-        // rejects it as misdirected, so EC pool listings need this just
-        // as much as the I/O hot path.
-        let shard = osdmap
-            .pg_to_spg_shard(&pg)
-            .map_err(|e| OSDClientError::Crush(format!("EC shard lookup: {e}")))?;
-        let spg = StripedPgId::new(pool, current_pg, shard.0);
-
-        // Get session
-        let session = self.get_or_create_session(primary_osd).await?;
-
-        // The hash must match the cursor's hash so the OSD's pgid.contains(head)
-        // check passes — hash=0 only belongs to PG 0.
+        let current_pg = osdmap
+            .pools
+            .get(&pool)
+            .map(|p| Self::cursor_pg(p, pool, hobject_cursor.hash).seed)
+            .ok_or(OSDClientError::PoolNotFound(pool))?;
         let object = Self::pgnls_target(pool, hobject_cursor.hash, nspace);
-
-        // Create pgls operation
         let ops = vec![OSDOp::pgls(
             max_entries,
             hobject_cursor.clone(),
             osdmap.epoch.as_u32(),
         )?];
-
-        // Acquire throttle permit
-        let _throttle_permit = self.throttle.acquire(calc_op_budget(&ops)).await?;
-
-        // Build request ID
-        let tid = session.next_tid();
-        let reqid = crate::osdclient::types::RequestId::new(
-            &self.entity_name,
-            tid,
-            self.config.client_inc as i32,
-        );
-
-        // Build message
-        let flags = MOSDOp::calculate_flags(&ops);
-        let msg = MOSDOp::new(
-            self.config.client_inc,
-            osdmap.epoch.as_u32(),
-            flags,
-            object,
-            spg,
-            ops,
-            reqid,
-            self.global_id,
-        );
-
-        // Submit operation (use default priority for internal PGLS operations)
-        let result_rx = session
-            .submit_op(
-                Arc::new(msg),
+        let result = self
+            .execute_op(
+                object,
+                ops,
+                None,
                 crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
-                pool_info.pg_num,
-                true,
+                OsdOpFlags::empty(),
             )
             .await?;
-
-        // Wait for result with timeout
-        let result = await_op_result(result_rx, self.tracker.operation_timeout()).await?;
 
         // For PGLS: result = 1 means "reached end of PG" (success)
         //           result = 0 means "more objects available" (success)
@@ -2598,12 +2707,10 @@ impl OSDClient {
         // Parse cursor → starting hobject position
         let mut hobject_cursor = Self::parse_list_cursor(pool, cursor)?;
 
-        // Get OSDMap to look up pool info
         let osdmap = self.get_osdmap().await?;
-        let pool_info = osdmap
-            .pools
-            .get(&pool)
-            .ok_or(OSDClientError::PoolNotFound(pool))?;
+        if !osdmap.pools.contains_key(&pool) {
+            return Err(OSDClientError::PoolNotFound(pool));
+        }
 
         // Mirrors execute_op pre-flight checks: hard-fail on EIO, pause, and epoch barrier.
         // PGLS is a read, so only pauserd applies (not pausewr/pool_full).
@@ -2643,6 +2750,13 @@ impl OSDClient {
                 });
             }
 
+            // Each page in the map current as it goes out, as
+            // list_nobjects reads the map anew for every page.
+            let osdmap = self.get_osdmap().await?;
+            let pool_info = osdmap
+                .pools
+                .get(&pool)
+                .ok_or(OSDClientError::PoolNotFound(pool))?;
             let current_pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash).seed;
             debug!(
                 "Querying PG {} (hash={:#x}), collected {} entries so far",
@@ -2653,7 +2767,7 @@ impl OSDClient {
 
             let remaining = max_entries.saturating_sub(all_entries.len() as u64);
             let (response, _result_code) = match self
-                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, pool_info, &osdmap)
+                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, &osdmap)
                 .await
             {
                 Ok(result) => result,
@@ -2873,10 +2987,11 @@ impl OSDClient {
         Ok(())
     }
 
-    /// Scan pending ops after OSDMap update, resend if target changed
+    /// Scan pending ops after OSDMap update, resend if target changed,
+    /// or every op when epochs were `skipped`.
     ///
     /// This implements Ceph's `_scan_requests` pattern from Objecter.
-    async fn scan_requests_on_map_change(&self, new_epoch: u32) -> Result<()> {
+    async fn scan_requests_on_map_change(&self, new_epoch: u32, skipped: bool) -> Result<()> {
         let osdmap = self.get_osdmap().await?;
 
         // Collect session snapshot
@@ -2895,7 +3010,7 @@ impl OSDClient {
                 sessions_to_close.push(osd_id);
                 // Drain all ops; CRUSH errors are silently dropped (session is closing).
                 let _ = self
-                    .collect_resend_ops(&session, &osdmap, new_epoch, None, &mut need_resend)
+                    .collect_resend_ops(&session, &osdmap, new_epoch, None, false, &mut need_resend)
                     .await;
                 continue;
             }
@@ -2903,7 +3018,14 @@ impl OSDClient {
             // Scan ops: only re-target those whose primary OSD changed or whose pool
             // bumped last_force_op_resend since this op was sent.
             let any_migrated = self
-                .collect_resend_ops(&session, &osdmap, new_epoch, Some(osd_id), &mut need_resend)
+                .collect_resend_ops(
+                    &session,
+                    &osdmap,
+                    new_epoch,
+                    Some(osd_id),
+                    skipped,
+                    &mut need_resend,
+                )
                 .await?;
 
             if any_migrated {
@@ -2912,7 +3034,7 @@ impl OSDClient {
                 // didn't change but whose connection is being torn down).
                 sessions_to_close.push(osd_id);
                 let _ = self
-                    .collect_resend_ops(&session, &osdmap, new_epoch, None, &mut need_resend)
+                    .collect_resend_ops(&session, &osdmap, new_epoch, None, false, &mut need_resend)
                     .await;
             }
         }
@@ -2969,6 +3091,13 @@ impl OSDClient {
     ///     sent, or whose PG split or merged since it was placed.
     ///   - `None`     — drain path: collect every op unconditionally (session is closing).
     ///
+    /// `skipped`, on the scan path, collects every op: epochs were skipped,
+    /// so a change of target may have gone unseen, and `_scan_requests`
+    /// resends an op its `_calc_target` leaves alone when `skipped_map`
+    /// is set (v19.2.2:src/osdc/Objecter.cc:1105-1111). An op collected
+    /// only for the skip is not migrated: it goes back out through its
+    /// session, which stays up.
+    ///
     /// Returns `true` if at least one op was migrated (scan path only; always `false` for
     /// the drain path because all ops stay within the same "session is closing" group).
     ///
@@ -2979,6 +3108,7 @@ impl OSDClient {
         osdmap: &crate::osdclient::osdmap::OSDMap,
         new_epoch: u32,
         current_osd: Option<i32>,
+        skipped: bool,
         need_resend: &mut Vec<(i32, crate::osdclient::session::PendingOp)>,
     ) -> Result<bool> {
         let metadata = session.get_pending_ops_metadata();
@@ -2996,10 +3126,12 @@ impl OSDClient {
                 Self::cached_rescan_osds(&mut placement_cache, osdmap, &msg)?;
             let new_primary = new_osds.first().copied().unwrap_or(-1);
 
-            // Scan path: only resend if primary changed or pool forced a resend.
+            // Scan path: resend if the op migrated (primary changed, pool forced
+            // a resend, PG split or merged), which tears the session down, or
+            // if epochs were skipped, which does not.
             // Drain path (current_osd == None): always resend.
-            let needs_resend = match current_osd {
-                None => true,
+            let (needs_resend, migrated) = match current_osd {
+                None => (true, false),
                 Some(osd_id) => {
                     // Mirrors Objecter::_calc_target step 4: if last_force_op_resend is in
                     // (op_epoch, new_epoch] the op must be resubmitted even if its primary
@@ -3013,7 +3145,8 @@ impl OSDClient {
                     // op sent before its PG split or merged, primary or not.
                     let split_or_merge =
                         Self::pg_split_or_merge(pool_id, new_hash, op_pg_num, new_pg_num);
-                    new_primary != osd_id || force_resend || split_or_merge
+                    let migrated = new_primary != osd_id || force_resend || split_or_merge;
+                    (skipped || migrated, migrated)
                 }
             };
 
@@ -3029,7 +3162,7 @@ impl OSDClient {
                 // Scan path only: cancel the io_loop so any message already
                 // encoded for this tid is dropped before reaching the wire.
                 // See `cancel_io_loop`'s doc comment for the full rationale.
-                if current_osd.is_some() {
+                if migrated {
                     session.cancel_io_loop();
                     any_migrated = true;
                 }
@@ -3268,7 +3401,9 @@ impl OSDClient {
 
         for (tid, msg, ..) in metadata {
             let pool_id = msg.object.pool;
-            let Some(mut pending_op) = old_session.remove_pending_op(tid) else {
+            // One not yet submitted is left to its submitter, which may
+            // take it back; it sends on the old session or fails there.
+            let Some(mut pending_op) = old_session.remove_submitted_op(tid) else {
                 continue;
             };
 
@@ -3334,13 +3469,10 @@ impl OSDClient {
         msg: &crate::msgr2::message::Message,
     ) -> Result<(crate::monclient::messages::MOSDMap, crate::Epoch)> {
         use crate::monclient::messages::MOSDMap;
-        use crate::msgr2::ceph_message::{CephMessagePayload, CephMsgHeader};
 
         info!("Handling OSDMap message ({} bytes)", msg.front.len());
 
-        // Decode MOSDMap
-        let header = CephMsgHeader::new(MOSDMap::msg_type(), MOSDMap::msg_version(0));
-        let mosdmap = MOSDMap::decode_payload(&header, &msg.front, &[], &[])?;
+        let mosdmap = MOSDMap::from_message(msg)?;
         info!(
             "Received MOSDMap: epochs [{}..{}], {} full maps, {} incremental maps",
             mosdmap.get_first(),
@@ -3398,7 +3530,7 @@ impl OSDClient {
 
         if current_epoch.as_u32() > 0 {
             // We have a current map, apply updates sequentially
-            self.apply_sequential_updates(mosdmap, current_epoch, current_map)
+            Some(self.apply_sequential_updates(mosdmap, current_epoch, current_map))
         } else {
             // No current map, use latest full map
             self.load_initial_map(mosdmap)
@@ -3406,42 +3538,21 @@ impl OSDClient {
     }
 
     /// Apply sequential updates to existing map, keeping every applied
-    /// epoch's map so the lingers can be checked against each.
+    /// epoch's map so the lingers can be checked against each; see
+    /// [`walk_map_epochs`].
     fn apply_sequential_updates(
         &self,
         mosdmap: &crate::monclient::messages::MOSDMap,
         current_epoch: crate::Epoch,
         current_map: Option<Arc<crate::osdclient::osdmap::OSDMap>>,
-    ) -> Option<MapBatch> {
-        let mut working_map = current_map;
-        let mut batch = MapBatch::default();
-
-        for e in (current_epoch.as_u32() + 1)..=mosdmap.get_last() {
-            let current_map_epoch = working_map.as_ref().map(|m| m.epoch).unwrap_or_default();
-            let contiguous = current_map_epoch == crate::Epoch::new(e - 1);
-
-            if contiguous && mosdmap.incremental_maps.contains_key(&e) {
-                // Apply incremental
-                if let Some(new_map) = self.apply_incremental_map(mosdmap, e, &working_map) {
-                    working_map = Some(Arc::clone(&new_map));
-                    batch.maps.push(new_map);
-                }
-            } else if mosdmap.maps.contains_key(&e) {
-                // Use full map
-                if let Some(new_map) = self.apply_full_map(mosdmap, e) {
-                    // A full map that does not follow the previous epoch
-                    // jumps over maps nobody here has seen.
-                    batch.skipped |= !contiguous;
-                    working_map = Some(Arc::clone(&new_map));
-                    batch.maps.push(new_map);
-                }
-            } else {
-                warn!("Missing epoch {} (incremental and full)", e);
-                batch.skipped = true;
-            }
-        }
-
-        (!batch.maps.is_empty()).then_some(batch)
+    ) -> MapBatch {
+        walk_map_epochs(
+            mosdmap,
+            current_epoch.as_u32(),
+            current_map,
+            |e, working| self.apply_incremental_map(mosdmap, e, working),
+            |e| self.apply_full_map(mosdmap, e),
+        )
     }
 
     /// Apply incremental map update
@@ -3538,15 +3649,14 @@ impl OSDClient {
                 base_epoch,
                 mosdmap.get_last(),
             );
-            let mut batch = self
-                .apply_sequential_updates(mosdmap, full_epoch, Some(full_map.clone()))
-                .unwrap_or_default();
+            let mut batch =
+                self.apply_sequential_updates(mosdmap, full_epoch, Some(full_map.clone()));
             batch.maps.insert(0, full_map);
             Some(batch)
         } else {
             Some(MapBatch {
                 maps: vec![full_map],
-                skipped: false,
+                ..MapBatch::default()
             })
         }
     }
@@ -3602,7 +3712,9 @@ impl OSDClient {
         // Skip the normal rescan if we just got blocklisted — all ops were
         // already failed above.
         if !self.blocklisted.load(Ordering::Relaxed)
-            && let Err(e) = self.scan_requests_on_map_change(final_epoch.as_u32()).await
+            && let Err(e) = self
+                .scan_requests_on_map_change(final_epoch.as_u32(), batch.skipped)
+                .await
         {
             warn!("Failed to rescan requests after OSDMap update: {}", e);
         }
@@ -3638,10 +3750,37 @@ impl OSDClient {
 
         // Update state if we got a new map
         if let Some(batch) = new_maps {
+            // Before the maps are marked got, as Objecter requests them
+            // in the loop and calls sub_got after it
+            // (v19.2.2:src/osdc/Objecter.cc:1228-1233, 1388).
+            if let Some(epoch) = batch.request_from {
+                self.request_maps_from(epoch).await;
+            }
             self.update_osdmap_state(batch).await?;
         }
 
         Ok(())
+    }
+
+    /// Ask the mon for the OSDMaps from `epoch` on: Objecter's
+    /// `_maybe_request_map` (v19.2.2:src/osdc/Objecter.cc:2024-2042),
+    /// `sub_want` then `renew_subs`, which [`MonClient::subscribe`] both
+    /// does. Objecter asks once (`CEPH_SUBSCRIBE_ONETIME`) unless the map
+    /// is full or paused, since it otherwise learns of new maps from the
+    /// OSDs; this client keeps one continuous `osdmap` subscription
+    /// (`wait_for_latest_osdmap`), and a one-time want would replace it,
+    /// on the mon too (v19.2.2:src/mon/Session.h:260-275), and end the
+    /// map stream. So the continuous subscription restarts at `epoch`.
+    ///
+    /// [`MonClient::subscribe`]: crate::monclient::MonClient::subscribe
+    async fn request_maps_from(&self, epoch: u32) {
+        if let Err(e) = self
+            .mon_client
+            .subscribe(crate::monclient::MonService::OsdMap, u64::from(epoch), 0)
+            .await
+        {
+            warn!("Failed to request OSDMaps from epoch {}: {}", epoch, e);
+        }
     }
 
     /// Handle OSD operation reply from a specific OSD
@@ -4222,7 +4361,7 @@ mod tests {
         let map = one_osd_map(new_pg_num, 11);
         let mut need_resend = Vec::new();
         client
-            .collect_resend_ops(&session, &map, 11, Some(0), &mut need_resend)
+            .collect_resend_ops(&session, &map, 11, Some(0), false, &mut need_resend)
             .await
             .expect("placed");
         need_resend
@@ -4256,6 +4395,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_epochs_resend_every_op() {
+        let client = offline_client().await;
+        let (session, _rx) = session_with_op(&object_in_pg(8, 5), 8, true);
+        let mut need_resend = Vec::new();
+        client
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                Some(0),
+                true,
+                &mut need_resend,
+            )
+            .await
+            .expect("placed");
+        assert_eq!(
+            need_resend.len(),
+            1,
+            "same primary and pg_num, still resent"
+        );
+        assert_eq!(need_resend[0].0, 0);
+        assert_eq!(need_resend[0].1.op.osdmap_epoch, 11);
+    }
+
+    #[tokio::test]
+    async fn skipped_epochs_leave_the_session_up() {
+        let client = offline_client().await;
+        let (session, _rx) = session_with_op(&object_in_pg(8, 5), 8, true);
+        let mut need_resend = Vec::new();
+        let any_migrated = client
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                Some(0),
+                true,
+                &mut need_resend,
+            )
+            .await
+            .expect("placed");
+        assert_eq!(need_resend.len(), 1);
+        assert!(!any_migrated, "a skip alone closes no session");
+        assert!(!session.io_loop_cancelled_for_test());
+    }
+
+    fn map_at(epoch: u32) -> Arc<crate::osdclient::osdmap::OSDMap> {
+        let mut map = crate::osdclient::osdmap::OSDMap::new();
+        map.epoch = crate::Epoch::new(epoch);
+        Arc::new(map)
+    }
+
+    /// An MOSDMap holding incrementals at `inc` and full maps at `full`,
+    /// whose bytes only `walk` below reads, with trim lower bound `lb`.
+    fn mosdmap_with(inc: &[u32], full: &[u32], lb: u32) -> crate::monclient::MOSDMap {
+        let epochs = |es: &[u32]| es.iter().map(|&e| (e, Bytes::new())).collect();
+        crate::monclient::MOSDMap {
+            fsid: [0; 16],
+            incremental_maps: epochs(inc),
+            maps: epochs(full),
+            cluster_osdmap_trim_lower_bound: lb,
+            newest_map: 100,
+        }
+    }
+
+    /// Walk `m` from a map at epoch 10, every map building. Returns the
+    /// batch and the epochs built, `i` for incremental and `f` for full.
+    fn walk(m: &crate::monclient::MOSDMap) -> (super::MapBatch, Vec<String>) {
+        let built = std::cell::RefCell::new(Vec::new());
+        let batch = super::walk_map_epochs(
+            m,
+            10,
+            Some(map_at(10)),
+            |e, working| {
+                assert_eq!(working.as_ref().unwrap().epoch.as_u32(), e - 1);
+                built.borrow_mut().push(format!("i{e}"));
+                Some(map_at(e))
+            },
+            |e| {
+                built.borrow_mut().push(format!("f{e}"));
+                Some(map_at(e))
+            },
+        );
+        (batch, built.into_inner())
+    }
+
+    fn epochs(batch: &super::MapBatch) -> Vec<u32> {
+        batch.maps.iter().map(|m| m.epoch.as_u32()).collect()
+    }
+
+    #[test]
+    fn a_missing_epoch_the_mon_holds_is_requested() {
+        // 12 is missing and above the trim bound: ask for it, and apply
+        // nothing after it, not even 13's full map.
+        let (batch, built) = walk(&mosdmap_with(&[11, 13, 14], &[13], 5));
+        assert_eq!(built, ["i11"]);
+        assert_eq!(epochs(&batch), [11]);
+        assert_eq!(batch.request_from, Some(12));
+        assert!(!batch.skipped);
+
+        // The first epoch missing asks for it.
+        let (batch, built) = walk(&mosdmap_with(&[12], &[], 11));
+        assert!(built.is_empty() && batch.maps.is_empty());
+        assert_eq!(batch.request_from, Some(11));
+
+        // An epoch that fails to build is missing too.
+        let m = mosdmap_with(&[11, 12], &[], 0);
+        let batch = super::walk_map_epochs(&m, 10, Some(map_at(10)), |_, _| None, |_| None);
+        assert_eq!(batch.request_from, Some(11));
+    }
+
+    #[test]
+    fn a_missing_epoch_the_mon_trimmed_jumps_to_the_trim_bound() {
+        // The mon trimmed up to 20: its full map, then incrementals.
+        let (batch, built) = walk(&mosdmap_with(&[21, 22], &[20], 20));
+        assert_eq!(built, ["f20", "i21", "i22"]);
+        assert_eq!(epochs(&batch), [20, 21, 22]);
+        assert!(batch.skipped);
+        assert_eq!(batch.request_from, None);
+
+        // Without the bound's full map, the next epoch is asked for.
+        let (batch, built) = walk(&mosdmap_with(&[21, 22], &[], 20));
+        assert!(built.is_empty());
+        assert!(batch.skipped);
+        assert_eq!(batch.request_from, Some(11));
+    }
+
+    #[test]
+    fn a_contiguous_message_applies_whole() {
+        let (batch, built) = walk(&mosdmap_with(&[11, 12], &[13], 5));
+        assert_eq!(built, ["i11", "i12", "f13"]);
+        assert!(!batch.skipped);
+        assert_eq!(batch.request_from, None);
+    }
+
+    #[tokio::test]
     async fn an_op_whose_pg_is_unchanged_is_not_resent() {
         assert!(rescan(&object_in_pg(8, 5), 8, 8).await.is_empty());
         // An op that recorded no pg_num is never judged split.
@@ -4281,7 +4555,14 @@ mod tests {
         let map = one_osd_map(new_pg_num, 11);
         let mut need_resend = Vec::new();
         client
-            .collect_resend_ops(&session, &map, 11, Some(session_osd), &mut need_resend)
+            .collect_resend_ops(
+                &session,
+                &map,
+                11,
+                Some(session_osd),
+                false,
+                &mut need_resend,
+            )
             .await
             .expect("placed");
         let pending = session.get_pending_ops_metadata().len() == 1;
@@ -4323,7 +4604,14 @@ mod tests {
         let (session, mut rx) = session_with_op(&object, 8, false);
         let mut need_resend = Vec::new();
         let _ = client
-            .collect_resend_ops(&session, &one_osd_map(8, 11), 11, None, &mut need_resend)
+            .collect_resend_ops(
+                &session,
+                &one_osd_map(8, 11),
+                11,
+                None,
+                false,
+                &mut need_resend,
+            )
             .await;
         assert!(need_resend.is_empty());
         assert!(session.get_pending_ops_metadata().is_empty());
@@ -4462,6 +4750,374 @@ mod tests {
                 hash: -1,
             }
         );
+    }
+
+    /// A session to OSD 0, the one every op of `client` goes to, whose
+    /// sends come out of the returned channel unanswered.
+    async fn fake_osd(
+        client: &Arc<OSDClient>,
+    ) -> (
+        Arc<crate::osdclient::session::OSDSession>,
+        tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) {
+        let (tx, _rx) = crate::msgr2::map_channel(1);
+        let mut session = crate::osdclient::session::OSDSession::new(
+            0,
+            None,
+            0,
+            tx,
+            std::sync::Weak::new(),
+            Arc::clone(&client.next_tid),
+        );
+        let sends = session.sends_for_test();
+        let session = Arc::new(session);
+        *client.fake_osd.lock().unwrap() = Some(Arc::clone(&session));
+        (session, sends)
+    }
+
+    /// Take the next op `session` sends, and the pending op it is.
+    async fn next_send(
+        session: &crate::osdclient::session::OSDSession,
+        sends: &mut tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) -> crate::osdclient::session::PendingOp {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("an op went out")
+            .expect("sends open");
+        session
+            .remove_pending_op(frame.tid())
+            .expect("the op sent is pending")
+    }
+
+    fn pgnls_reply(
+        result: i32,
+        handle: crate::HObject,
+        oid: &str,
+    ) -> crate::osdclient::types::OpResult {
+        let response = crate::osdclient::PgNlsResponse::with_entries(
+            handle,
+            vec![crate::osdclient::ListObjectImpl::new("", oid, "")],
+        );
+        let mut outdata = bytes::BytesMut::new();
+        crate::Denc::encode(&response, &mut outdata, 0).expect("encoded");
+        crate::osdclient::types::OpResult {
+            result,
+            version: 0,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: result,
+                outdata: outdata.freeze(),
+            }],
+            redirect: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_listing_page_is_placed_in_the_current_map() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        let listing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.list_in_namespace(2, "", None, 100).await })
+        };
+
+        // Page one: PG 0 of 8, at epoch 10. The pool splits to 16 PGs at
+        // epoch 11 before its reply.
+        let first = next_send(&session, &mut sends).await;
+        assert_eq!(first.op.osdmap_epoch, 10);
+        assert_eq!(first.op.pgid.seed, 0);
+        assert_eq!(first.target.pg_num, 8);
+        client.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+        let cursor = crate::HObject::new(2, String::new(), 0xd);
+        let _ = first.result_tx.send(Ok(pgnls_reply(1, cursor, "a")));
+
+        // Page two, at cursor hash 0xd: PG 5 of 8, but PG 13 of the 16
+        // now, and stamped with epoch 11.
+        let second = next_send(&session, &mut sends).await;
+        assert_eq!(second.op.osdmap_epoch, 11);
+        assert_eq!(second.op.pgid.seed, 13);
+        assert_eq!(second.op.object.hash, 0xd, "still placed by the cursor");
+        assert_eq!(second.target.pg_num, 16);
+        let mut end = crate::HObject::empty_cursor(2);
+        end.max = true;
+        let _ = second.result_tx.send(Ok(pgnls_reply(1, end, "b")));
+
+        let listed = listing.await.expect("ran").expect("listed");
+        let names: Vec<_> = listed.entries.iter().map(|e| e.oid.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(listed.cursor, None);
+    }
+
+    /// A write of `object` sent through `session` at epoch 10 with 8
+    /// PGs, as route_and_submit places it; `still_placed` as given.
+    async fn submit_write(
+        session: &crate::osdclient::session::OSDSession,
+        object: &ObjectId,
+        still_placed: impl FnOnce() -> bool,
+    ) -> super::Result<
+        Option<tokio::sync::oneshot::Receiver<super::Result<crate::osdclient::types::OpResult>>>,
+    > {
+        let map = one_osd_map(8, 10);
+        let (hash, spg, _) = OSDClient::object_to_osds_in_map(&map, object).unwrap();
+        let mut op = mosdop(
+            object.clone(),
+            vec![crate::osdclient::types::OSDOp::write_full(
+                Bytes::from_static(b"x"),
+            )],
+        );
+        op.object.hash = hash;
+        op.pgid = spg;
+        op.osdmap_epoch = 10;
+        op.reqid = crate::osdclient::types::RequestId::new(&"client.test".into(), 77, 0);
+        session
+            .submit_op(
+                Arc::new(op),
+                crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                8,
+                true,
+                still_placed,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_map_moved_before_it_went_out_is_taken_back() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let placed = submit_write(&session, &object_in_pg(8, 5), || false).await;
+        assert!(matches!(placed, Ok(None)), "to be placed again");
+        assert!(session.get_pending_ops_metadata().is_empty(), "taken back");
+        assert!(sends.try_recv().is_err(), "nothing sent");
+
+        // Still placed: it goes out.
+        let placed = submit_write(&session, &object_in_pg(8, 5), || true).await;
+        assert!(matches!(placed, Ok(Some(_))));
+        assert_eq!(session.get_pending_ops_metadata().len(), 1);
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+    }
+
+    #[tokio::test]
+    async fn an_op_a_rescan_took_first_is_left_to_the_rescan() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        // The rescan ran with the op pending, took it and resends it.
+        let taken = std::sync::Mutex::new(None);
+        let placed = submit_write(&session, &object_in_pg(8, 5), || {
+            *taken.lock().unwrap() = session.remove_pending_op(77);
+            false
+        })
+        .await;
+        let mut rx = placed.expect("submitted").expect("its reply still comes");
+        assert!(sends.try_recv().is_err(), "nothing sent here");
+        let taken = taken.into_inner().unwrap().expect("the rescan had it");
+        let _ = taken
+            .result_tx
+            .send(Ok(pgnls_reply(0, crate::HObject::empty_cursor(2), "")));
+        assert!(matches!(rx.try_recv(), Ok(Ok(_))), "the resend answers it");
+    }
+
+    #[tokio::test]
+    async fn a_write_a_rescan_resent_in_the_submit_window_goes_out_once() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        // With the write pending and its map unchecked, the pool splits on
+        // the same OSD and the rescan resends the write through the same
+        // session, as collect_resend_ops and insert_migrated_op do.
+        let publisher = Arc::clone(&client);
+        let rescan = Arc::clone(&session);
+        let mut fired = false;
+        *client.in_submit_window.lock().unwrap() = Some(Box::new(move || {
+            if std::mem::replace(&mut fired, true) {
+                return;
+            }
+            publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+            let (tid, ..) = rescan.get_pending_ops_metadata()[0];
+            let op = rescan.remove_pending_op(tid).expect("pending");
+            futures::executor::block_on(rescan.insert_migrated_op(op, 11)).expect("resent");
+        }));
+        let write = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .write_full(2, &object_in_pg(16, 13).oid, Bytes::from_static(b"x"))
+                    .await
+            })
+        };
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("the rescan's send")
+            .expect("sends open");
+        let again = tokio::time::timeout(std::time::Duration::from_millis(300), sends.recv()).await;
+        assert!(
+            again.is_err(),
+            "tid {} sent again as tid {:?}",
+            first.tid(),
+            again.ok().flatten().map(|m| m.tid())
+        );
+        let sent = session
+            .remove_pending_op(first.tid())
+            .expect("the op sent is pending");
+        assert_eq!(sent.op.osdmap_epoch, 11);
+        let _ = sent.result_tx.send(Ok(crate::osdclient::types::OpResult {
+            result: 0,
+            version: 1,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+            redirect: None,
+        }));
+        write.await.expect("ran").expect("written");
+    }
+
+    /// Lift a backoff on every object of `object`'s PG at epoch 10 with 8
+    /// PGs, as an OSD's UNBLOCK does, from inside a synchronous hook.
+    fn unblock_pg_of(session: &crate::osdclient::session::OSDSession, object: &ObjectId) {
+        let (_, spg, _) = OSDClient::object_to_osds_in_map(&one_osd_map(8, 10), object).unwrap();
+        let begin = crate::HObject::empty_cursor(2);
+        let mut end = crate::HObject::empty_cursor(2);
+        end.max = true;
+        futures::executor::block_on(session.resend_ops_in_range(&spg, &begin, &end));
+    }
+
+    #[tokio::test]
+    async fn an_unblock_does_not_send_an_op_its_submitter_has_not_checked() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let object = object_in_pg(8, 5);
+
+        // The UNBLOCK lands with the op pending and its map unchecked;
+        // the check then takes it back to place it again under a new tid.
+        let sent_in_window = std::cell::Cell::new(None);
+        let placed = submit_write(&session, &object, || {
+            unblock_pg_of(&session, &object);
+            sent_in_window.set(Some(sends.try_recv().is_ok()));
+            false
+        })
+        .await;
+        assert_eq!(
+            sent_in_window.get(),
+            Some(false),
+            "nothing before the check"
+        );
+        assert!(matches!(placed, Ok(None)), "taken back");
+        assert!(sends.try_recv().is_err(), "tid 77 never went out");
+
+        // With the map unchanged, only the submitter's frame goes out.
+        let placed = submit_write(&session, &object, || {
+            unblock_pg_of(&session, &object);
+            sent_in_window.set(Some(sends.try_recv().is_ok()));
+            true
+        })
+        .await;
+        assert_eq!(sent_in_window.get(), Some(false));
+        assert!(matches!(placed, Ok(Some(_))));
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+        assert!(sends.try_recv().is_err(), "sent once");
+
+        // Once submitted, an UNBLOCK re-sends it.
+        unblock_pg_of(&session, &object);
+        assert_eq!(sends.try_recv().expect("re-sent").tid(), 77);
+    }
+
+    #[tokio::test]
+    async fn an_op_a_rescan_resent_on_its_session_is_not_taken_back() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        // The rescan took the op and resent it through the same session.
+        let placed = submit_write(&session, &object_in_pg(8, 5), || {
+            let op = session.remove_pending_op(77).expect("pending");
+            futures::executor::block_on(session.insert_migrated_op(op, 11)).expect("resent");
+            false
+        })
+        .await;
+        assert!(matches!(placed, Ok(Some(_))), "its reply still comes");
+        let frame = sends.try_recv().expect("the rescan's send");
+        assert_eq!(frame.tid(), 77);
+        assert!(sends.try_recv().is_err(), "nothing sent here");
+        assert_eq!(session.get_pending_ops_metadata().len(), 1, "left pending");
+    }
+
+    #[tokio::test]
+    async fn an_op_is_placed_again_when_a_map_lands_before_it_is_pending() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        // PG 5 of 8, and PG 13 once it splits to 16.
+        let object = object_in_pg(16, 13);
+        // The pool splits after the op is placed and before it is
+        // pending: the rescan of epoch 11 finds nothing to resend.
+        let publisher = Arc::clone(&client);
+        let mut published = false;
+        *client.before_submit.lock().unwrap() = Some(Box::new(move || {
+            if !std::mem::replace(&mut published, true) {
+                publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+            }
+        }));
+        let write = {
+            let client = Arc::clone(&client);
+            let object = object.clone();
+            tokio::spawn(async move {
+                client
+                    .write_full(2, &object.oid, Bytes::from_static(b"x"))
+                    .await
+            })
+        };
+
+        let sent = next_send(&session, &mut sends).await;
+        assert_eq!(sent.op.osdmap_epoch, 11, "placed again in the new map");
+        assert_eq!(sent.op.pgid.seed, 13);
+        assert_eq!(sent.target.pg_num, 16);
+        assert!(
+            sends.try_recv().is_err(),
+            "the first placement never went out"
+        );
+        assert!(session.get_pending_ops_metadata().is_empty());
+        let _ = sent.result_tx.send(Ok(crate::osdclient::types::OpResult {
+            result: 0,
+            version: 1,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+            redirect: None,
+        }));
+        write.await.expect("ran").expect("written");
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_taken_back_is_cancelled_not_placed_again() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        let object = object_in_pg(16, 13);
+        let publisher = Arc::clone(&client);
+        *client.before_submit.lock().unwrap() = Some(Box::new(move || {
+            publisher.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+        }));
+
+        for kind in [super::SubmitKind::Linger, super::SubmitKind::Ping] {
+            let (_, _, osdmap, rx, _) = client
+                .submit_once_in_map(
+                    &object,
+                    vec![crate::osdclient::types::OSDOp::watch_ping(1, 1)],
+                    crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                    crate::osdclient::types::OsdOpFlags::READ,
+                    kind,
+                )
+                .await
+                .expect("routed");
+            assert_eq!(osdmap.epoch.as_u32(), 10, "not placed again");
+            assert!(
+                matches!(rx.await, Ok(Err(OSDClientError::Cancelled))),
+                "no answer"
+            );
+            assert!(sends.try_recv().is_err(), "never sent");
+            assert!(session.get_pending_ops_metadata().is_empty());
+            client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        }
     }
 
     #[test]
@@ -5098,6 +5754,75 @@ mod tests {
     }
 
     #[test]
+    fn a_superseded_registration_send_changes_nothing() {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Linger::new(
+            1001,
+            ObjectId::new(1, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        );
+        let (reg_tx, mut reg_rx) = tokio::sync::oneshot::channel();
+        linger.lock_state().registration = Some(reg_tx);
+        let first = linger.begin_send();
+        let second = linger.begin_send();
+        let sent = std::time::Instant::now();
+
+        // The first send's reply came before the second cancelled it.
+        OSDClient::finish_register_send(&linger, first, sent, Ok(notify_reply(0)));
+        assert!(!linger.lock_state().registered);
+        OSDClient::finish_register_send(
+            &linger,
+            first,
+            sent,
+            Err(OSDClientError::OSDError {
+                code: crate::osdclient::error::ENOENT,
+                message: "watch".into(),
+            }),
+        );
+        assert!(reg_rx.try_recv().is_err(), "still pending");
+        {
+            let state = linger.lock_state();
+            assert!(!state.registered);
+            assert_eq!(state.watch_valid_thru, None);
+        }
+
+        OSDClient::finish_register_send(&linger, second, sent, Ok(notify_reply(0)));
+        assert!(linger.lock_state().registered);
+        assert!(matches!(reg_rx.try_recv(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn the_latest_registration_send_fails_the_watch() {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Linger::new(
+            1001,
+            ObjectId::new(1, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        );
+        let (reg_tx, mut reg_rx) = tokio::sync::oneshot::channel();
+        linger.lock_state().registration = Some(reg_tx);
+        let seq = linger.begin_send();
+        OSDClient::finish_register_send(
+            &linger,
+            seq,
+            std::time::Instant::now(),
+            Err(OSDClientError::OSDError {
+                code: crate::osdclient::error::ENOENT,
+                message: "watch".into(),
+            }),
+        );
+        assert!(matches!(
+            reg_rx.try_recv(),
+            Ok(Err(OSDClientError::OSDError { .. }))
+        ));
+        assert!(!linger.lock_state().registered);
+    }
+
+    #[test]
     fn the_latest_notify_send_fails_the_notify() {
         let (linger, mut done_rx) = test_notify(1001);
         let seq = linger.begin_send();
@@ -5285,6 +6010,82 @@ mod tests {
             Arc::strong_count(&linger),
             1,
             "a send outlived the shutdown"
+        );
+    }
+
+    /// Wait until only the caller holds `linger`: every task that took
+    /// it has ended.
+    async fn only_caller_holds(linger: &Arc<crate::osdclient::watch::Linger>) -> bool {
+        for _ in 0..200 {
+            if Arc::strong_count(linger) == 1 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A registered watch on pool 2's `o`, last sent to OSD 0.
+    fn watch_on_osd_0(client: &Arc<OSDClient>) -> Arc<crate::osdclient::watch::Linger> {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Arc::new(Linger::new(
+            1001,
+            ObjectId::new(2, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        ));
+        {
+            let mut state = linger.lock_state();
+            state.registered = true;
+            state.osd = Some(0);
+        }
+        client.lingers.insert(1001, Arc::clone(&linger));
+        linger
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_a_ping_in_flight() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (_session, mut sends) = fake_osd(&client).await;
+        let linger = watch_on_osd_0(&client);
+
+        // The ping goes out and its reply never comes: its task waits
+        // out the Tracker's 30 s.
+        client.tick_lingers();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("the ping went out");
+
+        client.shutdown().await;
+        assert!(
+            only_caller_holds(&linger).await,
+            "the ping outlived the shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_a_linger_send_a_reset_began() {
+        let client = offline_client().await;
+        // Writes are paused: the reconnect a reset sends, a write, is held
+        // for the Tracker's 30 s before any session.
+        let mut map = (*one_osd_map(8, 10)).clone();
+        map.flags = 1 << 3; // CEPH_OSDMAP_PAUSEWR
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+        let linger = watch_on_osd_0(&client);
+
+        assert!(client.on_session_reset(0));
+        while linger.lock_state().send_seq == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(linger.lock_state().sending, "the reconnect is held");
+
+        client.shutdown().await;
+        assert!(
+            only_caller_holds(&linger).await,
+            "the re-send outlived the shutdown"
         );
     }
 

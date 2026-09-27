@@ -320,3 +320,145 @@ async fn ops_complete_across_a_merge_and_a_split() {
         std::panic::resume_unwind(panic);
     }
 }
+
+const LISTED: usize = 200;
+/// Entries per listing call: more than there are, so one call walks
+/// every PG, one PGNLS page each, and a split can land between its pages.
+const LIST_PAGE: usize = 2 * LISTED;
+
+/// List the whole namespace of `ioctx`, each call within `OP_BOUND`.
+/// Returns the names, or `None` on a failed call.
+async fn list_all(ioctx: &IoCtx, failures: &Failures) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (page, next) = bounded(
+            failures,
+            "list",
+            "the namespace",
+            ioctx.list_objects(cursor.clone(), LIST_PAGE),
+        )
+        .await?;
+        names.extend(page);
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Some(names),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_listing_completes_across_a_split() {
+    common::init_tracing();
+    let client = build_test_client().await.expect("client");
+    let pool = unique("split-list");
+    mon_command(
+        &client,
+        serde_json::json!({
+            "prefix": "osd pool create",
+            "pool": pool,
+            "pg_num": 8,
+            "pgp_num": 8,
+            "autoscale_mode": "off",
+        }),
+    )
+    .await;
+
+    let lister_abort = std::sync::Mutex::new(None);
+    let body = AssertUnwindSafe(async {
+        wait_for_pg_num(&client, &pool, 8).await;
+        wait_for_active(&pool, 8).await;
+        let mut ioctx = client.open_pool(&pool).await.expect("open pool");
+        ioctx.set_namespace(unique("sl-ns"));
+        let mut want = std::collections::BTreeSet::new();
+        for i in 0..LISTED {
+            let name = format!("obj-{i}");
+            ioctx
+                .write_full(&name, Bytes::from_static(b"x"))
+                .await
+                .expect("write");
+            want.insert(name);
+        }
+
+        // List the namespace over and over while the pool splits.
+        let failures = Arc::new(Failures::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let lister = {
+            let (ioctx, failures, stop, want) = (
+                ioctx.clone(),
+                Arc::clone(&failures),
+                Arc::clone(&stop),
+                want.clone(),
+            );
+            tokio::spawn(async move {
+                let mut listings = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(names) = list_all(&ioctx, &failures).await else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+                    let count = names.len();
+                    let got: std::collections::BTreeSet<_> = names.into_iter().collect();
+                    if got != want || count != want.len() {
+                        failures.lock().unwrap().push(format!(
+                            "listing {listings}: {count} names, {} missing, {} extra",
+                            want.difference(&got).count(),
+                            got.difference(&want).count()
+                        ));
+                    }
+                    listings += 1;
+                }
+                listings
+            })
+        };
+        *lister_abort.lock().unwrap() = Some(lister.abort_handle());
+
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mon_command(
+            &client,
+            serde_json::json!({
+                "prefix": "osd pool set",
+                "pool": pool,
+                "var": "pg_num",
+                "val": "64",
+            }),
+        )
+        .await;
+        wait_for_pg_num(&client, &pool, 64).await;
+        eprintln!("split to 64 PGs after {:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        stop.store(true, Ordering::Relaxed);
+        let listings = lister.await.expect("lister");
+
+        // And once more on the split pool.
+        let names = list_all(&ioctx, &failures).await;
+        let failures = failures.lock().unwrap();
+        eprintln!(
+            "{listings} listings in {:?}, {} failures",
+            started.elapsed(),
+            failures.len()
+        );
+        assert!(listings > 0, "no listing ran");
+        assert!(failures.is_empty(), "{failures:#?}");
+        let names = names.expect("listed");
+        assert_eq!(names.len(), want.len(), "duplicates listed");
+        let got: std::collections::BTreeSet<_> = names.into_iter().collect();
+        assert_eq!(got, want);
+    })
+    .catch_unwind()
+    .await;
+
+    // A panic leaves the lister running; stop it before the pool goes.
+    if let Some(lister) = lister_abort.lock().unwrap().take() {
+        lister.abort();
+    }
+
+    if let Err(err) = client.osd_client().delete_pool(&pool, true).await {
+        eprintln!("cleanup: deleting pool {pool}: {err:?}");
+    }
+    if let Err(panic) = body {
+        std::panic::resume_unwind(panic);
+    }
+}
