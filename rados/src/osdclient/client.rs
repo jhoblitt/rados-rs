@@ -657,7 +657,7 @@ impl OSDClient {
         if self.shutdown_token.is_cancelled() {
             return false;
         }
-        tokio::spawn(Arc::clone(self).relinger_after_reset(osd_id));
+        self.spawn_until_shutdown(Arc::clone(self).relinger_after_reset(osd_id));
         true
     }
 
@@ -1288,7 +1288,7 @@ impl OSDClient {
             return;
         }
         for (linger, generation) in watches_to_ping(&self.lingers) {
-            tokio::spawn(Arc::clone(self).ping_watch(linger, generation));
+            self.spawn_until_shutdown(Arc::clone(self).ping_watch(linger, generation));
         }
     }
 
@@ -6010,6 +6010,82 @@ mod tests {
             Arc::strong_count(&linger),
             1,
             "a send outlived the shutdown"
+        );
+    }
+
+    /// Wait until only the caller holds `linger`: every task that took
+    /// it has ended.
+    async fn only_caller_holds(linger: &Arc<crate::osdclient::watch::Linger>) -> bool {
+        for _ in 0..200 {
+            if Arc::strong_count(linger) == 1 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A registered watch on pool 2's `o`, last sent to OSD 0.
+    fn watch_on_osd_0(client: &Arc<OSDClient>) -> Arc<crate::osdclient::watch::Linger> {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Arc::new(Linger::new(
+            1001,
+            ObjectId::new(2, "o"),
+            LingerKind::Watch { timeout: 0 },
+            tx,
+        ));
+        {
+            let mut state = linger.lock_state();
+            state.registered = true;
+            state.osd = Some(0);
+        }
+        client.lingers.insert(1001, Arc::clone(&linger));
+        linger
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_a_ping_in_flight() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (_session, mut sends) = fake_osd(&client).await;
+        let linger = watch_on_osd_0(&client);
+
+        // The ping goes out and its reply never comes: its task waits
+        // out the Tracker's 30 s.
+        client.tick_lingers();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("the ping went out");
+
+        client.shutdown().await;
+        assert!(
+            only_caller_holds(&linger).await,
+            "the ping outlived the shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_a_linger_send_a_reset_began() {
+        let client = offline_client().await;
+        // Writes are paused: the reconnect a reset sends, a write, is held
+        // for the Tracker's 30 s before any session.
+        let mut map = (*one_osd_map(8, 10)).clone();
+        map.flags = 1 << 3; // CEPH_OSDMAP_PAUSEWR
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+        let linger = watch_on_osd_0(&client);
+
+        assert!(client.on_session_reset(0));
+        while linger.lock_state().send_seq == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(linger.lock_state().sending, "the reconnect is held");
+
+        client.shutdown().await;
+        assert!(
+            only_caller_holds(&linger).await,
+            "the re-send outlived the shutdown"
         );
     }
 
