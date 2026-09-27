@@ -90,10 +90,14 @@ maintain a list of its own.
   OSD a shape it might not accept, which is the trade the rule makes. The driver-level types the gateway
   writes itself are rgw-rs's, and there the rule applies in full.
   Under Rook the rule meets stored bytes from a newer release than the
-  cluster's. The operator writes the realm, zonegroup, zone and periods
-  in `.rgw.root` with its own radosgw-admin, and Rook v1.20.7's operator
-  image carries Ceph 20.2.4. So on a Squid v19.2.6 cluster `zone_info.*`
-  is stored at struct version 18, Tentacle's (v20.2.4
+  cluster's. Rook writes no zone metadata itself: it runs `radosgw-admin`,
+  and without Multus it runs that binary locally in the operator pod
+  (rook v1.20.7 `pkg/operator/ceph/object/admin.go:273-274`), so the
+  realm, zonegroup, zone and periods in `.rgw.root` are written by the
+  operator image's Ceph, 20.2.4 in Rook v1.20.7. With Multus the command
+  is proxied into the mgr's command-proxy container (`:245-271`), which
+  runs the cluster's image. So on a Squid v19.2.6 cluster without Multus,
+  `zone_info.*` is stored at struct version 18, Tentacle's (v20.2.4
   `src/rgw/driver/rados/rgw_zone.h:160`), where Squid's radosgw writes 15
   (v19.2.6 `:156`). This was verified on a rooket cluster on 2026-09-27
   after rgw-go reported it. The decode rule already covers these bytes,
