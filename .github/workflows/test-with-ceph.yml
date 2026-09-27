@@ -104,6 +104,7 @@ jobs:
             cargo test -p rados-cls --test "$test" -- --ignored --nocapture
           done
         env:
+          CEPH_TEST_EXPECT_OSD_RELEASE: squid
           RADOS_MS_CRC_DATA: "true"
           RUST_BACKTRACE: full
           RUST_LOG: info
@@ -124,6 +125,7 @@ jobs:
             cargo test -p rados-cls --test "$test" -- --ignored --nocapture
           done
         env:
+          CEPH_TEST_EXPECT_OSD_RELEASE: squid
           RADOS_MS_CRC_DATA: "false"
           RUST_BACKTRACE: full
           RUST_LOG: info

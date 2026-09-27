@@ -1,10 +1,13 @@
 //! Cluster tests for what a Squid rgw class does with the request shapes
-//! of later releases. Every test first asserts that the cluster's
-//! `require_osd_release` is squid: on a newer cluster the same requests
-//! would mean something else. What Tentacle and Umbrella themselves do
-//! with these shapes cannot be exercised here; the byte pins in
-//! `rgw::index` and `rgw::olh`, taken from their `ceph-dencoder`, are the
-//! evidence for those shapes. Run with:
+//! of later releases. They pin Squid only: on a cluster whose
+//! `require_osd_release` is any other release the same requests mean
+//! something else, so there every test prints a `skipped` line and
+//! passes. `CEPH_TEST_EXPECT_OSD_RELEASE` names the release the cluster
+//! must be, and any other fails instead; CI sets it to squid, so a newer
+//! compose image cannot turn these checks into skips. What Tentacle and
+//! Umbrella themselves do with these shapes cannot be exercised here; the
+//! byte pins in `rgw::index` and `rgw::olh`, taken from their
+//! `ceph-dencoder`, are the evidence for those shapes. Run with:
 //!   CEPH_CONF=... cargo test -p rados-cls --test cls_rgw_release_shapes -- --ignored --nocapture
 
 #[path = "../../rados/tests/common/mod.rs"]
@@ -64,15 +67,37 @@ fn olh_tag(name: &str) -> String {
     format!("olh-{name}")
 }
 
-/// A fresh, initialised index shard on a Squid cluster.
-async fn shard(prefix: &str) -> (IoCtx, String) {
+/// Whether the cluster is Squid, so `test` runs; if not, prints why it is
+/// skipped. A cluster whose release is not the one
+/// `CEPH_TEST_EXPECT_OSD_RELEASE` names fails instead.
+fn on_squid(ioctx: &IoCtx, test: &str) -> bool {
+    let release = ioctx.require_osd_release();
+    let name = release.map_or("unset", CephRelease::name);
+    if let Ok(expected) = std::env::var("CEPH_TEST_EXPECT_OSD_RELEASE") {
+        assert_eq!(
+            name, expected,
+            "the cluster's require_osd_release is not CEPH_TEST_EXPECT_OSD_RELEASE"
+        );
+    }
+    if release == Some(CephRelease::SQUID) {
+        return true;
+    }
+    println!("skipped {test}: the cluster's require_osd_release is {name}, not squid");
+    false
+}
+
+/// A fresh, initialised index shard on a Squid cluster, or `None` when
+/// [`on_squid`] skips the test.
+async fn shard(prefix: &str) -> Option<(IoCtx, String)> {
     common::init_tracing();
     let ioctx = create_ioctx().await.expect("create_ioctx");
-    assert_eq!(ioctx.require_osd_release(), Some(CephRelease::SQUID));
+    if !on_squid(&ioctx, prefix) {
+        return None;
+    }
     let oid = unique(prefix);
     ioctx.create(&oid, true).await.expect("create");
     index::init_index(&ioctx, &oid).await.expect("init_index");
-    (ioctx, oid)
+    Some((ioctx, oid))
 }
 
 /// Prepare and complete an `ADD` of the instance `name`/`inst` at
@@ -153,13 +178,15 @@ async fn main_stats(ioctx: &IoCtx, oid: &str) -> CategoryStats {
 #[ignore]
 async fn osd_release_is_squid() {
     let ioctx = create_ioctx().await.expect("create_ioctx");
-    assert_eq!(ioctx.require_osd_release(), Some(CephRelease::SQUID));
+    on_squid(&ioctx, "osd_release_is_squid");
 }
 
 #[tokio::test]
 #[ignore]
 async fn update_stats_tentacle_shape_is_accepted_as_v1() {
-    let (ioctx, a) = shard("cls-rgw-shapes-stats-a").await;
+    let Some((ioctx, a)) = shard("cls-rgw-shapes-stats-a").await else {
+        return;
+    };
     let b = unique("cls-rgw-shapes-stats-b");
     ioctx.create(&b, true).await.expect("create");
     index::init_index(&ioctx, &b).await.expect("init_index");
@@ -217,7 +244,9 @@ async fn update_stats_tentacle_shape_is_accepted_as_v1() {
 #[tokio::test]
 #[ignore]
 async fn read_olh_log_umbrella_shape_is_accepted() {
-    let (ioctx, oid) = shard("cls-rgw-shapes-olh-log").await;
+    let Some((ioctx, oid)) = shard("cls-rgw-shapes-olh-log").await else {
+        return;
+    };
     // The class reads past the end of an empty log, so give it an entry.
     add_instance(&ioctx, &oid, "o", "v1", "t1", 0, 100).await;
     olh::link_olh(&ioctx, &oid, &link_req("o", "v1", "t1", 0, 100))
@@ -251,7 +280,9 @@ async fn read_olh_log_umbrella_shape_is_accepted() {
 #[tokio::test]
 #[ignore]
 async fn meta_v8_in_complete_is_stored_as_v7() {
-    let (ioctx, oid) = shard("cls-rgw-shapes-complete").await;
+    let Some((ioctx, oid)) = shard("cls-rgw-shapes-complete").await else {
+        return;
+    };
     let prepare = PrepareOp {
         op: ModifyOp::ADD,
         key: key("x"),
@@ -300,7 +331,9 @@ async fn meta_v8_in_complete_is_stored_as_v7() {
 #[tokio::test]
 #[ignore]
 async fn meta_v8_in_link_olh_is_stored_as_v7() {
-    let (ioctx, oid) = shard("cls-rgw-shapes-link").await;
+    let Some((ioctx, oid)) = shard("cls-rgw-shapes-link").await else {
+        return;
+    };
     add_instance(&ioctx, &oid, "o", "v1", "t1", 0, 100).await;
     olh::link_olh(&ioctx, &oid, &link_req("o", "v1", "t1", 0, 100))
         .await
@@ -335,7 +368,9 @@ async fn meta_v8_in_link_olh_is_stored_as_v7() {
 #[tokio::test]
 #[ignore]
 async fn later_methods_are_eopnotsupp() {
-    let (ioctx, oid) = shard("cls-rgw-shapes-methods").await;
+    let Some((ioctx, oid)) = shard("cls-rgw-shapes-methods").await else {
+        return;
+    };
     // The lookup fails before any decode: OpInfo::set_from_op maps
     // get_method_flags' ENOENT to EOPNOTSUPP
     // (src/osd/osd_op_util.cc:189-196@v19.2.2).
