@@ -81,8 +81,9 @@ fn parse_pgid(s: &str) -> u32 {
     u32::from_str_radix(seed, 16).expect("hex pg seed")
 }
 
-/// The monitor's `osd map` answer for `object` in `nspace`: (raw ps, pg).
-async fn mon_osd_map(client: &Client, pool: &str, object: &str, nspace: &str) -> (u32, u32) {
+/// The monitor's `osd map` answer for `object` in `nspace`: the map
+/// epoch it answered from and (raw ps, pg).
+async fn mon_osd_map(client: &Client, pool: &str, object: &str, nspace: &str) -> (u32, (u32, u32)) {
     let mut cmd = serde_json::json!({
         "prefix": "osd map",
         "pool": pool,
@@ -99,17 +100,56 @@ async fn mon_osd_map(client: &Client, pool: &str, object: &str, nspace: &str) ->
         .expect("osd map");
     assert_eq!(result.retval, 0, "osd map: {}", result.outs);
     let reply: serde_json::Value = serde_json::from_slice(&result.outbl).expect("osd map json");
+    let epoch = reply["epoch"].as_u64().expect("epoch");
     (
-        parse_pgid(reply["raw_pgid"].as_str().expect("raw_pgid")),
-        parse_pgid(reply["pgid"].as_str().expect("pgid")),
+        u32::try_from(epoch).expect("epoch fits u32"),
+        (
+            parse_pgid(reply["raw_pgid"].as_str().expect("raw_pgid")),
+            parse_pgid(reply["pgid"].as_str().expect("pgid")),
+        ),
     )
 }
 
-/// The client's placement for `name` under `loc`: (raw ps, pg).
-async fn client_map(client: &Client, name: &str, loc: &ObjectLocator) -> (u32, u32) {
+/// The client's placement for `name` under `loc`: the epoch of the map
+/// it placed it in and (raw ps, pg).
+async fn client_map(client: &Client, name: &str, loc: &ObjectLocator) -> (u32, (u32, u32)) {
     let osdmap = client.osd_client().get_osdmap().await.expect("osdmap");
     let raw = osdmap.object_locator_to_pg(name, loc).expect("raw pg");
-    (raw.seed, osdmap.raw_pg_to_pg(raw).expect("pg").seed)
+    (
+        osdmap.epoch.as_u32(),
+        (raw.seed, osdmap.raw_pg_to_pg(raw).expect("pg").seed),
+    )
+}
+
+/// The monitor's placement of `mon_object` in `nspace` and the client's
+/// of `name` under `loc`, as (want, got), both taken from one OSDMap
+/// epoch: the client waits for the monitor's epoch, and the monitor is
+/// asked again when the client's map has moved past its answer.
+async fn placements(
+    client: &Client,
+    pool: &str,
+    mon_object: &str,
+    nspace: &str,
+    name: &str,
+    loc: &ObjectLocator,
+) -> ((u32, u32), (u32, u32)) {
+    let deadline = Instant::now() + OP_BOUND;
+    loop {
+        let (mon_epoch, want) = mon_osd_map(client, pool, mon_object, nspace).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = client
+            .osd_client()
+            .wait_for_epoch(mon_epoch, remaining)
+            .await;
+        let (epoch, got) = client_map(client, name, loc).await;
+        if epoch == mon_epoch {
+            return (want, got);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{nspace:?}/{mon_object}: client epoch {epoch} never met the monitor's {mon_epoch}"
+        );
+    }
 }
 
 fn locator(pool: u64, key: &str, ns: &str) -> ObjectLocator {
@@ -211,15 +251,29 @@ async fn placement_matches_the_monitor() {
     let own_ns = unique("olr-ns");
     for ns in ["", "ns1", own_ns.as_str()] {
         for name in names(64) {
-            let want = mon_osd_map(&client, &pool_name, &name, ns).await;
-            let got = client_map(&client, &name, &locator(pool, "", ns)).await;
+            let (want, got) = placements(
+                &client,
+                &pool_name,
+                &name,
+                ns,
+                &name,
+                &locator(pool, "", ns),
+            )
+            .await;
             assert_eq!(got, want, "{ns:?}/{name}");
         }
     }
     for ns in ["", "ns1"] {
         for key in ["obj", "key-a", "key-b", "_shadow_obj.1", "e"] {
-            let want = mon_osd_map(&client, &pool_name, key, ns).await;
-            let got = client_map(&client, "_multipart_x.1", &locator(pool, key, ns)).await;
+            let (want, got) = placements(
+                &client,
+                &pool_name,
+                key,
+                ns,
+                "_multipart_x.1",
+                &locator(pool, key, ns),
+            )
+            .await;
             assert_eq!(got, want, "{ns:?} key {key}");
         }
     }
@@ -304,9 +358,16 @@ async fn keyed_objects_round_trip() {
         let created: Vec<(IoCtx, String)> =
             names.iter().map(|n| (ioctx.clone(), n.clone())).collect();
         guarded(&created, async {
-            let want = mon_osd_map(&client, &pool_name, &key, ns).await;
             for name in &names {
-                let got = client_map(&client, name, &locator(pool, &key, ns)).await;
+                let (want, got) = placements(
+                    &client,
+                    &pool_name,
+                    &key,
+                    ns,
+                    name,
+                    &locator(pool, &key, ns),
+                )
+                .await;
                 assert_eq!(got, want, "{ns:?} key {key} name {name}");
                 within(
                     ns,
@@ -598,12 +659,15 @@ async fn stable_mod_matches_the_cpp_client() {
         all.extend(names(64));
 
         for name in &all {
-            let want = mon_osd_map(&client, &pool, name, "").await;
-            let got = client_map(&client, name, &locator(pool_id, "", "")).await;
+            let (want, got) =
+                placements(&client, &pool, name, "", name, &locator(pool_id, "", "")).await;
             assert_eq!(got, want, "{name}");
         }
         assert_eq!(
-            client_map(&client, "e", &locator(pool_id, "", "")).await.1,
+            client_map(&client, "e", &locator(pool_id, "", ""))
+                .await
+                .1
+                .1,
             6
         );
 
