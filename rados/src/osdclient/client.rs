@@ -2456,16 +2456,30 @@ impl OSDClient {
         }
     }
 
-    /// Compute the end-of-PG hobject handle for a given PG, matching `pg_t::get_hobj_end`.
+    /// How many low hash bits PG `pg_seed` of a pool with `pg_num` PGs
+    /// owns, as `pg_t::get_split_bits` (`src/osd/osd_types.cc:830-843`):
+    /// with `pg_num` in `[2^(p-1), 2^p)`, a PG that has split owns `p`
+    /// bits and one that has not owns `p - 1`.
+    fn pg_split_bits(pg_seed: u32, pg_num: u32) -> u32 {
+        if pg_num <= 1 {
+            return 0;
+        }
+        let p = 32 - pg_num.leading_zeros();
+        let half = 1u32 << (p - 1);
+        if pg_seed % half < pg_num % half {
+            p
+        } else {
+            p - 1
+        }
+    }
+
+    /// Compute the end-of-PG hobject handle for a given PG, matching
+    /// `pg_t::get_hobj_end` (`src/osd/osd_types.cc:879-894`).
     ///
     /// This is used to skip over a PG that has no OSDs so we can advance to the
     /// next PG in bitwise-sorted order without issuing an OSD request.
     fn pg_hobj_end(pool: u64, pg_seed: u32, pg_num: u32) -> crate::HObject {
-        let bits = if pg_num <= 1 {
-            0u32
-        } else {
-            32 - (pg_num - 1).leading_zeros()
-        };
+        let bits = Self::pg_split_bits(pg_seed, pg_num);
         let rev_start = pg_seed.reverse_bits();
         let rev_end: u64 = (rev_start as u64) | (0xffff_ffffu64 >> bits);
         let rev_end = rev_end + 1;
@@ -3765,6 +3779,80 @@ mod tests {
             OSDClient::placement_key(&keyed(2, "a", "obj", "ns1")),
             OSDClient::placement_key(&keyed(2, "b", "obj", "ns1"))
         );
+    }
+
+    /// The end hash of every PG of a `pg_num`-PG pool, or `None` for
+    /// the pool's end.
+    fn pg_end_hashes(pg_num: u32) -> Vec<Option<u32>> {
+        (0..pg_num)
+            .map(|seed| {
+                let end = OSDClient::pg_hobj_end(2, seed, pg_num);
+                (!end.max).then_some(end.hash)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pg_split_bits_for_twelve_pgs() {
+        let bits: Vec<u32> = (0..12).map(|s| OSDClient::pg_split_bits(s, 12)).collect();
+        assert_eq!(bits, [4, 4, 4, 4, 3, 3, 3, 3, 4, 4, 4, 4]);
+        assert_eq!(OSDClient::pg_split_bits(0, 1), 0);
+        assert!((0..8).all(|s| OSDClient::pg_split_bits(s, 8) == 3));
+    }
+
+    #[test]
+    fn pg_hobj_end_twelve_pgs() {
+        // PGs 4-7 have not split, so each ends where its 3-bit range does;
+        // PG 7's range runs to the end of the hash space.
+        assert_eq!(
+            pg_end_hashes(12),
+            [
+                Some(0x8),
+                Some(0x9),
+                Some(0xa),
+                Some(0xb),
+                Some(0x2),
+                Some(0x3),
+                Some(0x1),
+                None,
+                Some(0x4),
+                Some(0x5),
+                Some(0x6),
+                Some(0x7),
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_hobj_end_eight_pgs() {
+        assert_eq!(
+            pg_end_hashes(8),
+            [
+                Some(0x4),
+                Some(0x5),
+                Some(0x6),
+                Some(0x7),
+                Some(0x2),
+                Some(0x3),
+                Some(0x1),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_hobj_end_walks_every_pg_once() {
+        let map = map_with_pool(2, 12);
+        let pool = &map.pools[&2];
+        let mut cursor = crate::HObject::new(2, String::new(), 0);
+        let mut visited = Vec::new();
+        while !cursor.max {
+            let pg = OSDClient::cursor_pg(pool, 2, cursor.hash).seed;
+            assert!(visited.len() < 12, "revisited PGs: {visited:?} then {pg}");
+            visited.push(pg);
+            cursor = OSDClient::pg_hobj_end(2, pg, 12);
+        }
+        assert_eq!(visited, [0, 8, 4, 2, 10, 6, 1, 9, 5, 3, 11, 7]);
     }
 
     #[test]
