@@ -15,8 +15,9 @@
 //! `bucket` is set, and merges every hour of a (user, bucket) pair into
 //! one value. [`trim`] scans a range a thousand omap keys per call and
 //! removes both keys of each entry found; it derives those keys from the
-//! owner, so an entry stored under a payer is found but never removed,
-//! and a trim over it never reaches `ENODATA` (see [`trim`]).
+//! owner (before Umbrella v21), so an entry stored under a payer is found
+//! but never removed, and a trim over it never reaches `ENODATA` (see
+//! [`trim`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -580,11 +581,13 @@ pub async fn read(
 
 /// `cls_rgw_usage_log_trim`: send [`trim_op`] until the class answers
 /// `ENODATA`, at most [`MAX_TRIM_ROUNDS`] times. `cls_rgw_client.cc` loops
-/// without a bound, but on v19 two states make the class answer 0 forever
-/// without progress: an entry stored under a payer (the class derives the keys
-/// to remove from the owner, so the payer's keys stay) and a `bucket` filter
-/// that skips the first thousand keys of the range (the request carries no
-/// iter, so every round rescans them, whatever follows). Those end here as
+/// without a bound, but two states make the class answer 0 forever without
+/// progress. One is an entry stored under a payer: the class derives the keys
+/// to remove from the owner, so the payer's keys stay (every Squid and Tentacle
+/// release; Umbrella v21 derives them from the payer, 674d42d9023). The other
+/// is a `bucket` filter that skips the first thousand keys of the range: the
+/// request carries no iter, so every round rescans them, whatever follows
+/// (every release through Ceph `main`). Those end here as
 /// [`OSDClientError::Other`] once the rounds are spent. A trim with no `bucket`
 /// needs one round per thousand entries; with one, every round also rescans the
 /// skipped keys ahead of the first match. `ENOENT` when the shard does not
