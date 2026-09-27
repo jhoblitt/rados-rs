@@ -89,6 +89,16 @@ maintain a list of its own.
   the map's release; keying on the map is stricter and never sends an
   OSD a shape it might not accept, which is the trade the rule makes. The driver-level types the gateway
   writes itself are rgw-rs's, and there the rule applies in full.
+  Under Rook the rule meets stored bytes from a newer release than the
+  cluster's. The operator writes the realm, zonegroup, zone and periods
+  in `.rgw.root` with its own radosgw-admin, and Rook v1.20.7's operator
+  image carries Ceph 20.2.4. So on a Squid v19.2.6 cluster `zone_info.*`
+  is stored at struct version 18, Tentacle's (v20.2.4
+  `src/rgw/driver/rados/rgw_zone.h:160`), where Squid's radosgw writes 15
+  (v19.2.6 `:156`). This was verified on a rooket cluster on 2026-09-27
+  after rgw-go reported it. The decode rule already covers these bytes,
+  and a gateway that rewrites them writes the Squid encoding, as the
+  cluster's own radosgw would.
 - The RGW driver itself. This fork carries protocol and transport only;
   nothing here knows RGW's pool layout or object naming.
 
