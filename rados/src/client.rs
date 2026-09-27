@@ -161,8 +161,8 @@ impl Client {
 ///
 /// All fields are optional. `config_file` is the most common entry point and
 /// will populate `mon_addrs`, the keyring path, and the DNS SRV name from
-/// ceph.conf. Explicit setters override values from the file when both are
-/// provided.
+/// ceph.conf, as the builder's [`entity_name`](Self::entity_name()) reads them.
+/// Explicit setters override values from the file when both are provided.
 #[derive(Debug, Clone)]
 #[must_use = "ClientBuilder does nothing until build() is awaited"]
 pub struct ClientBuilder {
@@ -183,7 +183,7 @@ impl Default for ClientBuilder {
     fn default() -> Self {
         use crate::osdclient::throttle::{DEFAULT_MAX_BYTES, DEFAULT_MAX_OPS};
         Self {
-            entity_name: "client.admin".to_owned(),
+            entity_name: CephConfig::DEFAULT_ENTITY_NAME.to_owned(),
             config_file: None,
             mon_addrs: Vec::new(),
             keyring_path: None,
@@ -199,7 +199,8 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
-    /// Ceph entity name (defaults to `"client.admin"`).
+    /// Ceph entity name (defaults to `"client.admin"`). ceph.conf options
+    /// are read from its own section, then its type's, then `[global]`.
     pub fn entity_name(mut self, name: impl Into<String>) -> Self {
         self.entity_name = name.into();
         self
@@ -302,11 +303,13 @@ impl ClientBuilder {
             .transpose()?;
 
         // Step 2: resolve mon addrs, keyring, dns SRV name with explicit
-        // setters winning over ceph.conf values.
+        // setters winning over ceph.conf values, which are read as the
+        // entity this client runs as.
+        let entity = self.entity_name.as_str();
         let mon_addrs = if self.mon_addrs.is_empty() {
             ceph_config
                 .as_ref()
-                .and_then(|c| c.mon_addrs().ok())
+                .and_then(|c| c.mon_addrs_for(entity).ok())
                 .unwrap_or_default()
         } else {
             self.mon_addrs
@@ -314,7 +317,7 @@ impl ClientBuilder {
 
         let dns_srv_name = self
             .dns_srv_name
-            .or_else(|| ceph_config.as_ref().map(|c| c.mon_dns_srv_name()))
+            .or_else(|| ceph_config.as_ref().map(|c| c.mon_dns_srv_name_for(entity)))
             .unwrap_or_default();
 
         // Step 3: decide auth method. Clusters with `auth_client_required = none`
@@ -322,20 +325,13 @@ impl ClientBuilder {
         // When `ceph.conf` is available, honour its `auth_client_required` /
         // `auth_supported` setting; otherwise fall back to CephX (the common case).
         let cephx_required = ceph_config.as_ref().is_none_or(|c| {
-            c.get_auth_client_required()
+            c.get_auth_client_required_for(entity)
                 .contains(&crate::auth::protocol::CEPH_AUTH_CEPHX)
         });
 
         let auth = if cephx_required {
-            let keyring_path: PathBuf = self
-                .keyring_path
-                .or_else(|| {
-                    ceph_config
-                        .as_ref()
-                        .and_then(|c| c.keyring().ok())
-                        .map(PathBuf::from)
-                })
-                .unwrap_or_else(|| PathBuf::from("/etc/ceph/keyring"));
+            let keyring_path =
+                resolve_keyring_path(self.keyring_path, ceph_config.as_ref(), entity);
 
             // Validate UTF-8 up front so the spawn_blocking closure can be
             // infallible about the path.
@@ -433,6 +429,22 @@ impl ClientBuilder {
     }
 }
 
+/// The keyring path for `entity`: the explicit setter, then `keyring` from
+/// ceph.conf as `entity` reads it, then `/etc/ceph/keyring`.
+fn resolve_keyring_path(
+    explicit: Option<PathBuf>,
+    ceph_config: Option<&CephConfig>,
+    entity: &str,
+) -> PathBuf {
+    explicit
+        .or_else(|| {
+            ceph_config
+                .and_then(|c| c.keyring_for(entity).ok())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/etc/ceph/keyring"))
+}
+
 /// Errors returned by [`ClientBuilder::build`] and related high-level
 /// operations.
 ///
@@ -527,6 +539,36 @@ mod tests {
         assert_eq!(b.osdmap_wait_timeout, Duration::from_secs(3));
         assert_eq!(b.max_inflight_ops, 256);
         assert_eq!(b.max_inflight_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn keyring_path_follows_the_entity_in_use() {
+        let conf = CephConfig::parse(
+            r#"
+[client.admin]
+keyring = /etc/ceph/ceph.client.admin.keyring
+[client.rgw.x]
+keyring = /etc/ceph/ceph.client.rgw.x.keyring
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_keyring_path(None, Some(&conf), "client.admin"),
+            PathBuf::from("/etc/ceph/ceph.client.admin.keyring")
+        );
+        assert_eq!(
+            resolve_keyring_path(None, Some(&conf), "client.rgw.x"),
+            PathBuf::from("/etc/ceph/ceph.client.rgw.x.keyring")
+        );
+        assert_eq!(
+            resolve_keyring_path(None, Some(&conf), "client.other"),
+            PathBuf::from("/etc/ceph/keyring")
+        );
+        assert_eq!(
+            resolve_keyring_path(Some("/k".into()), Some(&conf), "client.rgw.x"),
+            PathBuf::from("/k")
+        );
     }
 
     #[test]
