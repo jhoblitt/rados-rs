@@ -490,10 +490,23 @@ impl CephXAuthorizeB {
 ///
 /// Sent by the service back to the client after validating the authorizer.
 /// struct_v >= 2 includes connection_secret for SECURE mode.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CephXAuthorizeReply {
     pub nonce_plus_one: u64,
     pub connection_secret: Option<Bytes>,
+}
+
+impl std::fmt::Debug for CephXAuthorizeReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::auth::types::Redacted;
+        f.debug_struct("CephXAuthorizeReply")
+            .field("nonce_plus_one", &self.nonce_plus_one)
+            .field(
+                "connection_secret",
+                &self.connection_secret.as_deref().map(Redacted),
+            )
+            .finish()
+    }
 }
 
 impl CephXAuthorizeReply {
@@ -581,6 +594,16 @@ mod tests {
         let decoded = CephXServiceTicketRequest::decode(&mut read_buf, 0).unwrap();
         assert_eq!(decoded.keys, 0x12345678);
         assert_eq!(read_buf.remaining(), 0);
+    }
+
+    #[test]
+    fn authorize_reply_debug_redacts_the_connection_secret() {
+        let reply = CephXAuthorizeReply::with_connection_secret(7, Bytes::from_static(&[0xab; 64]));
+        let out = format!("{reply:?}");
+        assert!(out.contains("nonce_plus_one: 7"), "{out}");
+        assert!(out.contains("<64 bytes redacted>"), "{out}");
+        assert!(!out.to_lowercase().contains("xab"), "{out}");
+        assert!(!out.contains("171"), "{out}");
     }
 
     #[test]

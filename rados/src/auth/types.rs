@@ -23,11 +23,31 @@ pub use crate::EntityType;
 /// - `buffer::ptr secret` - The actual secret key data
 ///
 /// `secret` holds the raw secret, without the encoding header.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CryptoKey {
     pub crypto_type: u16,
     pub created: SystemTime,
     pub secret: Bytes,
+}
+
+impl std::fmt::Debug for CryptoKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoKey")
+            .field("crypto_type", &self.crypto_type)
+            .field("created", &self.created)
+            .field("secret", &Redacted(&self.secret))
+            .finish()
+    }
+}
+
+/// Debug-formats secret bytes as their length only, so a key never reaches
+/// a log.
+pub(crate) struct Redacted<'a>(pub(crate) &'a [u8]);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0.len())
+    }
 }
 
 pub const CEPH_CRYPTO_NONE: u16 = 0x0;
@@ -720,5 +740,25 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn crypto_key_debug_redacts_the_secret() {
+        let secret: Vec<u8> = (0xa0..0xc0).collect();
+        let key = CryptoKey::new(KeyType::Aes256Krb5, Bytes::from(secret.clone())).unwrap();
+        let out = format!("{key:?}");
+        let pretty = format!("{key:#?}");
+        assert!(out.contains("crypto_type: 2"), "{out}");
+        assert!(out.contains("created"), "{out}");
+        assert!(out.contains("<32 bytes redacted>"), "{out}");
+        let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        for text in [&out, &pretty] {
+            let lower = text.to_lowercase();
+            // Hex, `Bytes`' escaped form, the byte list, and base64.
+            assert!(!lower.contains(&hex[..8]), "{text}");
+            assert!(!lower.contains("\\xa0\\xa1"), "{text}");
+            assert!(!text.contains("160, 161"), "{text}");
+            assert!(!text.contains(&STANDARD.encode(&secret)[..8]), "{text}");
+        }
     }
 }

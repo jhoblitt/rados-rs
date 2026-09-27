@@ -33,7 +33,6 @@ fn os_error(result: i32) -> std::io::Error {
 // ── Shared output ─────────────────────────────────────────────────────────────
 
 /// Data produced by a completed auth phase.
-#[derive(Debug)]
 pub struct AuthOutput {
     /// Global ID assigned by the server (or 0 for AUTH_NONE with monitors).
     pub global_id: u64,
@@ -43,6 +42,21 @@ pub struct AuthOutput {
     pub session_key: Option<Bytes>,
     /// Connection secret for SECURE-mode AES-GCM encryption (None for CRC mode).
     pub connection_secret: Option<Bytes>,
+}
+
+impl std::fmt::Debug for AuthOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::auth::types::Redacted;
+        f.debug_struct("AuthOutput")
+            .field("global_id", &self.global_id)
+            .field("connection_mode", &self.connection_mode)
+            .field("session_key", &self.session_key.as_deref().map(Redacted))
+            .field(
+                "connection_secret",
+                &self.connection_secret.as_deref().map(Redacted),
+            )
+            .finish()
+    }
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -477,6 +491,25 @@ mod tests {
     use super::*;
     use crate::msgr2::frames::{FrameFlags, MAX_NUM_SEGMENTS, Preamble, SegmentDescriptor};
     use bytes::BytesMut;
+
+    #[test]
+    fn auth_output_debug_redacts_the_secrets() {
+        let out = format!(
+            "{:?}",
+            AuthOutput {
+                global_id: 9,
+                connection_mode: 2,
+                session_key: Some(Bytes::from_static(&[0xab; 16])),
+                connection_secret: Some(Bytes::from_static(&[0xcd; 64])),
+            }
+        );
+        assert!(out.contains("global_id: 9"), "{out}");
+        assert!(out.contains("<16 bytes redacted>"), "{out}");
+        assert!(out.contains("<64 bytes redacted>"), "{out}");
+        let lower = out.to_lowercase();
+        assert!(!lower.contains("xab") && !lower.contains("xcd"), "{out}");
+        assert!(!out.contains("171") && !out.contains("205"), "{out}");
+    }
 
     /// Build an AUTH_BAD_METHOD frame's first segment from raw field
     /// values. Payload layout matches what `AuthClient::step` decodes:
