@@ -25,6 +25,7 @@
 //! # Ok::<(), crate::auth::CephXError>(())
 //! ```
 
+pub(crate) mod aes256krb5;
 pub mod client;
 pub mod error;
 pub mod keyring;
