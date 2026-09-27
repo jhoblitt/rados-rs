@@ -100,6 +100,88 @@ impl PgId {
     pub fn new(pool: u64, seed: u32) -> Self {
         PgId { pool, seed }
     }
+
+    /// Whether this PG splits when its pool goes from `old_pg_num` to
+    /// `new_pg_num` PGs, adding the PGs it splits into to `children`.
+    /// Ports `pg_t::is_split` (ceph v19.2.2 src/osd/osd_types.cc:786-828).
+    pub(crate) fn is_split(
+        &self,
+        old_pg_num: u32,
+        new_pg_num: u32,
+        mut children: Option<&mut std::collections::BTreeSet<PgId>>,
+    ) -> bool {
+        if self.seed >= old_pg_num {
+            // degenerate case
+            return false;
+        }
+        if new_pg_num <= old_pg_num {
+            return false;
+        }
+        let old_bits = cbits(old_pg_num);
+        let old_mask = ((1u64 << old_bits) - 1) as u32;
+        let mut split = false;
+        for n in 1u32.. {
+            let next_bit = n << (old_bits - 1);
+            let s = next_bit | self.seed;
+            if s < old_pg_num || s == self.seed {
+                continue;
+            }
+            if s >= new_pg_num {
+                break;
+            }
+            if ceph_stable_mod(s, old_pg_num, old_mask) == self.seed {
+                split = true;
+                if let Some(children) = children.as_deref_mut() {
+                    children.insert(PgId::new(self.pool, s));
+                }
+            }
+        }
+        split
+    }
+
+    /// Whether this PG merges into another when its pool goes from
+    /// `old_pg_num` to `new_pg_num` PGs, setting `parent` to the PG it
+    /// merges into. Ports `pg_t::is_merge_source` (ceph v19.2.2
+    /// src/osd/osd_types.cc:845-862).
+    pub(crate) fn is_merge_source(
+        &self,
+        old_pg_num: u32,
+        new_pg_num: u32,
+        parent: Option<&mut PgId>,
+    ) -> bool {
+        if self.seed < old_pg_num && self.seed >= new_pg_num {
+            if let Some(parent) = parent {
+                let mut t = *self;
+                while t.seed >= new_pg_num {
+                    t = t.parent();
+                }
+                *parent = t;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Whether other PGs merge into this one when its pool goes from
+    /// `old_pg_num` to `new_pg_num` PGs. Ports `pg_t::is_merge_target`
+    /// (ceph v19.2.2 src/osd/osd_types.h:452-454).
+    pub(crate) fn is_merge_target(&self, old_pg_num: u32, new_pg_num: u32) -> bool {
+        self.seed < new_pg_num && self.is_split(new_pg_num, old_pg_num, None)
+    }
+
+    /// The PG this one split from: its seed less its top bit. Ports
+    /// `pg_t::get_parent` (ceph v19.2.2 src/osd/osd_types.cc:864-871),
+    /// which asserts a non-zero seed.
+    fn parent(&self) -> PgId {
+        let bits = cbits(self.seed);
+        assert!(bits > 0, "PG {self} has no parent");
+        PgId::new(self.pool, self.seed & !(u32::MAX << (bits - 1)))
+    }
+}
+
+/// The number of bits needed to hold `v`: Ceph's `cbits`.
+fn cbits(v: u32) -> u32 {
+    u32::BITS - v.leading_zeros()
 }
 
 impl std::fmt::Display for PgId {
@@ -410,6 +492,117 @@ mod tests {
         let loc3 = ObjectLocator::with_key(3, "key1".to_string());
         assert_eq!(loc3.pool_id, 3);
         assert_eq!(loc3.key, "key1");
+    }
+
+    /// Every PG of pool 1 below `max(old, new)` that splits, with its
+    /// children, that is a merge source, with its parent, and that is a
+    /// merge target, going from `old` to `new` PGs.
+    #[allow(clippy::type_complexity)]
+    fn split_merge_table(old: u32, new: u32) -> (Vec<(u32, Vec<u32>)>, Vec<(u32, u32)>, Vec<u32>) {
+        let mut splits = Vec::new();
+        let mut sources = Vec::new();
+        let mut targets = Vec::new();
+        for seed in 0..old.max(new) {
+            let pg = PgId::new(1, seed);
+            let mut children = std::collections::BTreeSet::new();
+            if pg.is_split(old, new, Some(&mut children)) {
+                assert!(children.iter().all(|c| c.pool == 1));
+                splits.push((seed, children.iter().map(|c| c.seed).collect()));
+            } else {
+                assert!(children.is_empty());
+            }
+            let mut parent = PgId::default();
+            if pg.is_merge_source(old, new, Some(&mut parent)) {
+                assert_eq!(parent.pool, 1);
+                sources.push((seed, parent.seed));
+            }
+            if pg.is_merge_target(old, new) {
+                targets.push(seed);
+            }
+        }
+        (splits, sources, targets)
+    }
+
+    // The expected tables below come from an independent Python
+    // transcription of the C++ `pg_t::is_split`, `is_merge_source`,
+    // `is_merge_target` and `get_parent` (ceph v19.2.2
+    // src/osd/osd_types.cc:786-871, osd_types.h:452-454), run for each
+    // pg_num pair; they pin the C++ results, not this port's.
+
+    #[test]
+    fn pg_split_6_to_64() {
+        let (splits, sources, targets) = split_merge_table(6, 64);
+        assert_eq!(
+            splits,
+            vec![
+                (0, vec![8, 16, 24, 32, 40, 48, 56]),
+                (1, vec![9, 17, 25, 33, 41, 49, 57]),
+                (
+                    2,
+                    vec![6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62]
+                ),
+                (
+                    3,
+                    vec![7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63]
+                ),
+                (4, vec![12, 20, 28, 36, 44, 52, 60]),
+                (5, vec![13, 21, 29, 37, 45, 53, 61]),
+            ]
+        );
+        assert!(sources.is_empty() && targets.is_empty());
+    }
+
+    #[test]
+    fn pg_merge_8_to_6() {
+        let (splits, sources, targets) = split_merge_table(8, 6);
+        assert!(splits.is_empty());
+        assert_eq!(sources, vec![(6, 2), (7, 3)]);
+        assert_eq!(targets, vec![2, 3]);
+    }
+
+    #[test]
+    fn pg_merge_32_to_16() {
+        let (splits, sources, targets) = split_merge_table(32, 16);
+        assert!(splits.is_empty());
+        assert_eq!(sources, (16..32).map(|s| (s, s - 16)).collect::<Vec<_>>());
+        assert_eq!(targets, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pg_split_1_to_32() {
+        let (splits, sources, targets) = split_merge_table(1, 32);
+        assert_eq!(splits, vec![(0, (1..32).collect())]);
+        assert!(sources.is_empty() && targets.is_empty());
+    }
+
+    #[test]
+    fn pg_unchanged_12_to_12() {
+        let (splits, sources, targets) = split_merge_table(12, 12);
+        assert!(splits.is_empty() && sources.is_empty() && targets.is_empty());
+    }
+
+    #[test]
+    fn pg_split_12_to_24() {
+        let (splits, sources, targets) = split_merge_table(12, 24);
+        assert_eq!(
+            splits,
+            vec![
+                (0, vec![16]),
+                (1, vec![17]),
+                (2, vec![18]),
+                (3, vec![19]),
+                (4, vec![12, 20]),
+                (5, vec![13, 21]),
+                (6, vec![14, 22]),
+                (7, vec![15, 23]),
+            ]
+        );
+        assert!(sources.is_empty() && targets.is_empty());
+    }
+
+    #[test]
+    fn a_seed_past_the_old_pg_num_never_splits() {
+        assert!(!PgId::new(1, 7).is_split(6, 64, None));
     }
 
     #[test]

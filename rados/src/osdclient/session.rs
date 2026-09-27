@@ -232,6 +232,12 @@ pub(crate) struct PendingOp {
     /// Used to detect and prevent infinite redirect loops.
     /// Reference: Ceph has FIXME comment but no implementation (Objecter.cc:3741)
     pub redirect_count: u32,
+    /// Whether a map change or a session reset re-sends the op. A linger
+    /// send (registration, reconnect, notify) and a watch ping are not
+    /// re-sent: the linger layer sends a fresh op for them, so the old one
+    /// is cancelled instead, as Objecter clears `Op::should_resend` for
+    /// them (v19.2.2:src/osdc/Objecter.cc:583, 715).
+    pub should_resend: bool,
 }
 
 impl OSDSession {
@@ -718,14 +724,76 @@ impl OSDSession {
         Ok(msg)
     }
 
+    /// Track `op` as pending on this session, placed in a map whose pool
+    /// had `pg_num` PGs, and return its reply channel.
+    fn insert_pending(
+        &self,
+        op: Arc<MOSDOp>,
+        priority: i32,
+        pg_num: u32,
+        should_resend: bool,
+    ) -> oneshot::Receiver<Result<OpResult>> {
+        let tid = op.reqid.tid;
+        let (tx, rx) = oneshot::channel();
+        let target = crate::osdclient::types::OpTarget {
+            pg_num,
+            ..crate::osdclient::types::OpTarget::new(
+                op.osdmap_epoch,
+                op.pgid,
+                self.osd_id,
+                vec![self.osd_id],
+            )
+        };
+        self.pending_ops.insert(
+            tid,
+            PendingOp {
+                tid,
+                result_tx: tx,
+                attempts: 1, // First attempt (matches Linux kernel: r_attempts starts at 1)
+                osdmap_epoch: op.osdmap_epoch,
+                op,
+                state: crate::osdclient::types::OpState::Queued,
+                target,
+                priority,
+                // Capture current session incarnation
+                // Following Ceph pattern: operation stores incarnation when sent
+                sent_incarnation: self.incarnation.load(Ordering::Acquire),
+                redirect_count: 0,
+                should_resend,
+            },
+        );
+        rx
+    }
+
+    /// [`Self::insert_pending`] for tests, which have no connection to
+    /// send on.
+    #[cfg(test)]
+    pub(crate) fn insert_pending_for_test(
+        &self,
+        op: Arc<MOSDOp>,
+        pg_num: u32,
+        should_resend: bool,
+    ) -> oneshot::Receiver<Result<OpResult>> {
+        self.insert_pending(
+            op,
+            crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+            pg_num,
+            should_resend,
+        )
+    }
+
     /// Submit an operation to the OSD
     ///
     /// This queues the message for sending (non-blocking, like ceph_con_send)
-    /// Priority is set in the message header (not the MOSDOp payload)
+    /// Priority is set in the message header (not the MOSDOp payload).
+    /// `pg_num` is the op's pool's pg_num in the map it was placed in;
+    /// `should_resend` is [`PendingOp::should_resend`].
     pub async fn submit_op(
         &self,
         op: Arc<MOSDOp>,
         priority: i32,
+        pg_num: u32,
+        should_resend: bool,
     ) -> Result<oneshot::Receiver<Result<OpResult>>> {
         let tid = op.reqid.tid;
 
@@ -737,31 +805,7 @@ impl OSDSession {
             )));
         }
 
-        // Create channel for result
-        let (tx, rx) = oneshot::channel();
-
-        self.pending_ops.insert(
-            tid,
-            PendingOp {
-                tid,
-                result_tx: tx,
-                attempts: 1, // First attempt (matches Linux kernel: r_attempts starts at 1)
-                osdmap_epoch: op.osdmap_epoch,
-                op: op.clone(),
-                state: crate::osdclient::types::OpState::Queued,
-                target: crate::osdclient::types::OpTarget::new(
-                    op.osdmap_epoch,
-                    op.pgid,
-                    self.osd_id,
-                    vec![self.osd_id],
-                ),
-                priority,
-                // Capture current session incarnation
-                // Following Ceph pattern: operation stores incarnation when sent
-                sent_incarnation: self.incarnation.load(Ordering::Acquire),
-                redirect_count: 0,
-            },
-        );
+        let rx = self.insert_pending(Arc::clone(&op), priority, pg_num, should_resend);
 
         // Track operation timeout
         if let Some(tracker) = &self.tracker {
@@ -1057,14 +1101,15 @@ impl OSDSession {
 
     /// Get metadata for all pending operations
     ///
-    /// Returns (tid, op, osdmap_epoch) for each pending operation. Used by
-    /// OSDClient to determine which operations need rescanning.
-    pub fn get_pending_ops_metadata(&self) -> Vec<(u64, Arc<MOSDOp>, u32)> {
+    /// Returns (tid, op, osdmap_epoch, target pg_num) for each pending
+    /// operation. Used by OSDClient to determine which operations need
+    /// rescanning.
+    pub fn get_pending_ops_metadata(&self) -> Vec<(u64, Arc<MOSDOp>, u32, u32)> {
         self.pending_ops
             .iter()
             .map(|entry| {
                 let (tid, op) = entry.pair();
-                (*tid, Arc::clone(&op.op), op.osdmap_epoch)
+                (*tid, Arc::clone(&op.op), op.osdmap_epoch, op.target.pg_num)
             })
             .collect()
     }

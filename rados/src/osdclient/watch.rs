@@ -83,6 +83,10 @@ pub(crate) struct LingerState {
     pub(crate) send_seq: u64,
     /// A send is out and unanswered; no other send or ping follows it.
     pub(crate) sending: bool,
+    /// The OSD and tid of the current send once a session took it, until
+    /// it ends; the next send cancels it if it is still pending, as
+    /// Objecter's `register_tid`.
+    pub(crate) in_flight: Option<(i32, u64)>,
     /// The last send got no answer (a lost session, no reachable OSD);
     /// the next linger tick re-sends it, as Objecter re-sends a linger
     /// op when its session reconnects.
