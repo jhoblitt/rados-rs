@@ -3334,13 +3334,10 @@ impl OSDClient {
         msg: &crate::msgr2::message::Message,
     ) -> Result<(crate::monclient::messages::MOSDMap, crate::Epoch)> {
         use crate::monclient::messages::MOSDMap;
-        use crate::msgr2::ceph_message::{CephMessagePayload, CephMsgHeader};
 
         info!("Handling OSDMap message ({} bytes)", msg.front.len());
 
-        // Decode MOSDMap
-        let header = CephMsgHeader::new(MOSDMap::msg_type(), MOSDMap::msg_version(0));
-        let mosdmap = MOSDMap::decode_payload(&header, &msg.front, &[], &[])?;
+        let mosdmap = MOSDMap::from_message(msg)?;
         info!(
             "Received MOSDMap: epochs [{}..{}], {} full maps, {} incremental maps",
             mosdmap.get_first(),

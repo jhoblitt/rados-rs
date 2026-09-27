@@ -1338,7 +1338,7 @@ impl MonClient {
 
     /// Handle OSDMap message
     async fn handle_osdmap(&self, msg: crate::msgr2::message::Message) -> Result<()> {
-        let osdmap: MOSDMap = decode_message(&msg)?;
+        let osdmap = MOSDMap::from_message(&msg)?;
         let epoch = osdmap.get_last();
         debug!("Received OSDMap: epoch={}", epoch);
 
