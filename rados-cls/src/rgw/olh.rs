@@ -20,15 +20,24 @@
 //! [`trim_olh_log`], [`clear_olh`]) take no resharding guard of their
 //! own: as for the index writes, RGW puts
 //! [`super::index::guard_op`] in front of them in one compound
-//! operation. [`read_olh_log`], [`trim_olh_log`] and [`clear_olh`]
-//! compare `olh_tag` with the OLH's, and a missing OLH's tag is empty.
+//! operation, and from Tentacle v20.2.0 the class guards them itself as
+//! well (see [`super::index`]). [`read_olh_log`], [`trim_olh_log`] and
+//! [`clear_olh`] compare `olh_tag` with the OLH's, and a missing OLH's
+//! tag is empty.
+//!
+//! Umbrella v21.1.0 differs from those v19 rules. An `olh_epoch` of 0
+//! makes the class use the current time in nanoseconds since 1970 rather
+//! than the OLH's epoch plus one (`cls_rgw.cc:1865,1927,2102-2103@v21.1.0`,
+//! 75c7b8ece79). Link and unlink log `STALE` (4) entries
+//! (`cls_rgw.cc:1875,2009,2176,2198@v21.1.0`), which [`read_olh_log`]
+//! returns only with `get_stales` (`cls_rgw.cc:2289-2292@v21.1.0`).
 
 use std::collections::BTreeMap;
 
 use bytes::{Buf, BufMut};
 use rados::osdclient::error::Result;
 use rados::osdclient::{IoCtx, OSDOp, OpReply};
-use rados::{Denc, RadosError, UTime, VersionedDenc, VersionedEncode};
+use rados::{CephRelease, Denc, RadosError, UTime, VersionedDenc, VersionedEncode};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
 
@@ -39,7 +48,8 @@ use crate::call;
 
 byte_enum! {
     /// `OLHLogOp`: what one OLH log entry records. Ceph decodes any byte and
-    /// `CLS_RGW_OLH_OP_STALE` (4) is not modelled; the newtype keeps the byte.
+    /// `CLS_RGW_OLH_OP_STALE` (4) is not modelled (Umbrella v21.1.0+; kept
+    /// as the raw byte).
     OlhLogOp { UNKNOWN = 0, LINK_OLH = 1, UNLINK_OLH = 2, REMOVE_INSTANCE = 3 }
 }
 
@@ -302,21 +312,29 @@ impl Serialize for UnlinkInstanceOp {
     }
 }
 
-/// `rgw_cls_read_olh_log_op`: the log entries above `ver_marker`. Sent
-/// as version 1, all v19 knows; `main`'s version 2 appends
-/// `get_stales`, which decoding skips.
+/// `rgw_cls_read_olh_log_op`: the log entries above `ver_marker`. Squid
+/// v19 writes version 1; Umbrella v21.1.0 writes version 2, which appends
+/// `get_stales`. The encoded version follows `get_stales`: `Some` encodes
+/// version 2, and decoding sets it exactly when the struct is version 2.
+/// An Umbrella+ class returns `CLS_RGW_OLH_OP_STALE` (4) entries only
+/// when `get_stales` is true and otherwise filters them "for backward
+/// compatibility" (`cls_rgw.cc:2289-2292@v21.1.0`); Umbrella's radosgw
+/// always sends `true` and handles op 4 when replaying. A Squid class
+/// ignores the field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReadOlhLogOp {
     pub olh: ObjKey,
     pub ver_marker: u64,
     pub olh_tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get_stales: Option<bool>,
 }
 
 impl VersionedEncode for ReadOlhLogOp {
     const MAX_DECODE_VERSION: u8 = 2;
 
     fn encoding_version(&self, _features: u64) -> u8 {
-        1
+        if self.get_stales.is_some() { 2 } else { 1 }
     }
 
     fn compat_version(&self, _features: u64) -> u8 {
@@ -331,7 +349,11 @@ impl VersionedEncode for ReadOlhLogOp {
     ) -> std::result::Result<(), RadosError> {
         self.olh.encode(buf, features)?;
         self.ver_marker.encode(buf, features)?;
-        self.olh_tag.encode(buf, features)
+        self.olh_tag.encode(buf, features)?;
+        if let Some(get_stales) = self.get_stales {
+            get_stales.encode(buf, features)?;
+        }
+        Ok(())
     }
 
     fn decode_content<B: Buf>(
@@ -345,10 +367,16 @@ impl VersionedEncode for ReadOlhLogOp {
         let olh = ObjKey::decode(buf, features)?;
         let ver_marker = u64::decode(buf, features)?;
         let olh_tag = String::decode(buf, features)?;
+        let get_stales = if struct_v >= 2 {
+            Some(bool::decode(buf, features)?)
+        } else {
+            None
+        };
         Ok(Self {
             olh,
             ver_marker,
             olh_tag,
+            get_stales,
         })
     }
 
@@ -390,7 +418,8 @@ pub struct ClearOlhOp {
 /// exist unless `delete_marker` (which creates one). `ECANCELED` when
 /// the OLH exists with another tag and is not pending removal; `ENOENT`
 /// for a new delete marker on an object whose current version already
-/// is one. With `unmod_since` set and an existing instance whose mtime is
+/// is one on v19.2.2 (`cls_rgw.cc:1673-1693@v19.2.2`); v19.2.3 removed the
+/// check and links it. With `unmod_since` set and an existing instance whose mtime is
 /// not older (whole seconds unless `high_precision_time`), nothing is
 /// linked and the call succeeds. A newer epoch, or an equal one on an instance
 /// that does not sort after the current one, makes the instance current and
@@ -405,6 +434,18 @@ pub fn link_olh_op(op: &LinkOlhOp) -> Result<OSDOp> {
 /// becomes current; when it was the last, the OLH logs
 /// `UNLINK_OLH` and is marked pending removal. A plain entry with no OLH
 /// is first converted to a versioned one.
+///
+/// To unlink the null version, send instance `""` with
+/// [`BILOG_NULL_VERSION`] set in `bilog_flags`, never `"null"`: that is
+/// what radosgw sends from v19.2.3, whose class no longer maps `"null"` to `""` in the key it
+/// unlinks, where v19.2.2's does (`cls_rgw.cc:1889-1892@v19.2.2`). Every
+/// Squid class, v19.2.2 included, records `bilog_flags` in the bilog entry
+/// it logs (`cls_rgw.cc:2022,166@v19.2.2`) and treats an instance of `""`
+/// the same way, so this form behaves identically on every Squid point
+/// release, which `require_osd_release` (19 for all of them) cannot tell
+/// apart anyway.
+///
+/// [`BILOG_NULL_VERSION`]: super::index::BILOG_NULL_VERSION
 pub fn unlink_instance_op(op: &UnlinkInstanceOp) -> Result<OSDOp> {
     call::op(CLASS, "bucket_unlink_instance", op)
 }
@@ -413,20 +454,28 @@ pub fn unlink_instance_op(op: &UnlinkInstanceOp) -> Result<OSDOp> {
 /// epochs, with `is_truncated` when more follow. `EINVAL` when `olh` has
 /// an instance, `ECANCELED` when `olh_tag` is not the OLH's. The class
 /// reads past the end of an empty log, so read only a log known to hold
-/// entries. Decode the reply with [`decode_read_olh_log`].
-pub fn read_olh_log_op(olh: &ObjKey, ver_marker: u64, olh_tag: &str) -> Result<OSDOp> {
+/// entries. Decode the reply with [`decode_read_olh_log`]. Sent in the
+/// shape the radosgw of `release` sends: from Umbrella, version 2 with
+/// `get_stales` set.
+pub fn read_olh_log_op(
+    release: CephRelease,
+    olh: &ObjKey,
+    ver_marker: u64,
+    olh_tag: &str,
+) -> Result<OSDOp> {
     call::op(
         CLASS,
         "bucket_read_olh_log",
-        &read_req(olh, ver_marker, olh_tag),
+        &read_req(release, olh, ver_marker, olh_tag),
     )
 }
 
-fn read_req(olh: &ObjKey, ver_marker: u64, olh_tag: &str) -> ReadOlhLogOp {
+fn read_req(release: CephRelease, olh: &ObjKey, ver_marker: u64, olh_tag: &str) -> ReadOlhLogOp {
     ReadOlhLogOp {
         olh: olh.clone(),
         ver_marker,
         olh_tag: olh_tag.to_owned(),
+        get_stales: (release >= CephRelease::UMBRELLA).then_some(true),
     }
 }
 
@@ -481,11 +530,12 @@ pub async fn unlink_instance(ioctx: &IoCtx, oid: &str, op: &UnlinkInstanceOp) ->
 pub async fn read_olh_log(
     ioctx: &IoCtx,
     oid: &str,
+    release: CephRelease,
     olh: &ObjKey,
     ver_marker: u64,
     olh_tag: &str,
 ) -> Result<ReadOlhLogRet> {
-    let req = read_req(olh, ver_marker, olh_tag);
+    let req = read_req(release, olh, ver_marker, olh_tag);
     let out = call::exec(ioctx, oid, CLASS, "bucket_read_olh_log", &req).await?;
     call::decode_bytes(out)
 }
@@ -515,6 +565,7 @@ pub async fn clear_olh(ioctx: &IoCtx, oid: &str, key: &ObjKey, olh_tag: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rgw::index::RestoreInfo;
     use crate::rgw::types::ObjCategory;
     use rados::encode_with_capacity;
 
@@ -659,10 +710,9 @@ mod tests {
             json(&op),
             r#"{"key":{"name":"name","instance":""},"olh_tag":"olh_tag","delete_marker":true,"op_tag":"op_tag","meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false},"olh_epoch":123,"log_op":true,"bilog_flags":0,"unmod_since":"0.000000","high_precision_time":false,"zones_trace":[]}"#
         );
-        assert_eq!(
-            LinkOlhOp::decode(&mut &bytes(&op)[..], 0).expect("decode"),
-            op
-        );
+        let decoded = LinkOlhOp::decode(&mut &bytes(&op)[..], 0).expect("decode");
+        assert_eq!(decoded.meta.restore, None);
+        assert_eq!(decoded, op);
 
         let timed = LinkOlhOp {
             unmod_since: UTime {
@@ -681,6 +731,49 @@ mod tests {
             .expect("seconds precede the real_time");
         assert_eq!(wire.len() - at - tail.len(), 5);
         assert_eq!(LinkOlhOp::decode(&mut &wire[..], 0).expect("decode"), timed);
+    }
+
+    #[test]
+    fn link_olh_op_carries_umbrella_meta() {
+        // v21.1.0/rgw_cls_link_olh_op.1 (176 B)
+        let wire = unhex(
+            "0501aa00000001010c000000040000006e616d6500000000070000006f6c685f74616701060000006f705f74616708035c00000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000002d2029649000000007b00000000000000010000000000000000000000000000000000000000000000",
+        );
+        assert_eq!(wire.len(), 176);
+        let op = LinkOlhOp::decode(&mut &wire[..], 0).expect("decode");
+        let mut want = link_olh_instance();
+        want.meta.restore = Some(RestoreInfo {
+            status: 2,
+            expiry_date: UTime {
+                sec: 1_234_567_890,
+                nsec: 0,
+            },
+        });
+        assert_eq!(op, want);
+        assert_eq!(bytes(&op), wire);
+        assert_eq!(
+            json(&op),
+            r#"{"key":{"name":"name","instance":""},"olh_tag":"olh_tag","delete_marker":true,"op_tag":"op_tag","meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false,"restore_status":2,"restore_expiry_date":"2009-02-13T23:31:30.000000Z"},"olh_epoch":123,"log_op":true,"bilog_flags":0,"unmod_since":"0.000000","high_precision_time":false,"zones_trace":[]}"#
+        );
+
+        // v21.1.0/rgw_cls_link_olh_op.2 (126 B)
+        let wire = unhex(
+            "050178000000010108000000000000000000000000000000000000000008033b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert_eq!(wire.len(), 126);
+        let op = LinkOlhOp::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(
+            op,
+            LinkOlhOp {
+                meta: DirEntryMeta::for_release(CephRelease::UMBRELLA),
+                ..LinkOlhOp::default()
+            }
+        );
+        assert_eq!(bytes(&op), wire);
+        assert_eq!(
+            json(&op),
+            r#"{"key":{"name":"","instance":""},"olh_tag":"","delete_marker":false,"op_tag":"","meta":{"category":0,"size":0,"mtime":"0.000000","etag":"","storage_class":"","owner":"","owner_display_name":"","content_type":"","accounted_size":0,"user_data":"","appendable":false,"restore_status":0,"restore_expiry_date":"0.000000"},"olh_epoch":0,"log_op":false,"bilog_flags":0,"unmod_since":"0.000000","high_precision_time":false,"zones_trace":[]}"#
+        );
     }
 
     #[test]
@@ -722,26 +815,78 @@ mod tests {
         assert!(UnlinkInstanceOp::decode(&mut &v2[..], 0).is_err());
     }
 
+    const READ_OLH_LOG_V1_WIRE: &str =
+        "01012500000001010c000000040000006e616d65000000007b00000000000000070000006f6c685f746167";
+
     #[test]
     fn read_olh_log_op_is_sent_as_version_one() {
-        // Oracle rgw_cls_read_olh_log_op instance 1.
+        // v19.2.2/rgw_cls_read_olh_log_op.1
         let op = ReadOlhLogOp {
             olh: key("name"),
             ver_marker: 123,
             olh_tag: "olh_tag".to_owned(),
+            get_stales: None,
         };
-        let wire = unhex(
-            "01012500000001010c000000040000006e616d65000000007b00000000000000070000006f6c685f746167",
-        );
+        let wire = unhex(READ_OLH_LOG_V1_WIRE);
         assert_eq!(bytes(&op), wire);
         assert_eq!(
             json(&op),
             r#"{"olh":{"name":"name","instance":""},"ver_marker":123,"olh_tag":"olh_tag"}"#
         );
-        assert_eq!(ReadOlhLogOp::decode(&mut &wire[..], 0).expect("decode"), op);
-        // main's version 2 appends get_stales.
+        let decoded = ReadOlhLogOp::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(decoded.get_stales, None);
+        assert_eq!(decoded, op);
         let v2 = reframed(&wire, 2, wire.len() - 6, &[1]);
-        assert_eq!(ReadOlhLogOp::decode(&mut &v2[..], 0).expect("v2"), op);
+        assert_eq!(
+            ReadOlhLogOp::decode(&mut &v2[..], 0).expect("v2"),
+            ReadOlhLogOp {
+                get_stales: Some(true),
+                ..op
+            }
+        );
+
+        // v19.2.2/rgw_cls_read_olh_log_op.2, hex-identical in v20.2.4
+        let wire = unhex("01011a0000000101080000000000000000000000000000000000000000000000");
+        let op = ReadOlhLogOp::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(op, ReadOlhLogOp::default());
+        assert_eq!(bytes(&op), wire);
+        assert_eq!(
+            json(&op),
+            r#"{"olh":{"name":"","instance":""},"ver_marker":0,"olh_tag":""}"#
+        );
+    }
+
+    #[test]
+    fn read_olh_log_op_appends_get_stales_from_umbrella() {
+        // v21.1.0/rgw_cls_read_olh_log_op.1
+        let op = ReadOlhLogOp {
+            olh: key("name"),
+            ver_marker: 123,
+            olh_tag: "olh_tag".to_owned(),
+            get_stales: Some(true),
+        };
+        let wire = unhex(
+            "02012600000001010c000000040000006e616d65000000007b00000000000000070000006f6c685f74616701",
+        );
+        assert_eq!(bytes(&op), wire);
+        assert_eq!(ReadOlhLogOp::decode(&mut &wire[..], 0).expect("decode"), op);
+        assert_eq!(
+            json(&op),
+            r#"{"olh":{"name":"name","instance":""},"ver_marker":123,"olh_tag":"olh_tag","get_stales":true}"#
+        );
+
+        // v21.1.0/rgw_cls_read_olh_log_op.2
+        let op = ReadOlhLogOp {
+            get_stales: Some(false),
+            ..ReadOlhLogOp::default()
+        };
+        let wire = unhex("02011b000000010108000000000000000000000000000000000000000000000000");
+        assert_eq!(bytes(&op), wire);
+        assert_eq!(ReadOlhLogOp::decode(&mut &wire[..], 0).expect("decode"), op);
+        assert_eq!(
+            json(&op),
+            r#"{"olh":{"name":"","instance":""},"ver_marker":0,"olh_tag":"","get_stales":false}"#
+        );
     }
 
     #[test]
@@ -853,10 +998,20 @@ mod tests {
                 ),
             ),
             (
-                read_olh_log_op(&key("name"), 123, "olh_tag"),
+                read_olh_log_op(CephRelease::SQUID, &key("name"), 123, "olh_tag"),
+                "bucket_read_olh_log",
+                unhex(READ_OLH_LOG_V1_WIRE),
+            ),
+            (
+                read_olh_log_op(CephRelease::TENTACLE, &key("name"), 123, "olh_tag"),
+                "bucket_read_olh_log",
+                unhex(READ_OLH_LOG_V1_WIRE),
+            ),
+            (
+                read_olh_log_op(CephRelease::UMBRELLA, &key("name"), 123, "olh_tag"),
                 "bucket_read_olh_log",
                 unhex(
-                    "01012500000001010c000000040000006e616d65000000007b00000000000000070000006f6c685f746167",
+                    "02012600000001010c000000040000006e616d65000000007b00000000000000070000006f6c685f74616701",
                 ),
             ),
             (

@@ -8,7 +8,7 @@ mod common;
 use std::time::UNIX_EPOCH;
 
 use common::create_ioctx;
-use rados::{IoCtx, OSDClientError};
+use rados::{CephRelease, IoCtx, OSDClientError};
 use rados_cls::rgw::index::{self, CompleteOp, DirEntry, DirEntryMeta, ListOp, PrepareOp};
 use rados_cls::rgw::olh::{self, LinkOlhOp, OlhLogOp, ReadOlhLogRet, UnlinkInstanceOp};
 use rados_cls::rgw::types::{EntryVer, FLAG_VER, ModifyOp, ObjCategory, ObjKey};
@@ -178,9 +178,16 @@ fn logged(log: &ReadOlhLogRet, epoch: u64) -> Vec<(OlhLogOp, &str)> {
 }
 
 async fn read_log(ioctx: &IoCtx, oid: &str, name: &str, marker: u64) -> ReadOlhLogRet {
-    olh::read_olh_log(ioctx, oid, &key(name), marker, &olh_tag(name))
-        .await
-        .expect("read_olh_log")
+    olh::read_olh_log(
+        ioctx,
+        oid,
+        CephRelease::SQUID,
+        &key(name),
+        marker,
+        &olh_tag(name),
+    )
+    .await
+    .expect("read_olh_log")
 }
 
 #[tokio::test]
@@ -210,7 +217,7 @@ async fn olh_link_promotes_and_logs() {
     let log = read_log(&ioctx, &oid, "o", 10).await;
     assert_eq!(epochs(&log), [20]);
 
-    let err = olh::read_olh_log(&ioctx, &oid, &key("o"), 0, "wrong")
+    let err = olh::read_olh_log(&ioctx, &oid, CephRelease::SQUID, &key("o"), 0, "wrong")
         .await
         .expect_err("read with the wrong tag");
     assert!(is_osd_error(&err, ECANCELED), "{err:?}");

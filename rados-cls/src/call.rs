@@ -1,5 +1,9 @@
 //! The one shape every class call takes: encode the request struct, send
 //! a `CALL` op naming the class and method, decode the reply struct.
+//!
+//! Do not compose two writing class calls on one object in one compound
+//! op: each reads the object as it was before the op, so the later write
+//! wins (two `rgw_gc` enqueues in one op keep only the second on Squid).
 
 use bytes::Bytes;
 use rados::osdclient::error::Result;

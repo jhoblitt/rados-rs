@@ -177,7 +177,9 @@ rados::impl_denc_for_versioned!(Reservation);
 /// Ceph keeps `reservations` in an `unordered_map` and writes and dumps
 /// it in libstdc++ hash order; this map re-encodes and dumps in
 /// ascending id order, so two or more reservations differ from Ceph's
-/// bytes and dump in order only. Encodes version 2, what a leaking OSD
+/// bytes and dump in order only. A repeated id keeps its first
+/// reservation in C++ (an `unordered_map` decodes through `emplace`) and
+/// its last here; well-formed heads never repeat one. Encodes version 2, what a leaking OSD
 /// writes; decodes version 3 (v19.2.4, v20.2.3 and main, same layout,
 /// written by an OSD without the leak, though a v3 head need not have
 /// an exact `reserved_size`: only reserve recomputes it on a v2 head,

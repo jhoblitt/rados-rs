@@ -45,8 +45,10 @@ pub const LIST_DEFAULT_MAX: u32 = 128;
 /// `cls_queue_urgent_data` xattr. The class inits the head with no room
 /// for them, so every deferral lands in the xattr. Ceph keeps the map
 /// unordered, so a re-encode of two or more entries may order them
-/// differently from the bytes Ceph wrote. The dump prints each tag as its
-/// own value.
+/// differently from the bytes Ceph wrote. A repeated tag keeps its first
+/// value in C++ (an `unordered_map` decodes through `emplace`) and its
+/// last here; well-formed heads never repeat one. The dump prints each
+/// tag as its own value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
 #[denc(crate = "rados", version = 1, compat = 1)]
 pub struct UrgentData {

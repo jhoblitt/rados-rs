@@ -1377,8 +1377,93 @@ pub struct SnapIntervalSet {
     pub intervals: Vec<SnapInterval>,
 }
 
-/// Ceph release type (ceph_release_t in C++)
-pub type CephRelease = u8;
+/// `ceph_release_t`: a Ceph release as the OSD map carries it, one
+/// lossless byte. Values past the named ones (a release newer than
+/// this crate) are kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CephRelease(pub u8);
+
+impl CephRelease {
+    pub const UNKNOWN: Self = Self(0);
+    pub const REEF: Self = Self(18);
+    pub const SQUID: Self = Self(19);
+    pub const TENTACLE: Self = Self(20);
+    pub const UMBRELLA: Self = Self(21);
+    /// An incremental's "no change" (`ceph_release_t{0xff}`).
+    pub const NONE: Self = Self(0xff);
+
+    /// Not negative as `i8`; C++ treats a negative byte as "no release".
+    pub fn is_set(self) -> bool {
+        (self.0 as i8) >= 0
+    }
+
+    /// `operator<<(ceph_release_t)` (`src/common/ceph_releases.cc:7-10@main`):
+    /// `ceph_release_name` of the byte as an `int`, so 1..=21 give their
+    /// names and every other value (0, 22 and up, 0x80 and up) gives
+    /// "unknown" (`src/common/ceph_strings.cc:77-127@main`).
+    pub fn name(self) -> &'static str {
+        const NAMES: [&str; 21] = [
+            "argonaut",
+            "bobtail",
+            "cuttlefish",
+            "dumpling",
+            "emperor",
+            "firefly",
+            "giant",
+            "hammer",
+            "infernalis",
+            "jewel",
+            "kraken",
+            "luminous",
+            "mimic",
+            "nautilus",
+            "octopus",
+            "pacific",
+            "quincy",
+            "reef",
+            "squid",
+            "tentacle",
+            "umbrella",
+        ];
+        match self.0 {
+            1..=21 => NAMES[usize::from(self.0) - 1],
+            _ => "unknown",
+        }
+    }
+}
+
+/// C++'s `operator<` (`src/common/ceph_releases.h:56-78@main`) puts a
+/// byte that is negative as `i8` below every release. Two unset values
+/// compare by byte here, so the order stays consistent with `Eq`.
+impl Ord for CephRelease {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.is_set(), self.0).cmp(&(other.is_set(), other.0))
+    }
+}
+
+impl PartialOrd for CephRelease {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for CephRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl From<u8> for CephRelease {
+    fn from(byte: u8) -> Self {
+        Self(byte)
+    }
+}
+
+impl From<CephRelease> for u8 {
+    fn from(release: CephRelease) -> Self {
+        release.0
+    }
+}
 
 /// Incremental OSDMap update (OSDMap::Incremental in C++)
 /// Represents a diff from epoch-1 to epoch
@@ -1455,8 +1540,8 @@ pub struct OSDMapIncremental {
     pub new_full_ratio: f32,
     pub new_backfillfull_ratio: f32,
 
-    pub new_require_min_compat_client: CephRelease,
-    pub new_require_osd_release: CephRelease,
+    pub new_require_min_compat_client: u8,
+    pub new_require_osd_release: u8,
 
     pub new_crush_node_flags: BTreeMap<i32, u32>,
     pub new_device_class_flags: BTreeMap<i32, u32>,
@@ -1614,8 +1699,8 @@ struct OSDMapIncrementalOsdSection {
     new_nearfull_ratio: f32,
     new_full_ratio: f32,
     new_backfillfull_ratio: f32,
-    new_require_min_compat_client: CephRelease,
-    new_require_osd_release: CephRelease,
+    new_require_min_compat_client: u8,
+    new_require_osd_release: u8,
     new_crush_node_flags: BTreeMap<i32, u32>,
     new_device_class_flags: BTreeMap<i32, u32>,
     change_stretch_mode: bool,
@@ -1833,8 +1918,8 @@ struct OSDMapOsdSection {
     nearfull_ratio: f32,
     full_ratio: f32,
     backfillfull_ratio: f32,
-    require_min_compat_client: CephRelease,
-    require_osd_release: CephRelease,
+    require_min_compat_client: u8,
+    require_osd_release: u8,
     removed_snaps_queue: Vec<(i64, SnapIntervalSet)>,
     crush_node_flags: BTreeMap<i32, u32>,
     device_class_flags: BTreeMap<i32, u32>,
@@ -1890,8 +1975,8 @@ impl VersionedEncode for OSDMapOsdSection {
             nearfull_ratio: f32::decode(buf, features)?,
             full_ratio: f32::decode(buf, features)?,
             backfillfull_ratio: f32::decode(buf, features)?,
-            require_min_compat_client: CephRelease::decode(buf, features)?,
-            require_osd_release: CephRelease::decode(buf, features)?,
+            require_min_compat_client: u8::decode(buf, features)?,
+            require_osd_release: u8::decode(buf, features)?,
             removed_snaps_queue: Vec::decode(buf, features)?,
             crush_node_flags: BTreeMap::decode(buf, features)?,
             device_class_flags: BTreeMap::decode(buf, features)?,
@@ -2164,25 +2249,25 @@ impl OSDMapIncremental {
             new_nearfull_ratio: _,
             new_full_ratio: _,
             new_backfillfull_ratio: _,
+            new_require_min_compat_client: _,
+            new_require_osd_release: _,
 
             // -------- Intentionally not applied --------
-            encode_features: _,               // wire-decode metadata
-            fsid: _,                          // invariant within a session
-            fullmap: _,                       // TODO: handle full-map replacement
-            new_hb_back_up: _,                // server-side heartbeat addrs
-            new_up_thru: _,                   // server-side OSD epoch history
-            new_last_clean_interval: _,       // server-side OSD history
-            new_lost: _,                      // admin OSD lost flag
-            new_up_cluster: _,                // cluster-facing addrs (OSD-to-OSD)
-            cluster_snapshot: _,              // cephfs snapshot name
-            new_uuid: _,                      // per-OSD fsid (admin repair)
-            new_xinfo: _,                     // extended OSD info (server-side)
-            new_hb_front_up: _,               // server-side heartbeat addrs
-            new_require_min_compat_client: _, // mon-enforced feature gate
-            new_require_osd_release: _,       // mon-enforced feature gate
-            new_crush_node_flags: _,          // carried in the CRUSH map bytes
-            new_device_class_flags: _,        // carried in the CRUSH map bytes
-            change_stretch_mode: _,           // stretch mode (rare deployment)
+            encode_features: _,         // wire-decode metadata
+            fsid: _,                    // invariant within a session
+            fullmap: _,                 // TODO: handle full-map replacement
+            new_hb_back_up: _,          // server-side heartbeat addrs
+            new_up_thru: _,             // server-side OSD epoch history
+            new_last_clean_interval: _, // server-side OSD history
+            new_lost: _,                // admin OSD lost flag
+            new_up_cluster: _,          // cluster-facing addrs (OSD-to-OSD)
+            cluster_snapshot: _,        // cephfs snapshot name
+            new_uuid: _,                // per-OSD fsid (admin repair)
+            new_xinfo: _,               // extended OSD info (server-side)
+            new_hb_front_up: _,         // server-side heartbeat addrs
+            new_crush_node_flags: _,    // carried in the CRUSH map bytes
+            new_device_class_flags: _,  // carried in the CRUSH map bytes
+            change_stretch_mode: _,     // stretch mode (rare deployment)
             new_stretch_bucket_count: _,
             new_degraded_stretch_mode: _,
             new_recovering_stretch_mode: _,
@@ -2477,6 +2562,16 @@ impl OSDMapIncremental {
             base.backfillfull_ratio = self.new_backfillfull_ratio;
         }
 
+        // `OSDMap.cc:2646-2662@main`: 0xff (negative as `i8`) is an
+        // incremental's "no change"; a minimum client release of unknown
+        // is never applied. The C++ flag side effects are not mirrored.
+        if (self.new_require_osd_release as i8) >= 0 {
+            base.require_osd_release = self.new_require_osd_release;
+        }
+        if (self.new_require_min_compat_client as i8) > 0 {
+            base.require_min_compat_client = self.new_require_min_compat_client;
+        }
+
         Ok(())
     }
 }
@@ -2566,8 +2661,8 @@ pub struct OSDMap {
     pub backfillfull_ratio: f32,
 
     // Version 5+ fields
-    pub require_min_compat_client: CephRelease,
-    pub require_osd_release: CephRelease,
+    pub require_min_compat_client: u8,
+    pub require_osd_release: u8,
 
     // Version 6+ fields (osd-only section)
     pub removed_snaps_queue: Vec<(i64, SnapIntervalSet)>,
@@ -4444,6 +4539,72 @@ mod tests {
         inc.fsid = UuidD::from_bytes([0xBB; 16]);
         inc.apply_to(&mut base).expect("first apply should succeed");
         assert_eq!(base.fsid, UuidD::from_bytes([0xBB; 16]));
+    }
+
+    #[test]
+    fn test_apply_to_follows_require_osd_release() {
+        for (byte, expected) in [(0xff, 19), (0x80, 19), (20, 20), (0, 0)] {
+            let mut base = OSDMap::new();
+            base.require_osd_release = 19;
+            let mut inc = OSDMapIncremental::new(Epoch::new(1));
+            assert_eq!(
+                inc.new_require_osd_release, 0xff,
+                "the default is no change"
+            );
+            inc.new_require_osd_release = byte;
+            inc.apply_to(&mut base).expect("apply_to");
+            assert_eq!(base.require_osd_release, expected, "byte {byte:#x}");
+        }
+    }
+
+    #[test]
+    fn test_apply_to_follows_require_min_compat_client() {
+        for (byte, expected) in [(0xff, 12), (0, 12), (18, 18)] {
+            let mut base = OSDMap::new();
+            base.require_min_compat_client = 12;
+            let mut inc = OSDMapIncremental::new(Epoch::new(1));
+            assert_eq!(
+                inc.new_require_min_compat_client, 0xff,
+                "the default is no change"
+            );
+            inc.new_require_min_compat_client = byte;
+            inc.apply_to(&mut base).expect("apply_to");
+            assert_eq!(base.require_min_compat_client, expected, "byte {byte:#x}");
+        }
+    }
+
+    #[test]
+    fn ceph_release_names_and_order() {
+        assert_eq!(CephRelease::UNKNOWN.0, 0);
+        assert_eq!(CephRelease::REEF.0, 18);
+        assert_eq!(CephRelease::SQUID.0, 19);
+        assert_eq!(CephRelease::TENTACLE.0, 20);
+        assert_eq!(CephRelease::UMBRELLA.0, 21);
+        assert_eq!(CephRelease::NONE.0, 0xff);
+        assert_eq!(CephRelease::SQUID.to_string(), "squid");
+        assert_eq!(CephRelease::TENTACLE.to_string(), "tentacle");
+        assert_eq!(CephRelease::UMBRELLA.to_string(), "umbrella");
+        assert_eq!(CephRelease(1).to_string(), "argonaut");
+        for unknown in [CephRelease::UNKNOWN, CephRelease(22), CephRelease::NONE] {
+            assert_eq!(unknown.to_string(), "unknown");
+        }
+        let ascending = [
+            CephRelease::NONE,
+            CephRelease::UNKNOWN,
+            CephRelease::REEF,
+            CephRelease::SQUID,
+            CephRelease::TENTACLE,
+            CephRelease::UMBRELLA,
+            CephRelease(22),
+        ];
+        for pair in ascending.windows(2) {
+            assert!(pair[0] < pair[1], "{:?} < {:?}", pair[0], pair[1]);
+        }
+        assert!(CephRelease(0x80) < CephRelease::UNKNOWN);
+        assert!(!CephRelease::NONE.is_set());
+        assert!(CephRelease::UNKNOWN.is_set());
+        assert_eq!(u8::from(CephRelease::SQUID), 19);
+        assert_eq!(CephRelease::from(20), CephRelease::TENTACLE);
     }
 
     #[test]

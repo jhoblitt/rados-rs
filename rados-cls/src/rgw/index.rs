@@ -11,7 +11,27 @@
 //! and RGW decides per call site to put [`guard_op`] in front of the
 //! write in one compound operation, which then fails with
 //! `OSDError { code: -ERR_BUSY_RESHARDING }` while the shard reshards.
-//! The `*_op` constructors are for building that compound.
+//! The `*_op` constructors are for building that compound. Squid's
+//! radosgw (`rgw_rados.cc@v19.2.6`) guards [`prepare`], [`complete`]
+//! (including the completion manager's retry, `:917`) and the OLH
+//! writes; from Tentacle it also sends `assert_exists`, the guard and
+//! then [`suggest_changes`] in both listing paths
+//! (`rgw_rados.cc:10823,11061@v20.2.4`, where v19.2.6's `:9902,10138`
+//! send the suggestion bare), so a gateway at Tentacle level guards its
+//! listing-time suggestions. Listing, [`check_index`],
+//! [`rebuild_index`], [`init_index`] and [`set_tag_timeout`] stay
+//! unguarded in both (radosgw prepends no guard to them).
+//!
+//! From Tentacle v20.2.0 (d011c522bb1) the class also guards itself:
+//! prepare, complete, link_olh, unlink_instance, trim_olh_log,
+//! clear_olh, suggest_changes, bi_put_entries and rebuild_index run
+//! `guard_bucket_resharding(hctx, header)`
+//! (`cls_rgw.cc:906-921@v20.2.4`), which answers -2300 when the header is
+//! `IN_PROGRESS`, or `IN_LOGRECORD` with `reshardlog_entries >=
+//! rgw_reshardlog_threshold`. On those releases a write can fail with
+//! -2300 even without [`guard_op`]. Keep prepending it all the same: it is
+//! what radosgw sends (`main`'s link does `assert_exists`, then the guard,
+//! then the link, `rgw_rados.cc:9573-9597@main`).
 //!
 //! Server facts (Ceph v19 `cls_rgw.cc`): a second [`init_index`] is
 //! `EINVAL`, so RGW creates the shard with `create(exclusive)` first to
@@ -29,7 +49,9 @@ use std::collections::BTreeMap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rados::osdclient::error::Result;
 use rados::osdclient::{IoCtx, OSDOp, OpReply};
-use rados::{Denc, OSDClientError, OmapKey, RadosError, UTime, VersionedDenc, VersionedEncode};
+use rados::{
+    CephRelease, Denc, OSDClientError, OmapKey, RadosError, UTime, VersionedDenc, VersionedEncode,
+};
 use serde::Serialize;
 use serde::ser::{SerializeSeq, SerializeStruct};
 
@@ -44,8 +66,18 @@ use super::types::{
 use crate::call;
 
 /// `rgw_bucket_dir_entry_meta`: what the bucket index caches about an
-/// object's content. Squid v19.2.2 writes version 7 (compat 3); version
-/// 8's restore fields are not modelled and are skipped on decode.
+/// object's content. Squid v19.2.2 writes version 7 (compat 3); Umbrella
+/// v21.1.0 writes version 8, which appends [`RestoreInfo`]. The encoded
+/// version follows `restore`: `Some` encodes version 8, and decoding sets
+/// it exactly when the struct is version 8, so a meta decoded from a
+/// listing re-encodes in the version it arrived in, as C++ does. Build
+/// request metadata with [`DirEntryMeta::for_release`].
+///
+/// The dump prints `storage_class` raw, as v19.2.2's dencoder does. From
+/// Squid v19.2.4, `rgw_bucket_dir_entry_meta::dump` prints an empty one as
+/// `STANDARD` through `get_canonical_storage_class`
+/// (`cls_rgw_types.cc:199-217@main`; absent at v19.2.3). The bytes are
+/// the same; only the dump differs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirEntryMeta {
     pub category: ObjCategory,
@@ -59,13 +91,41 @@ pub struct DirEntryMeta {
     pub user_data: String,
     pub storage_class: String,
     pub appendable: bool,
+    pub restore: Option<RestoreInfo>,
+}
+
+/// The restore fields of `rgw_bucket_dir_entry_meta` version 8
+/// (Umbrella v21.1.0+, `cls_rgw_types.h:218-219@v21.1.0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoreInfo {
+    /// `RGWRestoreStatus`: 0 None, 1 RestoreAlreadyInProgress,
+    /// 2 CloudRestored, 3 RestoreFailed (`rgw_sal.h:173-178@v21.1.0`).
+    pub status: u8,
+    /// `restore_expiry_date`, a `real_time` encoded as `UTime` (u32
+    /// seconds, u32 nanoseconds); zero when not applicable.
+    pub expiry_date: UTime,
+}
+
+impl DirEntryMeta {
+    /// The default meta in the version the radosgw of `release` sends:
+    /// from Umbrella, version 8 with a zero [`RestoreInfo`] when nothing
+    /// was restored. Build the metadata of a request ([`CompleteOp`],
+    /// [`LinkOlhOp`](super::olh::LinkOlhOp)) from this and then fill its
+    /// fields. A `release` newer than the cluster's
+    /// `require_osd_release` builds a shape its radosgw would not send.
+    pub fn for_release(release: CephRelease) -> Self {
+        Self {
+            restore: (release >= CephRelease::UMBRELLA).then(RestoreInfo::default),
+            ..Self::default()
+        }
+    }
 }
 
 impl VersionedEncode for DirEntryMeta {
     const MAX_DECODE_VERSION: u8 = 8;
 
     fn encoding_version(&self, _features: u64) -> u8 {
-        7
+        if self.restore.is_some() { 8 } else { 7 }
     }
 
     fn compat_version(&self, _features: u64) -> u8 {
@@ -88,7 +148,12 @@ impl VersionedEncode for DirEntryMeta {
         self.accounted_size.encode(buf, features)?;
         self.user_data.encode(buf, features)?;
         self.storage_class.encode(buf, features)?;
-        self.appendable.encode(buf, features)
+        self.appendable.encode(buf, features)?;
+        if let Some(restore) = &self.restore {
+            restore.status.encode(buf, features)?;
+            restore.expiry_date.encode(buf, features)?;
+        }
+        Ok(())
     }
 
     fn decode_content<B: Buf>(
@@ -110,6 +175,14 @@ impl VersionedEncode for DirEntryMeta {
         let user_data = String::decode(buf, features)?;
         let storage_class = String::decode(buf, features)?;
         let appendable = bool::decode(buf, features)?;
+        let restore = if struct_v >= 8 {
+            Some(RestoreInfo {
+                status: u8::decode(buf, features)?,
+                expiry_date: UTime::decode(buf, features)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             category,
             size,
@@ -122,6 +195,7 @@ impl VersionedEncode for DirEntryMeta {
             user_data,
             storage_class,
             appendable,
+            restore,
         })
     }
 
@@ -163,7 +237,8 @@ impl Serialize for DirEntryMeta {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("DirEntryMeta", 11)?;
+        let fields = if self.restore.is_some() { 13 } else { 11 };
+        let mut state = serializer.serialize_struct("DirEntryMeta", fields)?;
         state.serialize_field("category", &self.category)?;
         state.serialize_field("size", &self.size)?;
         state.serialize_field("mtime", &DumpUtime(&self.mtime))?;
@@ -175,6 +250,10 @@ impl Serialize for DirEntryMeta {
         state.serialize_field("accounted_size", &self.accounted_size)?;
         state.serialize_field("user_data", &self.user_data)?;
         state.serialize_field("appendable", &self.appendable)?;
+        if let Some(restore) = &self.restore {
+            state.serialize_field("restore_status", &restore.status)?;
+            state.serialize_field("restore_expiry_date", &DumpUtime(&restore.expiry_date))?;
+        }
         state.end()
     }
 }
@@ -385,6 +464,12 @@ impl BucketInstanceEntry {
     pub fn resharding_in_progress(&self) -> bool {
         self.reshard_status == ReshardStatus::IN_PROGRESS
     }
+
+    /// `cls_rgw_bucket_instance_entry::resharding_in_logrecord`
+    /// (`cls_rgw_types.h:804@v20.2.4`).
+    pub fn resharding_in_logrecord(&self) -> bool {
+        self.reshard_status == ReshardStatus::IN_LOGRECORD
+    }
 }
 
 impl Serialize for BucketInstanceEntry {
@@ -399,8 +484,8 @@ impl Serialize for BucketInstanceEntry {
 }
 
 /// `rgw_bucket_dir_header`: the dir's running stats and bookkeeping.
-/// Squid v19.2.2 writes version 7 (compat 2); version 8's
-/// `reshardlog_entries` is not modelled and is skipped on decode.
+/// Squid v19.2.2 writes version 7 (compat 2); Tentacle v20.2.0's version
+/// 8 `reshardlog_entries` is not modelled and is skipped on decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirHeader {
     pub stats: BTreeMap<ObjCategory, CategoryStats>,
@@ -589,7 +674,10 @@ impl Serialize for Dir {
 
 /// `RGW_BILOG_FLAG_VERSIONED_OP`.
 pub const BILOG_FLAG_VERSIONED_OP: u16 = 0x1;
-/// `RGW_BILOG_NULL_VERSION` (Tentacle v20+; a v19 cluster never sets it).
+/// `RGW_BILOG_NULL_VERSION`. radosgw sets it on a null-version delete
+/// from Squid v19.2.3 (c860a396697, 012d8ebd71f;
+/// `rgw_rados.cc:7233,10355@main`), and `cls_rgw_bucket_unlink_instance`
+/// passes it.
 pub const BILOG_NULL_VERSION: u16 = 0x2;
 
 fn bilog_state_str(state: PendingState) -> &'static str {
@@ -703,8 +791,9 @@ impl BiLogEntry {
         self.bilog_flags & BILOG_FLAG_VERSIONED_OP != 0
     }
 
-    /// `rgw_bi_log_entry::is_null_verid`; always false on v19, which
-    /// never sets the flag.
+    /// `rgw_bi_log_entry::is_null_verid`: set on entries written by
+    /// v19.2.3+ radosgw for the null version, or by an unlink sent as
+    /// [`super::olh::unlink_instance_op`] describes, on any Squid class.
     pub fn is_null_verid(&self) -> bool {
         self.bilog_flags & BILOG_NULL_VERSION != 0
     }
@@ -752,8 +841,8 @@ impl Serialize for BiLogEntry {
 
 /// `cls_rgw_reshard_entry`: one bucket queued for resharding. Version 1's
 /// `new_instance_id` string (removed in version 2) is not modelled;
-/// version 3's `initiator` byte is not modelled either and is skipped on
-/// decode.
+/// Tentacle v20.2.0's version 3 `initiator` byte is not modelled either
+/// and is skipped on decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReshardEntry {
     pub time: UTime,
@@ -1323,16 +1412,75 @@ pub struct CheckIndexRet {
 }
 
 /// `rgw_cls_bucket_update_stats_op`: add `stats` to the header's, or
-/// replace them when `absolute`. Version 1 as v19 writes it (Tentacle
-/// v20 writes version 2 with `dec_stats`, which this request-only type
-/// does not decode); the dump prints `stats` as `{"key", "val"}` entries
-/// keyed by category number.
-#[derive(Debug, Clone, Default, PartialEq, Eq, VersionedDenc)]
-#[denc(crate = "rados", version = 1, compat = 1)]
+/// replace them when `absolute`. Squid v19 writes version 1; Tentacle
+/// v20.2.0 writes version 2, which appends `dec_stats`
+/// (`cls_rgw_ops.h:498-512@v20.2.4`). The encoded version follows
+/// `dec_stats`: `Some` encodes version 2, and decoding sets it exactly
+/// when the struct is version 2. A Tentacle+ class subtracts `dec_stats`
+/// from the header when not `absolute` and answers `EINVAL` for a
+/// non-empty `dec_stats` with `absolute` (`cls_rgw.cc:809-830@v20.2.4`);
+/// a Squid class ignores the field. The dump prints both maps as
+/// `{"key", "val"}` entries keyed by category number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateStatsOp {
     pub absolute: bool,
     pub stats: BTreeMap<ObjCategory, CategoryStats>,
+    pub dec_stats: Option<BTreeMap<ObjCategory, CategoryStats>>,
 }
+
+impl VersionedEncode for UpdateStatsOp {
+    const MAX_DECODE_VERSION: u8 = 2;
+
+    fn encoding_version(&self, _features: u64) -> u8 {
+        if self.dec_stats.is_some() { 2 } else { 1 }
+    }
+
+    fn compat_version(&self, _features: u64) -> u8 {
+        1
+    }
+
+    fn encode_content<B: BufMut>(
+        &self,
+        buf: &mut B,
+        features: u64,
+        _version: u8,
+    ) -> std::result::Result<(), RadosError> {
+        self.absolute.encode(buf, features)?;
+        self.stats.encode(buf, features)?;
+        if let Some(dec_stats) = &self.dec_stats {
+            dec_stats.encode(buf, features)?;
+        }
+        Ok(())
+    }
+
+    fn decode_content<B: Buf>(
+        buf: &mut B,
+        features: u64,
+        struct_v: u8,
+        _compat_version: u8,
+    ) -> std::result::Result<Self, RadosError> {
+        rados::check_min_version!(struct_v, 1, "UpdateStatsOp", "Kraken v11+");
+
+        let absolute = bool::decode(buf, features)?;
+        let stats = BTreeMap::decode(buf, features)?;
+        let dec_stats = if struct_v >= 2 {
+            Some(BTreeMap::decode(buf, features)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            absolute,
+            stats,
+            dec_stats,
+        })
+    }
+
+    fn encoded_size_content(&self, _features: u64, _version: u8) -> Option<usize> {
+        None
+    }
+}
+
+rados::impl_denc_for_versioned!(UpdateStatsOp);
 
 /// A stats map dumped as `encode_json` dumps a `std::map<int, ...>`.
 struct StatsEntries<'a>(&'a BTreeMap<ObjCategory, CategoryStats>);
@@ -1348,9 +1496,13 @@ impl Serialize for UpdateStatsOp {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("UpdateStatsOp", 2)?;
+        let fields = if self.dec_stats.is_some() { 3 } else { 2 };
+        let mut state = serializer.serialize_struct("UpdateStatsOp", fields)?;
         state.serialize_field("absolute", &self.absolute)?;
         state.serialize_field("stats", &StatsEntries(&self.stats))?;
+        if let Some(dec_stats) = &self.dec_stats {
+            state.serialize_field("dec_stats", &StatsEntries(dec_stats))?;
+        }
         state.end()
     }
 }
@@ -1589,16 +1741,32 @@ pub fn rebuild_index_op() -> Result<OSDOp> {
 }
 
 /// `cls_rgw_bucket_update_stats`: add `stats` to the header's, or replace
-/// the named categories when `absolute`.
+/// the named categories when `absolute`. Sent in the shape the radosgw of
+/// `release` sends: from Tentacle, version 2 with an empty `dec_stats`. A
+/// caller that needs a non-empty `dec_stats` builds [`UpdateStatsOp`]
+/// itself.
 pub fn update_stats_op(
+    release: CephRelease,
     absolute: bool,
     stats: &BTreeMap<ObjCategory, CategoryStats>,
 ) -> Result<OSDOp> {
-    let op = UpdateStatsOp {
+    call::op(
+        CLASS,
+        "bucket_update_stats",
+        &update_stats_req(release, absolute, stats),
+    )
+}
+
+fn update_stats_req(
+    release: CephRelease,
+    absolute: bool,
+    stats: &BTreeMap<ObjCategory, CategoryStats>,
+) -> UpdateStatsOp {
+    UpdateStatsOp {
         absolute,
         stats: stats.clone(),
-    };
-    call::op(CLASS, "bucket_update_stats", &op)
+        dec_stats: (release >= CephRelease::TENTACLE).then(BTreeMap::new),
+    }
 }
 
 /// `cls_rgw_suggest_changes`: apply each suggestion whose entry has no
@@ -1682,9 +1850,13 @@ pub fn clear_bucket_resharding_op() -> Result<OSDOp> {
     )
 }
 
-/// `cls_rgw_guard_bucket_resharding`: fail with `ret_err` when the
-/// header's reshard status is anything but `NOT_RESHARDING`, which
-/// aborts the compound operation it leads.
+/// `cls_rgw_guard_bucket_resharding`: fail with `ret_err`, which aborts
+/// the compound operation it leads. On Squid the trip condition is a
+/// reshard status other than `NOT_RESHARDING` (`header.resharding()`,
+/// `cls_rgw.cc:4606@v19.2.2`). From Tentacle v20.2.0 the method calls the
+/// class's own guard helper (`cls_rgw.cc:4995-5016@v20.2.4`), so `DONE`
+/// no longer trips it, and `IN_LOGRECORD` trips it only once
+/// `reshardlog_entries` reaches `rgw_reshardlog_threshold`.
 pub fn guard_bucket_resharding_op(ret_err: i32) -> Result<OSDOp> {
     call::op(
         CLASS,
@@ -1693,7 +1865,7 @@ pub fn guard_bucket_resharding_op(ret_err: i32) -> Result<OSDOp> {
     )
 }
 
-/// The guard RGW puts in front of every index write:
+/// The guard RGW puts in front of the index writes the module docs list:
 /// [`guard_bucket_resharding_op`] with `-ERR_BUSY_RESHARDING`.
 pub fn guard_op() -> Result<OSDOp> {
     guard_bucket_resharding_op(-ERR_BUSY_RESHARDING)
@@ -1811,13 +1983,11 @@ pub async fn rebuild_index(ioctx: &IoCtx, oid: &str) -> Result<()> {
 pub async fn update_stats(
     ioctx: &IoCtx,
     oid: &str,
+    release: CephRelease,
     absolute: bool,
     stats: &BTreeMap<ObjCategory, CategoryStats>,
 ) -> Result<()> {
-    let op = UpdateStatsOp {
-        absolute,
-        stats: stats.clone(),
-    };
+    let op = update_stats_req(release, absolute, stats);
     call::exec(ioctx, oid, CLASS, "bucket_update_stats", &op)
         .await
         .map(drop)
@@ -1956,31 +2126,85 @@ mod tests {
             user_data: String::new(),
             storage_class: String::new(),
             appendable: false,
+            restore: None,
         }
     }
+
+    /// `meta_instance` as Umbrella's dencoder instance 1 carries it.
+    fn restored_meta_instance() -> DirEntryMeta {
+        DirEntryMeta {
+            restore: Some(RestoreInfo {
+                status: 2,
+                expiry_date: UTime {
+                    sec: 1_234_567_890,
+                    nsec: 0,
+                },
+            }),
+            ..meta_instance()
+        }
+    }
+
+    const META_V19_WIRE: &str = "07035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f747970650000000000000000000000000000000000";
 
     #[test]
     fn dir_entry_meta_dump_order_differs_from_wire_order() {
         let m = meta_instance();
-        assert_eq!(
-            bytes(&m),
-            unhex(
-                "07035300000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f747970650000000000000000000000000000000000"
-            )
-        );
+        assert_eq!(bytes(&m), unhex(META_V19_WIRE));
         assert_eq!(
             json(&m),
             r#"{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false}"#
         );
-        assert_eq!(
-            DirEntryMeta::decode(&mut &bytes(&m)[..], 0).expect("decode"),
-            m
-        );
+        let decoded = DirEntryMeta::decode(&mut &bytes(&m)[..], 0).expect("decode");
+        assert_eq!(decoded.restore, None);
+        assert_eq!(decoded, m);
         // Version 6 lacked appendable; below the floor.
         let v6 = unhex(
             "06035200000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f7479706500000000000000000000000000000000",
         );
         assert!(DirEntryMeta::decode(&mut &v6[..], 0).is_err());
+    }
+
+    #[test]
+    fn dir_entry_meta_follows_the_release() {
+        // v19.2.2/rgw_bucket_dir_entry_meta.2, hex-identical in v20.2.4
+        let v7 = unhex(
+            "0703320000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        for release in [CephRelease::SQUID, CephRelease::TENTACLE] {
+            assert_eq!(DirEntryMeta::for_release(release), DirEntryMeta::default());
+        }
+        assert_eq!(bytes(&DirEntryMeta::default()), v7);
+        assert_eq!(
+            DirEntryMeta::decode(&mut &v7[..], 0).expect("decode"),
+            DirEntryMeta::default()
+        );
+
+        // v21.1.0/rgw_bucket_dir_entry_meta.1
+        let m = restored_meta_instance();
+        let wire = unhex(
+            "08035c00000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000002d202964900000000",
+        );
+        assert_eq!(bytes(&m), wire);
+        assert_eq!(DirEntryMeta::decode(&mut &wire[..], 0).expect("decode"), m);
+        assert_eq!(
+            json(&m),
+            r#"{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false,"restore_status":2,"restore_expiry_date":"2009-02-13T23:31:30.000000Z"}"#
+        );
+        let unrestored = DirEntryMeta { restore: None, ..m };
+        assert_eq!(bytes(&unrestored), unhex(META_V19_WIRE));
+
+        // v21.1.0/rgw_bucket_dir_entry_meta.2
+        let m = DirEntryMeta::for_release(CephRelease::UMBRELLA);
+        assert_eq!(m.restore, Some(RestoreInfo::default()));
+        let wire = unhex(
+            "08033b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert_eq!(bytes(&m), wire);
+        assert_eq!(DirEntryMeta::decode(&mut &wire[..], 0).expect("decode"), m);
+        assert_eq!(
+            json(&m),
+            r#"{"category":0,"size":0,"mtime":"0.000000","etag":"","storage_class":"","owner":"","owner_display_name":"","content_type":"","accounted_size":0,"user_data":"","appendable":false,"restore_status":0,"restore_expiry_date":"0.000000"}"#
+        );
     }
 
     /// `encoded` re-versioned to `version` with `tail` appended to its
@@ -1994,17 +2218,37 @@ mod tests {
         out
     }
 
+    /// `encoded` re-versioned to `version`, its content cut to `keep`
+    /// bytes and `tail` appended, with the length rewritten.
+    fn reframed(encoded: &[u8], version: u8, keep: usize, tail: &[u8]) -> Vec<u8> {
+        let mut out = encoded[..6 + keep].to_vec();
+        out[0] = version;
+        out.extend_from_slice(tail);
+        let len = u32::try_from(out.len() - 6).expect("fits");
+        out[2..6].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
     #[test]
     fn decoders_accept_mains_version_and_skip_its_tail() {
-        // Ceph main writes meta v8 (restore_status u8, restore_expiry_date
-        // real_time), header v8 (reshardlog_entries u32) and reshard
-        // entry v3 (initiator u8); everything past v19's fields is
-        // skipped, and a version past MAX_DECODE_VERSION is rejected.
+        // Umbrella v21.1.0 writes meta v8 (restore_status u8,
+        // restore_expiry_date real_time), which is modelled. Tentacle
+        // v20.2.0 writes header v8 (reshardlog_entries u32) and reshard
+        // entry v3 (initiator u8), reply-only fields that are skipped. A
+        // version past MAX_DECODE_VERSION is rejected.
         let meta = dir_entry_instance().meta;
         let v8 = with_tail(&bytes(&meta), 8, &[0; 9]);
         let mut buf = &v8[..];
-        assert_eq!(DirEntryMeta::decode(&mut buf, 0).expect("meta v8"), meta);
+        let decoded = DirEntryMeta::decode(&mut buf, 0).expect("meta v8");
         assert!(buf.is_empty());
+        assert_eq!(
+            decoded,
+            DirEntryMeta {
+                restore: Some(RestoreInfo::default()),
+                ..meta.clone()
+            }
+        );
+        assert_eq!(bytes(&decoded), v8);
         assert!(DirEntryMeta::decode(&mut &with_tail(&bytes(&meta), 9, &[])[..], 0).is_err());
 
         let header = dir_header_instance();
@@ -2060,7 +2304,49 @@ mod tests {
             json(&e),
             r#"{"name":"name","instance":"","ver":{"pool":1,"epoch":1234},"locator":"locator","exists":true,"meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false},"tag":"tag","flags":0,"pending_map":[],"versioned_epoch":0}"#
         );
-        assert_eq!(DirEntry::decode(&mut &bytes(&e)[..], 0).expect("decode"), e);
+        let decoded = DirEntry::decode(&mut &bytes(&e)[..], 0).expect("decode");
+        assert_eq!(decoded.meta.restore, None);
+        assert_eq!(decoded, e);
+    }
+
+    #[test]
+    fn dir_entry_carries_umbrella_meta() {
+        let umbrella = DirEntryMeta::for_release(CephRelease::UMBRELLA);
+        let cases = [
+            (
+                // v21.1.0/rgw_bucket_dir_entry.1
+                DirEntry {
+                    meta: restored_meta_instance(),
+                    ..dir_entry_instance()
+                },
+                "0803a2000000040000006e616d65d2040000000000000108035c00000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000002d20296490000000000000000070000006c6f6361746f720101040000000182d20400030000007461670000000000000000000000000000",
+                r#"{"name":"name","instance":"","ver":{"pool":1,"epoch":1234},"locator":"locator","exists":true,"meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false,"restore_status":2,"restore_expiry_date":"2009-02-13T23:31:30.000000Z"},"tag":"tag","flags":0,"pending_map":[],"versioned_epoch":0}"#,
+            ),
+            (
+                // v21.1.0/rgw_bucket_dir_entry.2
+                DirEntry {
+                    meta: umbrella.clone(),
+                    ..dir_entry_instance()
+                },
+                "080381000000040000006e616d65d2040000000000000108033b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000070000006c6f6361746f720101040000000182d20400030000007461670000000000000000000000000000",
+                r#"{"name":"name","instance":"","ver":{"pool":1,"epoch":1234},"locator":"locator","exists":true,"meta":{"category":0,"size":0,"mtime":"0.000000","etag":"","storage_class":"","owner":"","owner_display_name":"","content_type":"","accounted_size":0,"user_data":"","appendable":false,"restore_status":0,"restore_expiry_date":"0.000000"},"tag":"tag","flags":0,"pending_map":[],"versioned_epoch":0}"#,
+            ),
+            (
+                // v21.1.0/rgw_bucket_dir_entry.3
+                DirEntry {
+                    meta: umbrella,
+                    ..DirEntry::default()
+                },
+                "0803790000000000000000000000000000000008033b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001010a00000088ffffffffffffffff0000000000000000000000000000000000000000",
+                r#"{"name":"","instance":"","ver":{"pool":-1,"epoch":0},"locator":"","exists":false,"meta":{"category":0,"size":0,"mtime":"0.000000","etag":"","storage_class":"","owner":"","owner_display_name":"","content_type":"","accounted_size":0,"user_data":"","appendable":false,"restore_status":0,"restore_expiry_date":"0.000000"},"tag":"","flags":0,"pending_map":[],"versioned_epoch":0}"#,
+            ),
+        ];
+        for (entry, hex, dump) in cases {
+            let wire = unhex(hex);
+            assert_eq!(DirEntry::decode(&mut &wire[..], 0).expect("decode"), entry);
+            assert_eq!(bytes(&entry), wire);
+            assert_eq!(json(&entry), dump);
+        }
     }
 
     #[test]
@@ -2111,6 +2397,19 @@ mod tests {
         // Version 2 dropped the legacy fields; below the floor.
         let v2 = unhex("0201010000000100");
         assert!(BucketInstanceEntry::decode(&mut &v2[..], 0).is_err());
+    }
+
+    #[test]
+    fn bucket_instance_entry_reads_tentacles_in_logrecord() {
+        // Hand-derived from v19.2.2/cls_rgw_bucket_instance_entry.1
+        // (0301090000000000000000ffffffff) with the status byte set to 3.
+        let wire = unhex("0301090000000300000000ffffffff");
+        let e = BucketInstanceEntry::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(e.reshard_status, ReshardStatus::IN_LOGRECORD);
+        assert_eq!(bytes(&e), wire);
+        assert_eq!(json(&e), r#"{"reshard_status":"in-logrecord"}"#);
+        assert!(e.resharding_in_logrecord());
+        assert!(!e.resharding_in_progress());
     }
 
     fn dir_header_instance() -> DirHeader {
@@ -2389,7 +2688,9 @@ mod tests {
             json(&op),
             r#"{"op":1,"name":"name","instance":"","locator":"locator","ver":{"pool":2,"epoch":100},"meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false},"tag":"tag","log_op":false,"bilog_flags":0,"zones_trace":[]}"#
         );
-        assert_eq!(CompleteOp::decode(&mut &wire[..], 0).expect("decode"), op);
+        let decoded = CompleteOp::decode(&mut &wire[..], 0).expect("decode");
+        assert_eq!(decoded.meta.restore, None);
+        assert_eq!(decoded, op);
         assert_eq!(CompleteOp::default().op, ModifyOp::ADD);
         assert_eq!(CompleteOp::default().ver.pool, -1);
 
@@ -2406,6 +2707,50 @@ mod tests {
         let mut v8 = wire;
         v8[0] = 8;
         assert!(CompleteOp::decode(&mut &v8[..], 0).is_err());
+    }
+
+    #[test]
+    fn complete_op_carries_umbrella_meta() {
+        let cases = [
+            (
+                // v21.1.0/rgw_cls_obj_complete_op.1 (168 B)
+                CompleteOp {
+                    op: ModifyOp::DEL,
+                    key: ObjKey {
+                        name: "name".to_owned(),
+                        instance: String::new(),
+                    },
+                    locator: "locator".to_owned(),
+                    ver: EntryVer {
+                        pool: 2,
+                        epoch: 100,
+                    },
+                    meta: restored_meta_instance(),
+                    tag: "tag".to_owned(),
+                    ..CompleteOp::default()
+                },
+                "0907a200000001640000000000000008035c00000001640000000000000000000000000000000400000065746167050000006f776e65720c000000646973706c6179206e616d650c000000636f6e74656e742f74797065000000000000000000000000000000000002d20296490000000003000000746167070000006c6f6361746f720000000001010200000002640001010c000000040000006e616d6500000000000000000000",
+                168,
+                r#"{"op":1,"name":"name","instance":"","locator":"locator","ver":{"pool":2,"epoch":100},"meta":{"category":1,"size":100,"mtime":"0.000000","etag":"etag","storage_class":"","owner":"owner","owner_display_name":"display name","content_type":"content/type","accounted_size":0,"user_data":"","appendable":false,"restore_status":2,"restore_expiry_date":"2009-02-13T23:31:30.000000Z"},"tag":"tag","log_op":false,"bilog_flags":0,"zones_trace":[]}"#,
+            ),
+            (
+                // v21.1.0/rgw_cls_obj_complete_op.2 (129 B)
+                CompleteOp {
+                    meta: DirEntryMeta::for_release(CephRelease::UMBRELLA),
+                    ..CompleteOp::default()
+                },
+                "09077b00000000000000000000000008033b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001010a00000088ffffffffffffffff00000101080000000000000000000000000000000000",
+                129,
+                r#"{"op":0,"name":"","instance":"","locator":"","ver":{"pool":-1,"epoch":0},"meta":{"category":0,"size":0,"mtime":"0.000000","etag":"","storage_class":"","owner":"","owner_display_name":"","content_type":"","accounted_size":0,"user_data":"","appendable":false,"restore_status":0,"restore_expiry_date":"0.000000"},"tag":"","log_op":false,"bilog_flags":0,"zones_trace":[]}"#,
+            ),
+        ];
+        for (op, hex, len, dump) in cases {
+            let wire = unhex(hex);
+            assert_eq!(wire.len(), len);
+            assert_eq!(CompleteOp::decode(&mut &wire[..], 0).expect("decode"), op);
+            assert_eq!(bytes(&op), wire);
+            assert_eq!(json(&op), dump);
+        }
     }
 
     #[test]
@@ -2494,21 +2839,23 @@ mod tests {
         );
     }
 
+    /// The existing test's `CategoryStats`, encoded
+    /// `0302200000000100000000000000001000000000000001000000000000000000000000000000`.
+    fn cs() -> CategoryStats {
+        CategoryStats {
+            total_size: 1,
+            total_size_rounded: 4096,
+            num_entries: 1,
+            actual_size: 0,
+        }
+    }
+
     #[test]
     fn update_stats_op_dumps_stats_as_numbered_entries() {
-        let mut stats = BTreeMap::new();
-        stats.insert(
-            ObjCategory::NONE,
-            CategoryStats {
-                total_size: 1,
-                total_size_rounded: 4096,
-                num_entries: 1,
-                actual_size: 0,
-            },
-        );
         let op = UpdateStatsOp {
             absolute: true,
-            stats,
+            stats: BTreeMap::from([(ObjCategory::NONE, cs())]),
+            dec_stats: None,
         };
         let wire = unhex(
             "01012c0000000101000000000302200000000100000000000000001000000000000001000000000000000000000000000000",
@@ -2522,6 +2869,73 @@ mod tests {
             UpdateStatsOp::decode(&mut &wire[..], 0).expect("decode"),
             op
         );
+    }
+
+    #[test]
+    fn update_stats_op_appends_dec_stats_from_tentacle() {
+        // Hand-derived from cls_rgw_ops.h:498-512@v20.2.4 and
+        // cls_rgw_ops.cc:382-395@v20.2.4; not a dencoder type.
+        let op =
+            |stats: &[(ObjCategory, CategoryStats)],
+             dec_stats: Option<&[(ObjCategory, CategoryStats)]>| UpdateStatsOp {
+                absolute: false,
+                stats: stats.iter().copied().collect(),
+                dec_stats: dec_stats.map(|d| d.iter().copied().collect()),
+            };
+        let main = [(ObjCategory::MAIN, cs())];
+        let cases = [
+            (op(&[], None), "0101050000000000000000"),
+            (op(&[], Some(&[])), "020109000000000000000000000000"),
+            (
+                op(&main, Some(&[])),
+                "020130000000000100000001030220000000010000000000000000100000000000000100000000000000000000000000000000000000",
+            ),
+            (
+                op(&[], Some(&main)),
+                "020130000000000000000001000000010302200000000100000000000000001000000000000001000000000000000000000000000000",
+            ),
+        ];
+        for (op, hex) in &cases {
+            let wire = unhex(hex);
+            assert_eq!(bytes(op), wire);
+            assert_eq!(
+                &UpdateStatsOp::decode(&mut &wire[..], 0).expect("decode"),
+                op
+            );
+        }
+        assert_eq!(
+            json(&cases[1].0),
+            r#"{"absolute":false,"stats":[],"dec_stats":[]}"#
+        );
+        let last = &cases[3].0;
+        assert_eq!(
+            json(last),
+            r#"{"absolute":false,"stats":[],"dec_stats":[{"key":1,"val":{"total_size":1,"total_size_rounded":4096,"num_entries":1,"actual_size":0}}]}"#
+        );
+
+        let tailed = with_tail(&bytes(last), 2, &[0xaa]);
+        let mut buf = &tailed[..];
+        assert_eq!(&UpdateStatsOp::decode(&mut buf, 0).expect("tail"), last);
+        assert!(buf.is_empty());
+        let v3 = with_tail(&bytes(last), 3, &[0xaa]);
+        assert!(UpdateStatsOp::decode(&mut &v3[..], 0).is_err());
+
+        let v1 = reframed(&bytes(&cases[1].0), 1, 5, &[]);
+        assert_eq!(v1, unhex("0101050000000000000000"));
+        assert_eq!(
+            UpdateStatsOp::decode(&mut &v1[..], 0).expect("v1"),
+            op(&[], None)
+        );
+
+        let request = |release| {
+            update_stats_op(release, false, &BTreeMap::new())
+                .expect("op")
+                .indata
+        };
+        assert!(request(CephRelease::SQUID).ends_with(&unhex("0101050000000000000000")));
+        for release in [CephRelease::TENTACLE, CephRelease::UMBRELLA] {
+            assert!(request(release).ends_with(&unhex("020109000000000000000000000000")));
+        }
     }
 
     #[test]
@@ -2691,7 +3105,10 @@ mod tests {
             (dir_header_op(), "bucket_list"),
             (check_index_op(), "bucket_check_index"),
             (rebuild_index_op(), "bucket_rebuild_index"),
-            (update_stats_op(false, &stats), "bucket_update_stats"),
+            (
+                update_stats_op(CephRelease::SQUID, false, &stats),
+                "bucket_update_stats",
+            ),
             (suggest_changes_op(&[]), "dir_suggest_changes"),
             (remove_obj_op(&[]), "obj_remove"),
             (store_pg_ver_op("a"), "obj_store_pg_ver"),

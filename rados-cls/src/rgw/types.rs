@@ -162,8 +162,9 @@ impl BiIndexType {
 }
 
 byte_enum! {
-    /// `cls_rgw_reshard_status`.
-    ReshardStatus { NOT_RESHARDING = 0, IN_PROGRESS = 1, DONE = 2 }
+    /// `cls_rgw_reshard_status`. `IN_LOGRECORD` is Tentacle v20.2.0+
+    /// (`cls_rgw_types.h:735-756@v20.2.4`).
+    ReshardStatus { NOT_RESHARDING = 0, IN_PROGRESS = 1, DONE = 2, IN_LOGRECORD = 3 }
 }
 
 impl ReshardStatus {
@@ -173,6 +174,7 @@ impl ReshardStatus {
             Self::NOT_RESHARDING => "not-resharding",
             Self::IN_PROGRESS => "in-progress",
             Self::DONE => "done",
+            Self::IN_LOGRECORD => "in-logrecord",
             _ => "Unknown reshard status",
         }
     }

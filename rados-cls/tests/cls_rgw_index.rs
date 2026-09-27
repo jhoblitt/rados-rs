@@ -10,7 +10,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::create_ioctx;
-use rados::{IoCtx, OSDClientError, OmapMap, OpBuilder, UTime};
+use rados::{CephRelease, IoCtx, OSDClientError, OmapMap, OpBuilder, UTime};
 use rados_cls::rgw::index::{
     self, CompleteOp, DirEntry, DirEntryMeta, ERR_BUSY_RESHARDING, ListOp, ListRet, PrepareOp,
     SuggestOp, Suggestion,
@@ -456,7 +456,7 @@ async fn index_check_and_rebuild() {
         actual_size: 1,
     };
     let stats_map = BTreeMap::from([(ObjCategory::MAIN, corrupt)]);
-    index::update_stats(&ioctx, &oid, true, &stats_map)
+    index::update_stats(&ioctx, &oid, CephRelease::SQUID, true, &stats_map)
         .await
         .expect("update_stats");
 

@@ -16,6 +16,7 @@ use crate::osdclient::omap::{
     decode_omap_vals_by_keys,
 };
 use crate::osdclient::operation::{BuiltOp, OpBuilder};
+use crate::osdclient::osdmap::CephRelease;
 use crate::osdclient::snapshot::SnapId;
 use crate::osdclient::types::{
     AllocHintFlags, OSDOp, OpResult, OsdOpFlags, ReadResult, SparseReadResult, StatResult,
@@ -108,6 +109,11 @@ impl IoCtx {
     /// Get the pool ID
     pub fn pool_id(&self) -> u64 {
         self.pool_id
+    }
+
+    /// See [`OSDClient::require_osd_release`].
+    pub fn require_osd_release(&self) -> Option<CephRelease> {
+        self.client.require_osd_release()
     }
 
     /// Set the namespace applied to all object operations on this context.

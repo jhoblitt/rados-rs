@@ -41,7 +41,9 @@ pub use lock::{LockFlags, LockRequest, LockType, UnlockRequest};
 pub use object_io::RadosObject;
 pub use omap::{CmpOp, OmapAssertion, OmapKey, OmapKeySet, OmapKeys, OmapMap, OmapVals};
 pub use operation::{BuiltOp, OpBuilder};
-pub use osdmap::{OSDMap, OSDMapIncremental, PgMergeMeta, PgPool, PoolSnapInfo, UuidD};
+pub use osdmap::{
+    CephRelease, OSDMap, OSDMapIncremental, PgMergeMeta, PgPool, PoolSnapInfo, UuidD,
+};
 pub use pg_nls_response::{ListObjectImpl, PgNlsResponse};
 pub use pgmap_types::{ObjectstorePerfStat, PoolStat};
 pub use snapshot::SnapId;
