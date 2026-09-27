@@ -2180,6 +2180,16 @@ impl OSDClient {
         }
     }
 
+    /// The object a PGNLS request addresses: no name or key, the listed
+    /// namespace, and the cursor hash as its hobject hash, as Ceph's
+    /// `Objecter::list_nobjects` builds `object_locator_t oloc(pool_id,
+    /// list_context->nspace)` (`src/osdc/Objecter.cc:3854`).
+    fn pgnls_target(pool: u64, cursor_hash: u32, nspace: &str) -> ObjectId {
+        let mut object = ObjectId::with_namespace(pool, "", nspace);
+        object.hash = cursor_hash;
+        object
+    }
+
     /// Query objects from the PG that contains `hobject_cursor`.
     ///
     /// The target PG is derived from `hobject_cursor.hash` using `ceph_stable_mod`, matching
@@ -2190,6 +2200,7 @@ impl OSDClient {
     async fn query_pg_objects(
         &self,
         pool: u64,
+        nspace: &str,
         hobject_cursor: &crate::HObject,
         max_entries: u64,
         pool_info: &crate::osdclient::PgPool,
@@ -2216,11 +2227,9 @@ impl OSDClient {
         // Get session
         let session = self.get_or_create_session(primary_osd).await?;
 
-        // Create object ID (empty for PGNLS).
         // The hash must match the cursor's hash so the OSD's pgid.contains(head)
         // check passes — hash=0 only belongs to PG 0.
-        let mut object = ObjectId::new(pool, "");
-        object.hash = hobject_cursor.hash;
+        let object = Self::pgnls_target(pool, hobject_cursor.hash, nspace);
 
         // Create pgls operation
         let ops = vec![OSDOp::pgls(
@@ -2314,7 +2323,7 @@ impl OSDClient {
         ListResult { entries, cursor }
     }
 
-    /// List objects in a pool
+    /// List objects in a pool's default namespace
     ///
     /// Lists objects in the specified pool using PGNLS, following the cursor returned
     /// by each OSD reply (bitwise-sorted order).  The cursor is the raw hobject hash
@@ -2330,10 +2339,22 @@ impl OSDClient {
         cursor: Option<String>,
         max_entries: u64,
     ) -> Result<ListResult> {
-        debug!(
-            "list pool={} cursor={:?} max_entries={}",
-            pool, cursor, max_entries
-        );
+        self.list_in_namespace(pool, "", cursor, max_entries).await
+    }
+
+    /// List objects in one namespace of a pool, or in every namespace
+    /// when `nspace` is [`ALL_NSPACES`](crate::osdclient::ALL_NSPACES).
+    ///
+    /// As [`OSDClient::list`], whose cursors it shares; each entry carries
+    /// its namespace and locator key.
+    pub async fn list_in_namespace(
+        &self,
+        pool: u64,
+        nspace: &str,
+        cursor: Option<String>,
+        max_entries: u64,
+    ) -> Result<ListResult> {
+        debug!("list pool={pool} nspace={nspace:?} cursor={cursor:?} max_entries={max_entries}");
 
         // Fail immediately if the client has been fenced by the cluster.
         if self.blocklisted.load(Ordering::Relaxed) {
@@ -2398,7 +2419,7 @@ impl OSDClient {
 
             let remaining = max_entries.saturating_sub(all_entries.len() as u64);
             let (response, _result_code) = match self
-                .query_pg_objects(pool, &hobject_cursor, remaining, pool_info, &osdmap)
+                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, pool_info, &osdmap)
                 .await
             {
                 Ok(result) => result,
@@ -3566,7 +3587,7 @@ impl OSDClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{MOSDOp, OSDClient, OSDClientConfig};
+    use super::{MOSDOp, OSDClient, OSDClientConfig, ObjectLocator};
     use crate::osdclient::error::OSDClientError;
     use crate::osdclient::types::ObjectId;
     use crate::osdclient::types::{OpReply, OpResult};
@@ -3784,6 +3805,81 @@ mod tests {
             assert_eq!(hash, want_hash);
             assert_eq!((spg.pool, spg.seed), (2, want_seed));
         }
+    }
+
+    /// The front of a PGNLS request in `nspace` at cursor hash `hash`.
+    fn pgnls_front(nspace: &str, hash: u32) -> bytes::Bytes {
+        use crate::msgr2::ceph_message::{CephMessage, CrcFlags};
+        let object = OSDClient::pgnls_target(2, hash, nspace);
+        let cursor = crate::HObject::new(2, String::new(), hash);
+        let op = mosdop(
+            object,
+            vec![crate::osdclient::types::OSDOp::pgls(8, cursor, 1).unwrap()],
+        );
+        CephMessage::from_payload(&op, 0, CrcFlags::ALL)
+            .unwrap()
+            .front
+    }
+
+    fn encoded_locator(nspace: &str) -> Vec<u8> {
+        use crate::Denc;
+        let loc = ObjectLocator {
+            pool_id: 2,
+            key: String::new(),
+            namespace: nspace.to_string(),
+            hash: -1,
+        };
+        let mut buf = bytes::BytesMut::new();
+        loc.encode(&mut buf, 0).unwrap();
+        buf.to_vec()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn pgnls_target_carries_the_namespace() {
+        let target = OSDClient::pgnls_target(2, 0xef61efce, "ns1");
+        assert_eq!(target.namespace, "ns1");
+        assert_eq!(target.oid, "");
+        assert_eq!(target.key, "");
+        assert_eq!(target.hash, 0xef61efce);
+        assert_eq!(
+            ObjectLocator::from(&target),
+            ObjectLocator {
+                pool_id: 2,
+                key: String::new(),
+                namespace: "ns1".to_string(),
+                hash: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn pgnls_request_encodes_the_namespace() {
+        let with_ns = pgnls_front("ns1", 0xef61efce);
+        let without = pgnls_front("", 0xef61efce);
+        assert!(contains(&with_ns, &encoded_locator("ns1")));
+        assert!(contains(&without, &encoded_locator("")));
+        assert_eq!(with_ns.len(), without.len() + "ns1".len());
+    }
+
+    #[test]
+    fn pgnls_request_all_namespaces() {
+        let front = pgnls_front(crate::osdclient::ALL_NSPACES, 0xef61efce);
+        let locator = encoded_locator(crate::osdclient::ALL_NSPACES);
+        // The namespace is the locator's last string before its i64 hash.
+        let tail = [&[1u8, 0, 0, 0, 0x01][..], &(-1i64).to_le_bytes()].concat();
+        assert!(locator.ends_with(&tail));
+        assert!(contains(&front, &locator));
+    }
+
+    #[test]
+    fn pgnls_target_default_namespace_is_unnamespaced() {
+        let mut unnamespaced = ObjectId::new(2, "");
+        unnamespaced.hash = 0xef61efce;
+        assert_eq!(OSDClient::pgnls_target(2, 0xef61efce, ""), unnamespaced);
     }
 
     /// An `OSDClient` whose MonClient never connects: enough for the

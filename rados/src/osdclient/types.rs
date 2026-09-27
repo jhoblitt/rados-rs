@@ -1566,6 +1566,15 @@ pub struct PoolInfo {
 // Re-export ListObjectImpl as ListObjectEntry
 pub use crate::osdclient::pg_nls_response::ListObjectImpl as ListObjectEntry;
 
+/// The namespace that lists objects in every namespace: librados's
+/// `LIBRADOS_ALL_NSPACES` (`src/include/rados/rados_types.h:39`), which
+/// the OSD's PGNLS matches against any namespace
+/// (`src/osd/PrimaryLogPG.cc:1366-1369`).
+///
+/// It is meaningful for listing only: as in librados, an object op on a
+/// context set to it hashes the literal byte as the namespace.
+pub const ALL_NSPACES: &str = "\u{1}";
+
 /// Result of a list operation
 #[derive(Debug, Clone)]
 pub struct ListResult {
