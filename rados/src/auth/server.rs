@@ -23,8 +23,6 @@ use tracing::{debug, info, warn};
 const DEFAULT_INITIAL_GLOBAL_ID: u64 = 1000;
 /// Default service ticket TTL in seconds (1 hour)
 const DEFAULT_SERVICE_TICKET_TTL_SECS: u64 = 3600;
-/// Connection secret length; it does not depend on the key type.
-const CONNECTION_SECRET_LEN: usize = 16;
 
 /// Server-side authentication handler for CephX protocol
 ///
@@ -151,11 +149,15 @@ impl CephXServerHandler {
     ///
     /// Client sends: CephXRequestHeader + CephXAuthenticate
     /// Server responds with: session_key + service_tickets
+    ///
+    /// The connection secret is `connection_secret_len` random bytes, which
+    /// the caller takes from the negotiated mode as Ceph's msgr2 does.
     pub fn handle_authenticate(
         &mut self,
         entity_name: &EntityName,
         global_id: u64,
         payload: &[u8],
+        connection_secret_len: usize,
     ) -> Result<(CryptoKey, Bytes, Bytes)> {
         let mut buf = Bytes::copy_from_slice(payload);
 
@@ -229,7 +231,7 @@ impl CephXServerHandler {
         encrypted_session_key.encode(&mut response, 0)?;
         service_tickets.encode(&mut response, 0)?;
 
-        let connection_secret = Self::random_bytes(CONNECTION_SECRET_LEN);
+        let connection_secret = Self::random_bytes(connection_secret_len);
 
         debug!(
             "Server: Generated connection_secret: {} bytes",
@@ -477,7 +479,7 @@ mod tests {
             let mut server = CephXServerHandler::new(keyring(server_key));
             let (entity, global_id, payload) = client_payload(&mut server, client_key);
             server
-                .handle_authenticate(&entity, global_id, &payload)
+                .handle_authenticate(&entity, global_id, &payload, 0)
                 .map(|_| ())
         }
 
@@ -520,13 +522,32 @@ mod tests {
                 let bad = with_key(&payload, |k| k.wrapping_add(1));
                 assert!(
                     server
-                        .handle_authenticate(&entity, global_id, &bad)
+                        .handle_authenticate(&entity, global_id, &bad, 0)
                         .is_err()
                 );
                 server
-                    .handle_authenticate(&entity, global_id, &payload)
+                    .handle_authenticate(&entity, global_id, &payload, 0)
                     .unwrap();
             }
+        }
+
+        #[test]
+        fn connection_secret_has_the_mode_length() {
+            use crate::auth::protocol::{
+                CEPH_CON_MODE_CRC, CEPH_CON_MODE_SECURE, CONNECTION_SECRET_MIN_LEN,
+                connection_secret_len,
+            };
+            assert_eq!(connection_secret_len(CEPH_CON_MODE_SECURE), 64);
+            assert_eq!(connection_secret_len(CEPH_CON_MODE_CRC), 0);
+            for mode in [CEPH_CON_MODE_SECURE, CEPH_CON_MODE_CRC] {
+                let mut server = CephXServerHandler::new(keyring(AES_TEST_KEY));
+                let (entity, global_id, payload) = client_payload(&mut server, AES_TEST_KEY);
+                let (_, secret, _) = server
+                    .handle_authenticate(&entity, global_id, &payload, connection_secret_len(mode))
+                    .unwrap();
+                assert_eq!(secret.len(), connection_secret_len(mode));
+            }
+            assert!(connection_secret_len(CEPH_CON_MODE_SECURE) >= CONNECTION_SECRET_MIN_LEN);
         }
 
         // The literal is the Python-computed fold of the client challenge test.
@@ -548,11 +569,11 @@ mod tests {
                 out.freeze()
             };
             server
-                .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d33))
+                .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d33), 0)
                 .unwrap();
             assert!(
                 server
-                    .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d32))
+                    .handle_authenticate(&entity, 4242, &payload(0x46778d1186712d32), 0)
                     .is_err()
             );
         }

@@ -441,8 +441,12 @@ impl AuthServer {
             .connection_mode
             .ok_or_else(|| Error::protocol_error("Missing connection_mode in phase 1"))?;
 
-        let (session_key, connection_secret, auth_payload) =
-            handler.handle_authenticate(entity_name, global_id, &auth_payload)?;
+        let (session_key, connection_secret, auth_payload) = handler.handle_authenticate(
+            entity_name,
+            global_id,
+            &auth_payload,
+            crate::auth::protocol::connection_secret_len(connection_mode),
+        )?;
         tracing::info!("Server: {entity_name} authenticated successfully");
 
         let done_payload = handler.build_auth_done_response(
@@ -461,7 +465,7 @@ impl AuthServer {
                 global_id,
                 connection_mode,
                 session_key: Some(session_key.secret.clone()),
-                connection_secret: Some(connection_secret),
+                connection_secret: (!connection_secret.is_empty()).then_some(connection_secret),
             },
             Some(done_frame),
         ))

@@ -33,6 +33,16 @@ pub const CEPH_CON_MODE_SECURE: u32 = 0x2;
 /// and two 12-byte nonces, which C++ `rxtx_t::create_handler_pair` asserts.
 pub const CONNECTION_SECRET_MIN_LEN: usize = 16 + 2 * 12;
 
+/// Connection secret length a server generates for a connection mode, as C++
+/// `AuthConnectionMeta::get_connection_secret_length`: four 16-byte blocks
+/// for SECURE, none for CRC.
+pub fn connection_secret_len(con_mode: u32) -> usize {
+    match con_mode {
+        CEPH_CON_MODE_SECURE => 16 * 4,
+        _ => 0,
+    }
+}
+
 /// A SECURE-mode connection secret: the given one, or an error when it is
 /// missing or too short to key the connection. Ceph never continues a SECURE
 /// connection without one.
