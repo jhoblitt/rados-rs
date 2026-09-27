@@ -856,8 +856,11 @@ model. The PR body:
   then `dir_suggest_changes` in both listing paths (v20.2.4
   `rgw_rados.cc:10823` and `:11061`; v19.2.6 `:9902` and `:10138` send
   the suggestion bare). The doc names both sets, and a gateway at
-  Tentacle level guards its listing-time suggestions. Listing, index
-  check/rebuild and init stay unguarded in both releases.
+  Tentacle level guards its listing-time suggestions. The completion
+  manager's retry of `bucket_complete_op` is guarded too (v19.2.6
+  `rgw_rados.cc:917`, v20.2.4 `:955`). Listing, index check/rebuild,
+  init and `set_tag_timeout` stay unguarded in both releases. The same
+  per-release list is canonical in rgw-go's `docs/exclusions.md`.
 - Duplicate keys in a decoded map (settled by the rgw-go session with
   ceph-dencoder on v19.2.6 and v20.2.4 using crafted inputs): when the
   key or the value is a struct with its own encode/decode, C++ decodes
