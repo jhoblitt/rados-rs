@@ -588,6 +588,263 @@ against v19.2.2.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The monitor reports a
   refused cephx key type as EINVAL".
 
+## CEPH-BUG-017: radosgw caches any control-pool notifier's UPDATE_OBJ payload, and a read cap can send one
+
+- **Component:** radosgw, the system-object cache (`RGWSI_SysObj_Cache`)
+  and the control-pool watch that feeds it (`RGWSI_Notify`).
+- **Status:** confirmed. The behaviour is radosgw's trust model; see the
+  last Symptom item.
+- **Symptom:**
+  - Every radosgw in a zone watches the zone's control objects in
+    `<zone>.rgw.control`, and passes each notify to its metadata cache.
+  - An `UPDATE_OBJ` record replaces the cached copy of the object it names
+    with the record's status, data, attributes and version.
+  - Reads are then served from that copy, without RADOS, until one of
+    these happens:
+    - `rgw_cache_expiry_interval` passes: 900 s by default, never at 0;
+    - the entry is evicted;
+    - a later update replaces it.
+  - The cache holds user records and the access-key index, among other
+    system objects.
+    - A gateway can therefore authenticate and authorise against a record
+      that no RADOS object holds.
+    - A record whose status is `ENOENT` makes an existing object read as
+      missing.
+  - Nothing identifies the sender:
+    - the record carries no signature;
+    - the callback does not look at the notifier's id;
+    - the ack goes out whatever the callback returns, so a notifier cannot
+      tell an applied record from a rejected one.
+  - RADOS classes `notify` as a read, so read access to the control pool
+    is enough to send one.
+  - This is by design. The expiry option's own description says the
+    notify relay keeps the gateways' caches consistent, and radosgw treats
+    every notifier as a peer gateway.
+    - It is recorded because that boundary is wider than the gateway
+      principals it was drawn for. A principal with read-only access to
+      the control pool, or to every pool, can change what each gateway in
+      the zone believes.
+    - A principal that can also read the meta pool can already read every
+      user's secret key. What the notify adds is state that no RADOS object
+      holds.
+- **Affected:** every tag checked: v19.2.2, v19.2.6, v20.2.4, v21.1.1 and
+  main.
+- **Fixed in:** none.
+- **Evidence:** source reading. It has not been exercised on a cluster.
+  - `v19.2.6:src/rgw/services/svc_notify.cc:77` hands every notify to the
+    cache callback and discards its result. `:79-80` ack it.
+  - `v19.2.6:src/rgw/services/svc_sys_obj_cache.cc:465-502` is the
+    callback:
+    - it decodes the record at `:475`;
+    - for `UPDATE_OBJ` it puts the record's object info into the cache
+      (`:490-491`);
+    - it never reads `notifier_id`.
+  - `v19.2.6:src/rgw/rgw_cache.h:96-101`: the record holds an op, an
+    object, the object info, an offset and a namespace.
+  - `v19.2.6:src/rgw/rgw_cache.cc:142-215`: `put` stamps `time_added`
+    (`:155`) and copies status, attributes, data and version from the
+    record.
+  - `get` (`:13-96`) drops an entry only after `rgw_cache_expiry_interval`
+    (`:30-31`), and answers an `ENOENT` entry with `ENODATA` (`:72-75`).
+  - `v19.2.6:src/rgw/services/svc_sys_obj_cache.cc:146-177`: a cache hit
+    returns the cached bytes without reading RADOS, and `ENODATA` becomes
+    `ENOENT`.
+  - `v19.2.6:src/rgw/driver/rados/rgw_service.cc:122-124` routes
+    system-object reads through the cache when `rgw_cache_enabled` is on.
+    That is the default (`v19.2.6:src/common/options/rgw.yaml.in:288-297`).
+  - Access-key lookup reads its index through that service
+    (`v19.2.6:src/rgw/services/svc_user_rados.cc:651-656,765-787`).
+  - `v19.2.6:src/common/options/rgw.yaml.in:3324-3336` defines
+    `rgw_cache_expiry_interval`: its default of 900, and the long_desc
+    about notify consistency.
+  - The cap:
+    - `v19.2.6:src/include/rados.h:258` makes `NOTIFY` a read-mode op;
+    - `v19.2.6:src/osd/osd_op_util.cc:120-124` sets only the read flag for
+      it;
+    - `v19.2.6:src/osd/PG.cc:390-396` checks caps against those flags.
+  - The user record stores each secret key
+    (`v19.2.6:src/rgw/rgw_acl_types.h:46,58`).
+  - The same apply path is at:
+    - `v19.2.2`: `svc_notify.cc:76-79`, `svc_sys_obj_cache.cc:490-491`;
+    - `v20.2.4` and `v21.1.1`: `svc_notify.cc:75-78`,
+      `svc_sys_obj_cache.cc:490-491`;
+    - main: `svc_notify.cc:75-78`, `svc_sys_obj_cache.cc:505-506`.
+  - `NOTIFY` is still read-mode on main (`src/include/rados.h:260`).
+- **rados-rs:** unaffected; this is radosgw's cache. For rgw-rs:
+  - Its design keeps the gateway's cephx caps as narrow as radosgw needs,
+    because every gateway in the zone trusts the notify channel
+    (jhoblitt/rgw-rs design spec draft, section 17).
+  - Its cache is to drop the entry an `UPDATE_OBJ` names and re-read it,
+    rather than store the payload, so a notify can cost it a read but
+    cannot plant a record (owner-agreed design, to be added to the rgw-rs
+    spec in its review edits).
+  - It still sends the full record on its own metadata writes, because
+    radosgw applies it (section 8).
+- **Found:** rgw-rs design planning, 2026-09-27, as an unverified
+  candidate. It was confirmed from source the same day.
+- **Upstream:** not filed. The owner chose on 2026-09-27 to record it
+  publicly without a report.
+
+## CEPH-BUG-018: radosgw aborts after 100 failed control-watch re-registrations, counted over its whole life
+
+- **Component:** radosgw, `RGWWatcher` in
+  `src/rgw/services/svc_notify.cc`.
+- **Status:** confirmed. Whether an outage reaches the abort is derived
+  from the code; it has not been reproduced.
+- **Symptom:**
+  - When a control-object watch breaks, radosgw drops the watcher and
+    re-registers it on its finisher thread.
+    - Each failed unwatch or watch adds one to a per-watcher counter.
+    - The next attempt is queued at once, with no delay.
+  - The first attempt after the counter passes 100 calls `abort()`, and
+    radosgw exits on SIGABRT.
+  - The counter is never reset, not even by a successful re-registration.
+    - Failures from separate incidents therefore add up over the process's
+      life.
+    - Yet the log line says "Looping in attempt to reinit watch", and the
+      commit that added it describes "a maximum retry timeout".
+  - A failed unwatch both queues a retry and goes on to a watch attempt.
+    One failure can therefore start two retry chains that share the
+    counter.
+  - A transient mon or OSD outage does not reach it with default settings:
+    - `rados_osd_op_timeout` defaults to 0, and librados then arms no
+      timeout for the watch and unwatch calls, so an outage makes them
+      wait rather than fail;
+    - the counter moves only when a call returns an error;
+    - the OSD answers an unwatch of a watch it no longer holds with
+      success.
+  - It becomes reachable in two ways:
+    - with `rados_osd_op_timeout` set, each attempt during an outage fails
+      when that timeout expires and the next starts at once, so an outage
+      long enough for more than 100 attempts to time out aborts the
+      gateway;
+    - failures that accumulate across separate incidents.
+- **Affected:**
+  - Squid from v19.2.3, through ff248d7ed94 (ceph/ceph PR #62402).
+  - v20.1.0 onward, through 34366f0f0d8 (ceph/ceph PR #62253).
+  - Checked at v19.2.6, v20.2.4, v21.1.1 and main.
+  - v19.2.2 and v20.0.0 have no counter. Their `reinit` retries without
+    limit, also with no delay (`v19.2.2:src/rgw/services/svc_notify.cc:88-101`).
+- **Fixed in:** none.
+- **Evidence:** source reading.
+  - `v19.2.6:src/rgw/services/svc_notify.cc:36` declares `retries = 0`.
+    `:103` and `:111` increment it, and nothing else assigns it.
+  - `:90-93` abort once it exceeds 100.
+  - `:82-87`: `handle_error` removes the watcher and queues `reinit`.
+  - `:104` and `:112` queue each retry on the finisher, which is a plain
+    `queue` (`v19.2.6:src/rgw/services/svc_finisher.cc:54-57`).
+  - `:95-108`: after an unwatch that fails with anything but `ENOENT`,
+    `reinit` queues a retry and still calls `register_watch` (`:108`).
+  - librados waits for the call to finish:
+    `v19.2.6:src/librados/IoCtxImpl.cc:1671` for the watch, `:1762` for
+    the unwatch.
+  - `v19.2.6:src/osdc/Objecter.cc:2317-2324` arms an op timeout only when
+    `rados_osd_op_timeout` is above 0.
+    - Its default is 0 (`v19.2.6:src/common/options/global.yaml.in:6379-6384`).
+    - Nothing under `src/rgw` sets it.
+  - `v19.2.6:src/osd/PrimaryLogPG.cc:6971,7027-7039` leaves the result at
+    0 for an unwatch of an unknown watch.
+  - The same logic is at
+    `v20.2.4:src/rgw/services/svc_notify.cc:31,88-91,101,109`, and on the
+    same lines at v21.1.1 and main. Only a `null_yield` argument was
+    added.
+  - 34366f0f0d8, "rgw: Try to handle unwatch errors sensibly", added the
+    counter and the abort. Its message reads "add a maximum retry
+    timeout".
+- **rados-rs:** unaffected; the abort is in radosgw. For rgw-rs:
+  - Its design delivers a broken watch as an event on the watcher.
+  - rados-rs reconnects the watch on session resets, map changes, and
+    every five seconds while it is in error.
+  - The driver watches again after a not-connected error (jhoblitt/rgw-rs
+    design spec draft, section 7).
+  - The design sets no retry limit, and its lints make a panic in
+    production code a build failure (section 11).
+- **Found:** rgw-rs design planning, 2026-09-27, as an unverified
+  candidate. It was confirmed from source the same day.
+- **Upstream:** not filed. The abort came with the fix for tracker #70422
+  (tracker not checked).
+
+## CEPH-BUG-019: radosgw accepts 0 for its GC, lifecycle and usage shard counts, then faults on first use
+
+- **Component:** radosgw's option table (`src/common/options/rgw.yaml.in`),
+  and the GC, lifecycle and usage-log code that shards by those options.
+- **Status:** confirmed.
+- **Symptom:**
+  - `rgw_gc_max_objs`, `rgw_lc_max_objs` and `rgw_usage_max_shards` are
+    `int` options with no `min:`. The option system therefore accepts 0,
+    and negative values too.
+  - Their neighbour `rgw_usage_max_user_shards` has `min: 1`.
+  - `rgw_gc_max_objs = 0`:
+    - the GC shard-name array has no elements;
+    - a chain's shard index comes back as -1;
+    - so sending a chain to GC reads before the start of the array, which
+      is undefined behaviour;
+    - the first overwrite or delete of an object that has tail objects
+      does this;
+    - before v19.2.3 and v20.1.0 the shard helper had no guard for 0, and
+      the same path was an integer division by zero instead.
+  - `rgw_lc_max_objs = 0`: finding a bucket's lifecycle shard is an integer
+    division by zero (SIGFPE). An S3 PutBucketLifecycleConfiguration or
+    DeleteBucketLifecycle does this.
+  - `rgw_usage_max_shards = 0`: naming a usage-log shard is an integer
+    division by zero. Two things do this:
+    - radosgw's usage-log flush, when `rgw_enable_usage_log` is on;
+    - any usage read or trim.
+  - Only an administrator can set these options. Once one of them is 0,
+    ordinary S3 requests reach the fault.
+- **Affected:** every tag checked: v19.2.2, v19.2.6, v20.2.4, v21.1.1 and
+  main.
+- **Fixed in:** none.
+  - 456a5e661d1 (squid, v19.2.3, ceph/ceph PR #62884) and a2b76b0e09e
+    (v20.1.0, ceph/ceph PR #62850) guard `rgw_shards_mod` against 0.
+  - That guard was for a shard count a radosgw-admin user types. For GC it
+    only turned the division by zero into the out-of-bounds read.
+- **Evidence:** source reading. None of it was run, because each case
+  crashes or corrupts a gateway.
+  - Options:
+    - `v19.2.6:src/common/options/rgw.yaml.in:427-436` (`rgw_lc_max_objs`),
+      `:1515-1527` (`rgw_usage_max_shards`) and `:1692-1701`
+      (`rgw_gc_max_objs`) set no `min:`;
+    - `:1528-1541` (`rgw_usage_max_user_shards`) has `min: 1` at `:1540`;
+    - the same holds on main, at `:489-499`, `:1846-1865` and `:2026-2048`.
+  - GC:
+    - `v19.2.6:src/rgw/driver/rados/rgw_gc.cc:35-37` sizes the name array
+      from the option;
+    - `:63-66` compute the index through
+      `v19.2.6:src/rgw/driver/rados/rgw_tools.h:46-49`, which returns -1
+      for a count of 0 or less;
+    - `rgw_gc.cc:128` takes that index, and `:132` reads `obj_names[i]`.
+  - What reaches GC: `v19.2.6:src/rgw/driver/rados/rgw_rados.cc:5400`, in
+    `complete_atomic_modification` (`:5382`). That is called on write
+    (`:3314`) and on delete (`:5963`).
+  - `v19.2.2:src/rgw/driver/rados/rgw_tools.h:48-49` has no guard, and
+    computes `hval % RGW_SHARDS_PRIME_0 % max_shards`.
+  - Lifecycle:
+    - `v19.2.6:src/rgw/rgw_lc.cc:1974` takes the hash modulo the option;
+    - `get_lc_oid` (`:1978-1988`) calls it from `guard_lc_modify` (`:2593`)
+      and from `fix_lc_shard_entry` (`:2715`);
+    - `guard_lc_modify` serves `set_bucket_config` (`:2659`) and
+      `remove_bucket_config` (`:2686`);
+    - the S3 ops call those at `v19.2.6:src/rgw/rgw_op.cc:6020` (PUT) and
+      `:6038` (DELETE).
+  - Usage:
+    - `v19.2.6:src/rgw/driver/rados/rgw_rados.cc:1625-1626` take the
+      modulo;
+    - `log_usage` (`:1654`), `read_usage` (`:1681`) and `trim_usage`
+      (`:1723`) call it;
+    - the flush is `v19.2.6:src/rgw/rgw_log.cc:174`, gated at `:558-559`.
+  - The same code is on each later tag:
+    - `v20.2.4`: `rgw_gc.cc:128,132`, `rgw_lc.cc:2031`, `rgw_rados.cc:1729`;
+    - `v21.1.1`: `rgw_gc.cc:129,133`, `rgw_lc.cc:2424`, `rgw_rados.cc:1797`;
+    - main: `rgw_gc.cc:129,133`, `rgw_lc.cc:2490`, `rgw_rados.cc:1817`.
+- **rados-rs:** unaffected; these are radosgw's options. rgw-rs is to
+  refuse a shard count below 1 when it loads its configuration, rather
+  than fault on first use (to be added to the rgw-rs spec in its review
+  edits).
+- **Found:** rgw-rs design planning, 2026-09-27, as an unverified
+  candidate. It was confirmed from source the same day.
+- **Upstream:** not filed.
+
 ## Considered and excluded
 
 - **Map decode with duplicate keys** (candidate 4).
