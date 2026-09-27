@@ -75,7 +75,7 @@ impl Keyring {
                             .insert(service.to_string(), cap_value.to_string());
                     }
                     _ => {
-                        warn!("Unknown keyring field: {} = {}", key, value);
+                        warn!("Unknown keyring field: {key}");
                     }
                 }
             }
