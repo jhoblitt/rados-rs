@@ -37,13 +37,15 @@ against v19.2.2.
   - `reserved_size` therefore grows by ten bytes per reserved entry, until
     `2pc_queue_reserve` answers `ENOSPC` on a queue that has room.
   - radosgw turns that `ENOSPC` into a rate-limit error.
-- **Affected:** v16.1.0 (the first form, 4fba777a1d1) through v19.2.3, and
-  v20.2.0 through v20.2.2.
-- **Fixed in:**
-  - v19.2.4: b97fe168f62 (subtracts the overhead) and 8f86e0926f4 (one-time
-    recompute).
-  - v20.2.3: 98ed23288db and 7a8f84046b8.
-  - v21.0.0 and main: 00ad83d3ab2 and 7f4eaee30cb.
+- **Affected:** v16.1.0 (the first form, 4fba777a1d1) through v19.2.3,
+  v20.2.0 through v20.2.2, and the v20.0.0, v20.1.x and v20.3.0
+  pre-release tags.
+- **Fixed in:** each series carries its own pair. The first commit of each
+  pair subtracts the overhead, the second recomputes `reserved_size` once.
+  - Squid only, v19.2.4 onward: b97fe168f62 and 8f86e0926f4.
+  - Tentacle only, v20.2.3 onward: 98ed23288db and 7a8f84046b8.
+  - v21.0.0 onward and main: 00ad83d3ab2 and 7f4eaee30cb. The squid and
+    tentacle pairs are cherry-picks of these.
   - The recompute is incomplete; see CEPH-BUG-002.
 - **Evidence:**
   - Source reading:
@@ -62,7 +64,8 @@ against v19.2.2.
   found it independently.
 - **Upstream:** fixed by ceph/ceph PR #67169 (main), #67575 (squid) and
   #67576 (tentacle). No tracker is cited.
-- **See also:** rgw-go, "The 2pc queue's reserved size drifts upward".
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The 2pc queue's
+  reserved size drifts upward".
 
 ## CEPH-BUG-002: cls_2pc_queue's self-heal is skipped when another write comes first
 
@@ -72,29 +75,32 @@ against v19.2.2.
   - A fixed OSD recomputes `reserved_size` only inside `reserve`, and only
     for a head it decodes below v3.
   - `commit`, `abort`, `expire_reservations` and `remove_entries` re-encode
-    the head at v3 without recomputing.
+    the head at v3 without recomputing. `expire_reservations` writes the
+    head only when it removes a stale reservation.
   - A queue that drifted under CEPH-BUG-001 keeps that drift for good if its
     first write after the upgrade is one of those four, so the spurious
     `ENOSPC` persists.
 - **Affected:** v19.2.4 and later, v20.2.3 and later, v21.0.0 and later, and
   main, on any queue that drifted under an earlier release.
 - **Fixed in:** none, as of main.
-- **Evidence:** source reading.
-  - `v19.2.4:src/cls/2pc_queue/cls_2pc_queue.cc:135-137` recomputes only
-    when `decoded_struct_v < 3`, inside `reserve`.
-  - `v19.2.4:src/cls/2pc_queue/cls_2pc_queue_types.h:72` encodes with
+- **Evidence:** source reading. `src/cls/2pc_queue/` is unchanged from
+  v19.2.4 to v19.2.6.
+  - `v19.2.6:src/cls/2pc_queue/cls_2pc_queue.cc:135` gates the recompute on
+    `decoded_struct_v < 3`, inside `reserve`.
+  - `v19.2.6:src/cls/2pc_queue/cls_2pc_queue_types.h:72` encodes with
     `ENCODE_START(3, 1, bl)` every time.
-  - The head is re-encoded with no recompute at `cls_2pc_queue.cc:370-371`
-    (commit), `:457-458` (abort), `:601-602` (expire) and `:697-698`
-    (remove_entries).
-  - The same check is at `v20.2.3:…:137` and `main:…:137`.
+  - The head is re-encoded with no recompute at `cls_2pc_queue.cc:371`
+    (commit), `:458` (abort), `:602` (expire) and `:698` (remove_entries).
+    The expire write sits under `:597`, which requires a stale reservation.
+  - The same gate is at `v20.2.3:…:137` and `main:…:137`.
 - **rados-rs:** a doc note only. The `two_pc_queue.rs` module doc says that
   version 3 does not mean `reserved_size` is exact (2d8becf, PR #16). No
   test pins it.
 - **Found:** rados-rs plan 14, PR #16, 2026-09-25. rgw-go found it
   independently.
 - **Upstream:** not filed.
-- **See also:** rgw-go, "The 2pc queue's reserved size drifts upward".
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The 2pc queue's
+  self-heal is skipped when another write comes first".
 
 ## CEPH-BUG-003: cls_2pc_queue hands out reservation id 0, which radosgw treats as "none"
 
@@ -106,8 +112,11 @@ against v19.2.2.
     does not skip 0.
   - After 2^32 reservations on one queue, a reserve therefore returns id 0,
     which is `NO_ID`.
-  - radosgw does not commit a reservation whose id is `NO_ID`. That event is
-    lost, and its reservation holds space until it expires.
+  - radosgw neither commits nor aborts a reservation whose id is `NO_ID`.
+    That event is lost, and its reservation's space stays reserved until
+    the reservation expires.
+  - The class itself treats id 0 like any other id: it commits or aborts
+    reservation 0 normally.
   - It happens once per wrap.
 - **Affected:** every tag checked: v19.2.6, v20.2.4, v21.1.0 and main.
 - **Fixed in:** none.
@@ -118,11 +127,16 @@ against v19.2.2.
   - `v19.2.6:src/cls/2pc_queue/cls_2pc_queue.cc:186` does
     `++urgent_data.last_id`.
   - `v19.2.6:src/rgw/driver/rados/rgw_notify.cc:1149` takes the id as
-    returned, and `:1174` skips the commit when it is `NO_ID`.
+    returned, `:1174` skips the commit when it is `NO_ID`, and `:1283-1284`
+    skip the abort.
+  - `v19.2.6:src/cls/2pc_queue/cls_2pc_queue.cc:292` (commit) and `:401`
+    (abort) look the id up in the reservation map, with no `NO_ID` check.
 - **rados-rs:** a doc note on `NO_ID` in `rados-cls/src/two_pc_queue.rs`
   (046b45f, PR #16).
 - **Found:** rados-rs, PR #16, 2026-09-25.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The 2pc queue hands
+  out reservation id 0, which radosgw treats as none".
 
 ## CEPH-BUG-004: radosgw's notification-queue registry listing never advances past 1024 keys
 
@@ -136,10 +150,11 @@ against v19.2.2.
 - **Affected:**
   - All of Squid: v19.2.2, v19.2.6 and the squid branch at a742f50616e were
     checked.
-  - v20.2.0 through v20.2.2.
+  - v20.2.0 through v20.2.2, and the v20.0.0, v20.1.x and v20.3.0
+    pre-release tags.
 - **Fixed in:**
-  - v20.2.3: 15de1799510.
-  - main and v21.1.0: b984980897d.
+  - v21.0.0 onward and main: b984980897d.
+  - Tentacle, v20.2.3 onward: 15de1799510, a cherry-pick of b984980897d.
   - There is no squid backport as of a742f50616e.
 - **Evidence:** source reading.
   - `v19.2.6:src/rgw/driver/rados/rgw_notify.cc:108` declares `start_after`,
@@ -149,8 +164,11 @@ against v19.2.2.
   (2d8becf, PR #16).
 - **Found:** rados-rs cls_2pc_queue research, 2026-09-25. rgw-go records it
   in its `docs/exclusions.md`.
-- **Upstream:** filed and fixed. The tracker is #73812. The fix is ceph/ceph
-  PR #66246 (main) and #66491 (tentacle). There is no squid backport.
+- **Upstream:** filed and fixed. Both fix commits cite tracker #73812 in a
+  `Fixes:` line. The fix is ceph/ceph PR #66246 (main) and its backport
+  #66491 (tentacle). There is no squid backport.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "radosgw's notification
+  queue listing never pages past 1024 queues".
 
 ## CEPH-BUG-005: cls_rgw usage trim never removes a payer-keyed record, and never reports done
 
@@ -163,6 +181,10 @@ against v19.2.2.
     never `ENODATA`.
   - radosgw's own trim loop runs until `ENODATA`, so `radosgw-admin usage
     trim` and the admin-ops usage trim spin for ever over such a record.
+  - A trim filtered by the payer finds the payer's record and removes the
+    owner's keys for its epoch and bucket. The owner's own record for the
+    same hour and bucket is therefore deleted, although the filter excludes
+    it.
 - **Affected:** every release checked before v21: v19.2.2 through v19.2.6,
   v20.2.0 through v20.2.4, and the heads of the squid (a742f50616e) and
   tentacle (9208ed9a291) branches.
@@ -173,6 +195,10 @@ against v19.2.2.
     - `v19.2.2:src/cls/rgw/cls_rgw.cc:3592` keys records by payer; `:3770`
       builds the keys to remove from the owner; `:3808` answers `ENODATA`
       only when nothing was found and the scan was not truncated.
+    - A trim filtered by user scans that user's keys (`:3654`), and
+      `:3770-3778` then removes the owner's by-time and by-user keys.
+      radosgw rounds a record's epoch to the hour
+      (`v19.2.6:src/rgw/rgw_log.cc:136,143`).
     - The unbounded loops are `v19.2.2:src/cls/rgw/cls_rgw_client.cc:838-847`
       and `v19.2.2:src/rgw/driver/rados/rgw_rados.cc:10092-10106`.
     - The same code is at `v20.2.4:src/cls/rgw/cls_rgw.cc:4163,4201`.
@@ -187,6 +213,8 @@ against v19.2.2.
 - **Found:** rados-rs plan 09, 2026-09-25.
 - **Upstream:** not filed as such. ceph/ceph PR #65329 fixed it in passing,
   on main only.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw usage trim
+  never removes a payer-keyed record".
 
 ## CEPH-BUG-006: cls_rgw usage trim with a bucket filter never reports done past 1000 skipped keys
 
@@ -222,6 +250,8 @@ against v19.2.2.
 - **Found:** the rados-rs plan 09 review, 2026-09-25. The radosgw-admin hang
   was traced on 2026-09-27.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw usage trim
+  with a bucket filter stalls behind 1000 other records".
 
 ## CEPH-BUG-007: cls_rgw link_olh refuses a delete marker on top of a delete marker
 
@@ -231,20 +261,35 @@ against v19.2.2.
   - A `link_olh` with `delete_marker` set, for a key whose OLH already
     points at a delete marker, answers `ENOENT` and links nothing.
   - A second delete marker therefore cannot be created.
-  - Tracker #63799 describes the multisite effect: lifecycle leaves zones
-    with delete markers that differ.
-- **Affected:** v17.1.0 (69d7589fb13, from ceph/ceph PR #41897) through
-  v19.2.2. Reef was not checked.
-- **Fixed in:** v19.2.3 (9cca4fd435a), and v20.1.0 and later (65e3e9b5888).
-- **Evidence:** source reading. `v19.2.2:src/cls/rgw/cls_rgw.cc:1676-1692`
-  answers `-ENOENT` for a delete marker on a new instance when the OLH
-  already refers to one. 9cca4fd435a removes the check; its message is
-  "rgw: revert PR #41897 to allow multiple delete markers to be created".
+  - Tracker #63799 (tracker not verified; tracker.ceph.com unreachable)
+    describes the multisite effect: lifecycle leaves zones with delete
+    markers that differ.
+- **Affected:**
+  - Pacific from v16.2.6, through the backport 1e575378b00 (ceph/ceph
+    PR #42645), to v16.2.15.
+  - v17.1.0 (69d7589fb13, from ceph/ceph PR #41897) through v19.2.2. That
+    is all of Quincy and Reef, through v18.2.8.
+  - v20.0.0.
+  - The pacific, quincy and reef branch heads carry no revert.
+- **Fixed in:**
+  - Squid, v19.2.3 onward: 9cca4fd435a (ceph/ceph PR #62740).
+  - v20.1.0 onward and main: 65e3e9b5888 (ceph/ceph PR #54957).
+- **Evidence:** source reading.
+  - `v19.2.2:src/cls/rgw/cls_rgw.cc:1676-1692` answers `-ENOENT` for a
+    delete marker on a new instance when the OLH already refers to one.
+  - The same check is at `v16.2.6:…:1572-1577`, `v17.2.9:…:1577-1582`,
+    `v18.2.8:…:1703-1708` and `v20.0.0:…:1827-1832`. It is absent from
+    v16.2.5, v19.2.3 and v20.1.0.
+  - 9cca4fd435a removes the check; its message is "rgw: revert PR #41897 to
+    allow multiple delete markers to be created".
 - **rados-rs:** the per-release behaviour is documented on `link_olh` in
   `rados-cls/src/rgw/olh.rs` (e3f85c3, PR #21). No test pins it.
 - **Found:** rados-rs release-shapes research (plan 16), 2026-09-25.
-- **Upstream:** filed and fixed. The tracker is #63799 (Resolved). The fix
+- **Upstream:** filed and fixed. The tracker is #63799 (tracker not
+  verified; tracker.ceph.com unreachable); no fix commit cites it. The fix
   is ceph/ceph PR #54957 (main) and #62740 (squid).
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "Squid before 19.2.3
+  refuses a delete marker on top of a delete marker".
 
 ## CEPH-BUG-008: cls_rgw complete_op writes a stale epoch onto the entry when it cancels
 
@@ -261,13 +306,13 @@ against v19.2.2.
     indexed over object 10.
   - The fallback has been observed. The overwrite is derived from the code
     and has not been reproduced.
-- **Affected:** every release checked: v19.2.2, v19.2.6, v20.2.0, v20.2.4,
-  v21.1.0 and main.
+- **Affected:** v19.2.2 through main. Checked at v19.2.2, v19.2.6, v20.2.0,
+  v20.2.4, v21.1.0 and main.
 - **Fixed in:** none.
 - **Evidence:**
   - Source reading: `v19.2.6:src/cls/rgw/cls_rgw.cc:1082-1086` turns a stale
     epoch into `CANCEL`; `:1094` does `entry.ver = op.ver` before the cancel
-    branch; `:1116-1117` writes the entry back in the cancel branch.
+    branch; `:1115-1117` writes the entry back in the cancel branch.
   - Cluster test `index_stale_epoch_is_a_cancel`: after completes at epochs
     10 down to 1, the entry reads `ver.epoch == 1`.
 - **rados-rs:** `index_stale_epoch_is_a_cancel` pins it (e687b90, PR #10).
@@ -275,6 +320,8 @@ against v19.2.2.
 - **Found:** rados-rs plan 07, 2026-09-25, as a pinned fact. It was
   classified as a defect on 2026-09-27.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw complete_op
+  writes a stale epoch back when it cancels".
 
 ## CEPH-BUG-009: cls_rgw encode_packed_val writes 0x10000 as 0
 
@@ -304,6 +351,8 @@ against v19.2.2.
   (`rados-cls/src/rgw/packed.rs`, 8b83b69, PR #9).
 - **Found:** rados-rs plan 06, 2026-09-25.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw encodes a
+  packed value of exactly 65536 as 0".
 
 ## CEPH-BUG-010: Squid radosgw sends listing-time index suggestions unguarded during a reshard
 
@@ -333,8 +382,8 @@ against v19.2.2.
   (PR #21) documented it the same day.
 - **Upstream:** fixed by ceph/ceph PR #59609 (main). No tracker is cited,
   and the fix is not on squid.
-- **See also:** rgw-go, "Squid does not guard listing-time index suggestions
-  against resharding".
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "Squid does not guard
+  listing-time index suggestions against resharding".
 
 ## CEPH-BUG-011: cls_lock get_info and assert_locked fail with EIO on an expired ephemeral lock
 
@@ -366,6 +415,8 @@ against v19.2.2.
   pinned by `expired_ephemeral_read_is_eio` (e137d2d, PR #15).
 - **Found:** rados-rs cls_lock research, 2026-09-25.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_lock get_info and
+  assert_locked fail with EIO on an expired ephemeral lock".
 
 ## CEPH-BUG-012: cls_otp divides by a zero step_size and crashes the OSD
 
@@ -395,8 +446,10 @@ against v19.2.2.
   (`rados-cls/src/otp.rs`, 5b8fe0c, PR #17), tested by
   `zero_step_size_is_refused_before_sending`.
 - **Found:** rados-rs cls_otp research, with a liboath probe, 2026-09-25.
-- **Upstream:** not filed. It lets a client crash an OSD, so a report should
-  consider Ceph's security channel.
+- **Upstream:** not filed, by the owner's decision of 2026-09-27: leave it
+  public and do not report it. It was already public in rados-rs's
+  `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123) from
+  2026-09-26.
 
 ## CEPH-BUG-013: cls_otp records the wrong replay index for a past-step match
 
@@ -426,8 +479,10 @@ against v19.2.2.
 - **rados-rs:** documented in `rados-cls/src/otp.rs` (5b8fe0c, PR #17) and
   pinned by `otp_past_step_quirk` (9ce2255, PR #17).
 - **Found:** rados-rs cls_otp research, 2026-09-25.
-- **Upstream:** not filed. It weakens replay protection, so a report should
-  consider Ceph's security channel.
+- **Upstream:** not filed, by the owner's decision of 2026-09-27: leave it
+  public and do not report it. It was already public in rados-rs's
+  `rados-cls/src/otp.rs` docs (fork main, tchaikov/rados-rs#123) from
+  2026-09-26.
 
 ## CEPH-BUG-014: cls_version's client header documents EAGAIN, but the class returns ECANCELED
 
@@ -437,17 +492,27 @@ against v19.2.2.
   - The header says a conditional `inc` returns `-EAGAIN` when its condition
     fails. Both `inc` and `check` return `-ECANCELED`.
   - A client written from the header misses the race signal.
+  - The code's behaviour is intended: radosgw relies on `-ECANCELED`, and
+    Ceph's own test asserts it. Only the header comment is wrong.
+  - It stays in the registry because the spec counts code that contradicts
+    its own documentation. rgw-go records it as a quirk.
 - **Affected:** every tag checked: v19.2.6, v20.2.4, v21.1.0 and main.
 - **Fixed in:** none.
 - **Evidence:**
   - Source reading: compare `v19.2.6:src/cls/version/cls_version_client.h:19`
     with `v19.2.6:src/cls/version/cls_version.cc:166,196`.
+  - radosgw detects a transition "via ECANCELED from cls_version_check()"
+    (`v19.2.6:src/rgw/driver/rados/rgw_gc.cc:168,209`), and
+    `v19.2.6:src/test/cls_version/test_cls_version.cc:190-206` expects
+    `-ECANCELED` from a failed conditional `inc`.
   - The cluster tests in `rados-cls/tests/cls_version_refcount.rs` assert
     `ECANCELED`.
 - **rados-rs:** documents `ECANCELED` in `rados-cls/src/version.rs` (60284ae,
   PR #6), and its tests assert it.
 - **Found:** rados-rs plan 03, 2026-09-25.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_version's header
+  documents EAGAIN, but the class returns ECANCELED" (a quirk there).
 
 ## CEPH-BUG-015: the mon's default for mon_auth_allow_insecure_key lags auth_allowed_ciphers until its next tick
 
@@ -464,8 +529,9 @@ against v19.2.2.
     - on a new leader that has not yet run `check_health`.
   - The client sees `EINVAL` with "creating key with insecure key type …
     not allowed", not `EPERM` (see CEPH-BUG-016).
-- **Affected:** v19.2.6, v20.2.4, v21.1.1 and main. Earlier releases do not
-  have the key-type switch.
+- **Affected:** v19.2.6, v20.2.4, v21.1.1 and main. No other tag has the
+  key-type switch: v19.2.5, v20.2.3, v21.1.0 and v21.3.0 (a tag on main)
+  lack it.
 - **Fixed in:** none.
 - **Evidence:** source reading. It has not been observed on a cluster.
   - `v19.2.6:src/mon/AuthMonitor.cc:172-184`: the tick returns early on a
@@ -483,6 +549,8 @@ against v19.2.2.
     on `EPERM`, which the client never receives.
 - **Found:** the rados-rs plan 18 review, 2026-09-26.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The monitor's default
+  for insecure key creation lags auth_allowed_ciphers".
 
 ## CEPH-BUG-016: the mon reports a refused cephx key type as EINVAL
 
@@ -499,8 +567,10 @@ against v19.2.2.
     `fs authorize` and `auth rotate`.
   - A client can tell a policy refusal from a bad argument only by the
     status text.
-- **Affected:** v19.2.6, v20.2.4, v21.1.1 and main. The switch was
-  introduced by 2f6983f9931, and its first caller already dropped the code.
+- **Affected:** v19.2.6, v20.2.4, v21.1.1 and main. Each series got the
+  switch in its own commit: 2f6983f9931 (v19.2.6), faceef2a37b (v20.2.4),
+  3ba936e837d (v21.1.1) and 8f379e24f42 (main). The first caller already
+  dropped the code.
 - **Fixed in:** none.
 - **Evidence:** source reading.
   - `v19.2.6:src/mon/AuthMonitor.cc:1510-1548` returns the distinct codes.
@@ -511,6 +581,8 @@ against v19.2.2.
   with the status text.
 - **Found:** plan 18 Part B drafting, 2026-09-27.
 - **Upstream:** not filed.
+- **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The monitor reports a
+  refused cephx key type as EINVAL".
 
 ## Considered and excluded
 
