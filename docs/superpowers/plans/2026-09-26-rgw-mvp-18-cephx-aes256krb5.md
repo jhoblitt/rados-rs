@@ -383,8 +383,9 @@ Plus:
    - the MAC over `0^16 || C` truncated to 24 bytes and compared in
      constant time;
    - the 40-byte minimum;
-   - the secret used whole (a 33-byte secret derives different keys
-     from its 32-byte prefix).
+   - the secret used whole (a 33-byte secret ending in a non-zero
+     byte derives different keys from its 32-byte prefix; HMAC
+     zero-pads its key, so a trailing `00` cannot differ).
 2. **Key parsing and dispatch** (Tasks 2 and 3):
    - Parsing follows the header, with `_set_secret`'s rules including an
      accepted empty secret.
@@ -492,7 +493,9 @@ Unit tests:
 - **Longer CS3 vectors** (`m = 5`, computed in Python by the plan
   review, whose model reproduces Ceph's vectors 1 and 4 byte for byte;
   independent of the Rust crates). Usage 4, the RFC key, confounder
-  `a0a1a2a3a4a5a6a7a8a9aaabacadaeaf`, plaintext all zero bytes:
+  `a0a1a2a3a4a5a6a7a8a9aaabacadaeaf`, plaintext the counting bytes
+  `00 01 02 ...` as in Ceph's RFC vectors (corrected at implementation:
+  the literals decrypt to counting bytes, not zeros):
   - plaintext length 53 (`n = 69`, `r = 5`):
     `ca0522838c12dfd084d33a407bf109a3e80556051f828e1fe307f9392d7cba733b6510a90ea5abbdea280d562a78bac74eb2626fe95091e7be6f0f759a8bf17b0bdff321a656ca4738330db2aa0d3a2efd5902db3852fecbc2be298fd6`
   - plaintext length 64 (`n = 80`, exact multiple):
@@ -516,8 +519,9 @@ Unit tests:
     differs from the vector (C++ `EncryptUsage`,
     `crypto.cc:496-539@v19.2.6`).
 - **Secret length.** Lengths 0 to 31 are rejected and 32 to 49 accepted
-  (`crypto.cc:360-377@v19.2.6`). A 33-byte secret produces a different
-  ciphertext from its 32-byte prefix under the same confounder.
+  (`crypto.cc:360-377@v19.2.6`). A 33-byte secret whose last byte is
+  non-zero produces a different ciphertext from its 32-byte prefix under
+  the same confounder (a trailing `00` cannot: HMAC zero-pads its key).
 - **Round trip** of random plaintexts of length 0 to 64 with random
   usages, crossing every CTS boundary. This is a supplement; the
   literals above are the pins.
