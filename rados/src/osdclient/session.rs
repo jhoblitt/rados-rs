@@ -788,6 +788,15 @@ impl OSDSession {
         self.io_loop_token.is_cancelled()
     }
 
+    /// Queue this session's sends on a channel of the test's instead of
+    /// a connection: the test reads the frames and answers the ops.
+    #[cfg(test)]
+    pub(crate) fn sends_for_test(&mut self) -> mpsc::Receiver<crate::msgr2::message::Message> {
+        let (tx, rx) = mpsc::channel(SEND_CHANNEL_BUFFER_SIZE);
+        self.send_tx = tx;
+        rx
+    }
+
     /// Submit an operation to the OSD
     ///
     /// This queues the message for sending (non-blocking, like ceph_con_send)

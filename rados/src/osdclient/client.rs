@@ -152,6 +152,9 @@ pub struct OSDClient {
     /// Stands in for a linger send's submit, which needs a session.
     #[cfg(test)]
     fake_linger_submit: std::sync::Mutex<Option<FakeLingerSubmit>>,
+    /// The session every OSD's ops go to, connected or not.
+    #[cfg(test)]
+    fake_osd: std::sync::Mutex<Option<Arc<OSDSession>>>,
 }
 
 #[cfg(test)]
@@ -522,6 +525,8 @@ impl OSDClient {
                 watch_pings_enabled: AtomicBool::new(true),
                 #[cfg(test)]
                 fake_linger_submit: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                fake_osd: std::sync::Mutex::new(None),
             }
         });
 
@@ -1449,6 +1454,15 @@ impl OSDClient {
 
     /// Get or create a session for an OSD
     async fn get_or_create_session(&self, osd_id: i32) -> Result<Arc<OSDSession>> {
+        #[cfg(test)]
+        if let Some(session) = self
+            .fake_osd
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Ok(session);
+        }
         // Get OSD address early (before acquiring any locks)
         // This reduces lock contention by doing I/O outside critical section
         let current_addr = self.get_osd_address(osd_id).await?;
@@ -2078,8 +2092,9 @@ impl OSDClient {
                 continue;
             }
 
-            // Map to OSDs based on current object (using the osdmap we already have)
-            let (hash, spg, osds) = Self::object_to_osds_in_map(&op.osdmap, &msg.object)?;
+            // Map to OSDs based on current object (using the osdmap we
+            // already have), or a PG op by its cursor.
+            let (hash, spg, osds) = Self::replace_pending(&op.osdmap, msg)?;
             let primary_osd = osds[0];
             tracing::trace!(
                 target: "rados::osdclient::routing",
@@ -2124,8 +2139,7 @@ impl OSDClient {
                     // and now — re-prune the snapc against any new
                     // removals before we encode the wire op.
                     live.prune_snap_context(msg.object.pool, &mut Arc::make_mut(msg).snaps);
-                    let (new_hash, new_spg, new_osds) =
-                        Self::object_to_osds_in_map(&live, &msg.object)?;
+                    let (new_hash, new_spg, new_osds) = Self::replace_pending(&live, msg)?;
                     if new_osds.first().copied() != Some(primary_osd) {
                         op.osdmap = live;
                         continue;
@@ -2490,11 +2504,16 @@ impl OSDClient {
         object
     }
 
-    /// Query objects from the PG that contains `hobject_cursor`.
+    /// Query objects from the PG that contains `hobject_cursor` in the
+    /// current map, one page of a listing.
     ///
-    /// The target PG is derived from `hobject_cursor.hash` using `ceph_stable_mod`, matching
-    /// exactly how Ceph's Objecter routes PGNLS requests.  Using the cursor hash as the
-    /// object hash in the MOSDOp satisfies the OSD's `pgid.contains(head)` assertion.
+    /// The op goes out as any other, placed and stamped with the map
+    /// current when it is sent and re-placed on a map change, as
+    /// `Objecter::list_nobjects` sends each page through `pg_read` and
+    /// `op_submit` (v19.2.2:src/osdc/Objecter.cc:3793-3862). The PG
+    /// comes from `hobject_cursor.hash` with `ceph_stable_mod` in that map
+    /// ([`Self::replace_pending`]), and the cursor hash is the op's
+    /// hobject hash, so the OSD's `pgid.contains(head)` check passes.
     ///
     /// Returns the decoded response and result code from the OSD.
     async fn query_pg_objects(
@@ -2503,77 +2522,28 @@ impl OSDClient {
         nspace: &str,
         hobject_cursor: &crate::HObject,
         max_entries: u64,
-        pool_info: &crate::osdclient::PgPool,
-        osdmap: &Arc<crate::osdclient::osdmap::OSDMap>,
+        osdmap: &crate::osdclient::osdmap::OSDMap,
     ) -> Result<(crate::osdclient::PgNlsResponse, i32)> {
-        // Derive the target PG from the cursor hash — mirrors Objecter::pg_read(current_pg,…)
-        let pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash);
-        let current_pg = pg.seed;
-
-        let osds = Self::pg_to_osds_in_map(osdmap, pg)?;
-        let primary_osd = osds[0];
-
-        // For replicated pools `pg_to_spg_shard` returns NO_SHARD; for
-        // non-optimised EC it returns the primary's position; for
-        // optimised EC it runs `pgtemp_undo_primaryfirst`.  Sending a
-        // PGNLS scan with the wrong shard would land on a replica that
-        // rejects it as misdirected, so EC pool listings need this just
-        // as much as the I/O hot path.
-        let shard = osdmap
-            .pg_to_spg_shard(&pg)
-            .map_err(|e| OSDClientError::Crush(format!("EC shard lookup: {e}")))?;
-        let spg = StripedPgId::new(pool, current_pg, shard.0);
-
-        // Get session
-        let session = self.get_or_create_session(primary_osd).await?;
-
-        // The hash must match the cursor's hash so the OSD's pgid.contains(head)
-        // check passes — hash=0 only belongs to PG 0.
+        let current_pg = osdmap
+            .pools
+            .get(&pool)
+            .map(|p| Self::cursor_pg(p, pool, hobject_cursor.hash).seed)
+            .ok_or(OSDClientError::PoolNotFound(pool))?;
         let object = Self::pgnls_target(pool, hobject_cursor.hash, nspace);
-
-        // Create pgls operation
         let ops = vec![OSDOp::pgls(
             max_entries,
             hobject_cursor.clone(),
             osdmap.epoch.as_u32(),
         )?];
-
-        // Acquire throttle permit
-        let _throttle_permit = self.throttle.acquire(calc_op_budget(&ops)).await?;
-
-        // Build request ID
-        let tid = session.next_tid();
-        let reqid = crate::osdclient::types::RequestId::new(
-            &self.entity_name,
-            tid,
-            self.config.client_inc as i32,
-        );
-
-        // Build message
-        let flags = MOSDOp::calculate_flags(&ops);
-        let msg = MOSDOp::new(
-            self.config.client_inc,
-            osdmap.epoch.as_u32(),
-            flags,
-            object,
-            spg,
-            ops,
-            reqid,
-            self.global_id,
-        );
-
-        // Submit operation (use default priority for internal PGLS operations)
-        let result_rx = session
-            .submit_op(
-                Arc::new(msg),
+        let result = self
+            .execute_op(
+                object,
+                ops,
+                None,
                 crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
-                pool_info.pg_num,
-                true,
+                OsdOpFlags::empty(),
             )
             .await?;
-
-        // Wait for result with timeout
-        let result = await_op_result(result_rx, self.tracker.operation_timeout()).await?;
 
         // For PGLS: result = 1 means "reached end of PG" (success)
         //           result = 0 means "more objects available" (success)
@@ -2666,12 +2636,10 @@ impl OSDClient {
         // Parse cursor → starting hobject position
         let mut hobject_cursor = Self::parse_list_cursor(pool, cursor)?;
 
-        // Get OSDMap to look up pool info
         let osdmap = self.get_osdmap().await?;
-        let pool_info = osdmap
-            .pools
-            .get(&pool)
-            .ok_or(OSDClientError::PoolNotFound(pool))?;
+        if !osdmap.pools.contains_key(&pool) {
+            return Err(OSDClientError::PoolNotFound(pool));
+        }
 
         // Mirrors execute_op pre-flight checks: hard-fail on EIO, pause, and epoch barrier.
         // PGLS is a read, so only pauserd applies (not pausewr/pool_full).
@@ -2711,6 +2679,13 @@ impl OSDClient {
                 });
             }
 
+            // Each page in the map current as it goes out, as
+            // list_nobjects reads the map anew for every page.
+            let osdmap = self.get_osdmap().await?;
+            let pool_info = osdmap
+                .pools
+                .get(&pool)
+                .ok_or(OSDClientError::PoolNotFound(pool))?;
             let current_pg = Self::cursor_pg(pool_info, pool, hobject_cursor.hash).seed;
             debug!(
                 "Querying PG {} (hash={:#x}), collected {} entries so far",
@@ -2721,7 +2696,7 @@ impl OSDClient {
 
             let remaining = max_entries.saturating_sub(all_entries.len() as u64);
             let (response, _result_code) = match self
-                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, pool_info, &osdmap)
+                .query_pg_objects(pool, nspace, &hobject_cursor, remaining, &osdmap)
                 .await
             {
                 Ok(result) => result,
@@ -4702,6 +4677,102 @@ mod tests {
                 hash: -1,
             }
         );
+    }
+
+    /// A session to OSD 0, the one every op of `client` goes to, whose
+    /// sends come out of the returned channel unanswered.
+    async fn fake_osd(
+        client: &Arc<OSDClient>,
+    ) -> (
+        Arc<crate::osdclient::session::OSDSession>,
+        tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) {
+        let (tx, _rx) = crate::msgr2::map_channel(1);
+        let mut session = crate::osdclient::session::OSDSession::new(
+            0,
+            None,
+            0,
+            tx,
+            std::sync::Weak::new(),
+            Arc::clone(&client.next_tid),
+        );
+        let sends = session.sends_for_test();
+        let session = Arc::new(session);
+        *client.fake_osd.lock().unwrap() = Some(Arc::clone(&session));
+        (session, sends)
+    }
+
+    /// Take the next op `session` sends, and the pending op it is.
+    async fn next_send(
+        session: &crate::osdclient::session::OSDSession,
+        sends: &mut tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) -> crate::osdclient::session::PendingOp {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("an op went out")
+            .expect("sends open");
+        session
+            .remove_pending_op(frame.tid())
+            .expect("the op sent is pending")
+    }
+
+    fn pgnls_reply(
+        result: i32,
+        handle: crate::HObject,
+        oid: &str,
+    ) -> crate::osdclient::types::OpResult {
+        let response = crate::osdclient::PgNlsResponse::with_entries(
+            handle,
+            vec![crate::osdclient::ListObjectImpl::new("", oid, "")],
+        );
+        let mut outdata = bytes::BytesMut::new();
+        crate::Denc::encode(&response, &mut outdata, 0).expect("encoded");
+        crate::osdclient::types::OpResult {
+            result,
+            version: 0,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: result,
+                outdata: outdata.freeze(),
+            }],
+            redirect: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_listing_page_is_placed_in_the_current_map() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        let listing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.list_in_namespace(2, "", None, 100).await })
+        };
+
+        // Page one: PG 0 of 8, at epoch 10. The pool splits to 16 PGs at
+        // epoch 11 before its reply.
+        let first = next_send(&session, &mut sends).await;
+        assert_eq!(first.op.osdmap_epoch, 10);
+        assert_eq!(first.op.pgid.seed, 0);
+        assert_eq!(first.target.pg_num, 8);
+        client.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+        let cursor = crate::HObject::new(2, String::new(), 0xd);
+        let _ = first.result_tx.send(Ok(pgnls_reply(1, cursor, "a")));
+
+        // Page two, at cursor hash 0xd: PG 5 of 8, but PG 13 of the 16
+        // now, and stamped with epoch 11.
+        let second = next_send(&session, &mut sends).await;
+        assert_eq!(second.op.osdmap_epoch, 11);
+        assert_eq!(second.op.pgid.seed, 13);
+        assert_eq!(second.op.object.hash, 0xd, "still placed by the cursor");
+        assert_eq!(second.target.pg_num, 16);
+        let mut end = crate::HObject::empty_cursor(2);
+        end.max = true;
+        let _ = second.result_tx.send(Ok(pgnls_reply(1, end, "b")));
+
+        let listed = listing.await.expect("ran").expect("listed");
+        let names: Vec<_> = listed.entries.iter().map(|e| e.oid.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(listed.cursor, None);
     }
 
     #[test]
