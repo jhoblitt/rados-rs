@@ -270,7 +270,7 @@ async fn await_notify(
     mut done_rx: tokio::sync::oneshot::Receiver<(i32, Bytes)>,
     bound: std::time::Duration,
 ) -> Result<NotifyResult> {
-    let (code, data) = loop {
+    let done = loop {
         tokio::select! {
             done = &mut done_rx => {
                 break done
@@ -280,6 +280,11 @@ async fn await_notify(
             () = tokio::time::sleep(bound) => return Err(OSDClientError::Timeout(bound)),
         }
     };
+    notify_outcome(done)
+}
+
+/// A notify's result from its completion's code and reply.
+fn notify_outcome((code, data): (i32, Bytes)) -> Result<NotifyResult> {
     // A completion with no reply map is a failed send, not the OSD's.
     if code < 0 && (code != ETIMEDOUT || data.is_empty()) {
         return Err(OSDClientError::OSDError {
@@ -702,11 +707,13 @@ impl OSDClient {
                 // A later send began while this one was being routed and
                 // found nothing to cancel.
                 self.cancel_linger_send(osd, tid).await;
+                return Err(OSDClientError::Cancelled);
             }
             self.record_target(linger, &osdmap, Some(osd));
             if matches!(linger.kind, LingerKind::Notify { .. }) {
-                // Only a send a session took restarts the notify's bound;
-                // a re-send that never got out must not extend it.
+                // Only the latest send, once a session took it, restarts
+                // the notify's bound; a re-send that never got out, or
+                // one that cancelled itself above, must not extend it.
                 linger.resent.notify_one();
             }
             let result = await_op_result(rx, self.tracker.operation_timeout()).await?;
@@ -919,10 +926,7 @@ impl OSDClient {
     }
 
     /// Send a notify linger's NOTIFY, whole, unless it already completed,
-    /// and record the notify id its reply carries unless a later send or
-    /// the completion superseded it. An OSD's rejection completes the
-    /// notify with the error, as Objecter's `_linger_commit` does; no
-    /// answer leaves it for the next reset or map change to re-send.
+    /// and apply its reply with [`Self::finish_notify_send`].
     async fn send_notify(&self, linger: &Linger) {
         let LingerKind::Notify {
             completion,
@@ -933,13 +937,11 @@ impl OSDClient {
         else {
             return;
         };
-        let completed = || {
-            completion
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
-        };
-        if completed() {
+        let completed = completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+        if completed {
             return;
         }
         let seq = {
@@ -950,18 +952,47 @@ impl OSDClient {
             Linger::begin_send_locked(&mut state)
         };
         let op = OSDOp::notify(linger.cookie, *timeout_secs, payload.clone());
-        match self.send_linger_op(linger, op, "notify", seq).await {
+        let outcome = self.send_linger_op(linger, op, "notify", seq).await;
+        Self::finish_notify_send(linger, seq, outcome);
+    }
+
+    /// Apply the outcome of send `seq` of a notify linger: record the
+    /// notify id its reply carries, or complete the notify with an OSD's
+    /// rejection, as Objecter's `_linger_commit` does. No answer leaves
+    /// it for the next reset or map change to re-send. A send a later one
+    /// superseded, or one that ends after the completion, changes
+    /// nothing. The later send cancels it if it is still pending
+    /// ([`Self::cancel_previous_send`]), as Objecter's `_send_linger` does
+    /// (v19.2.2:src/osdc/Objecter.cc:586-594), but it may already have
+    /// ended, and its late reply, its `Cancelled` or its Tracker timeout
+    /// must not fail the notify the later send carries.
+    fn finish_notify_send(
+        linger: &Linger,
+        seq: u64,
+        outcome: Result<crate::osdclient::types::OpResult>,
+    ) {
+        let LingerKind::Notify {
+            completion,
+            notify_id,
+            ..
+        } = &linger.kind
+        else {
+            return;
+        };
+        let state = linger.lock_state();
+        let current = state.send_seq == seq
+            && completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+        match outcome {
             Ok(result) => {
                 let id = result
                     .ops
                     .first()
                     .and_then(|r| r.outdata.get(..8))
                     .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
-                let state = linger.lock_state();
-                if state.send_seq == seq
-                    && !completed()
-                    && let Some(id) = id
-                {
+                if current && let Some(id) = id {
                     notify_id.store(id, Ordering::Release);
                 }
             }
@@ -971,7 +1002,14 @@ impl OSDClient {
                     linger.cookie, e
                 );
             }
+            Err(e) if !current => {
+                debug!(
+                    "notify {} send {} superseded, ignoring its error: {}",
+                    linger.cookie, seq, e
+                );
+            }
             Err(e) => {
+                drop(state);
                 warn!("notify {} failed: {}", linger.cookie, e);
                 linger.complete_notify(notify_error_code(&e));
             }
@@ -1016,7 +1054,28 @@ impl OSDClient {
         self.lingers.insert(cookie, Arc::clone(&linger));
         let _registration = LingerGuard::new(self, cookie);
         self.refuse_after_shutdown()?;
-        self.send_notify(&linger).await;
+        // The notify ends with its completion, not with this first send's
+        // reply: a re-send on a new interval supersedes it, and the OSD
+        // may drop it unanswered, as Objecter never waits on a superseded
+        // linger op. The send runs in its own task, as a re-send does, so
+        // a caller that stops waiting cannot drop it half way through
+        // submit_op and leave an op pending that nothing tracks.
+        let first_send = {
+            let client = Arc::clone(self);
+            let linger = Arc::clone(&linger);
+            self.spawn_until_shutdown(async move { client.send_notify(&linger).await })
+        };
+        let mut done_rx = done_rx;
+        tokio::select! {
+            done = &mut done_rx => {
+                let done = done
+                    .map_err(|_| OSDClientError::Internal("notify completion dropped".into()))?;
+                return notify_outcome(done);
+            }
+            _ = first_send => {}
+        }
+        // As plan 12 has it, the outer bound starts once the first send
+        // ends; a later send a session takes restarts it.
         await_notify(&linger, done_rx, notify_outer_bound(timeout_secs)).await
     }
 
@@ -1189,15 +1248,30 @@ impl OSDClient {
         match linger.kind {
             LingerKind::Watch { .. } => {
                 if linger.lock_state().registered {
-                    tokio::spawn(client.send_reconnect(linger));
+                    self.spawn_until_shutdown(client.send_reconnect(linger));
                 } else {
-                    tokio::spawn(async move { client.send_register(&linger).await });
+                    self.spawn_until_shutdown(async move { client.send_register(&linger).await });
                 }
             }
             LingerKind::Notify { .. } => {
-                tokio::spawn(client.resend_notify(linger));
+                self.spawn_until_shutdown(client.resend_notify(linger));
             }
         }
+    }
+
+    /// Run `task` in a task of its own that ends when the client shuts
+    /// down, as plan 12 has `shutdown_token` cancel every timer and task.
+    fn spawn_until_shutdown(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let shutdown = self.shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                () = task => {}
+            }
+        })
     }
 
     /// Get the current OSDMap
@@ -4961,6 +5035,257 @@ mod tests {
             .expect_err("shut down");
         assert!(matches!(err, OSDClientError::Connection(_)), "{err:?}");
         assert!(client.lingers.is_empty());
+    }
+
+    fn test_notify(
+        cookie: u64,
+    ) -> (
+        Arc<crate::osdclient::watch::Linger>,
+        tokio::sync::oneshot::Receiver<(i32, Bytes)>,
+    ) {
+        use crate::osdclient::watch::{Linger, LingerKind};
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let linger = Arc::new(Linger::new(
+            cookie,
+            ObjectId::new(1, "o"),
+            LingerKind::Notify {
+                completion: std::sync::Mutex::new(Some(done_tx)),
+                notify_id: std::sync::atomic::AtomicU64::new(0),
+                timeout_secs: 10,
+                payload: Bytes::new(),
+            },
+            tx,
+        ));
+        (linger, done_rx)
+    }
+
+    fn notify_reply(id: u64) -> crate::osdclient::types::OpResult {
+        crate::osdclient::types::OpResult {
+            result: 0,
+            version: 0,
+            ops: vec![crate::osdclient::types::OpReply {
+                return_code: 0,
+                outdata: Bytes::copy_from_slice(&id.to_le_bytes()),
+            }],
+            redirect: None,
+        }
+    }
+
+    #[test]
+    fn a_superseded_notify_send_changes_nothing() {
+        use crate::osdclient::watch::LingerKind;
+        let (linger, mut done_rx) = test_notify(1001);
+        let first = linger.begin_send();
+        let second = linger.begin_send();
+        let LingerKind::Notify { notify_id, .. } = &linger.kind else {
+            unreachable!()
+        };
+
+        // The first send's late reply records no id; its Tracker timeout
+        // does not fail the notify the second send carries.
+        OSDClient::finish_notify_send(&linger, first, Ok(notify_reply(5)));
+        assert_eq!(notify_id.load(std::sync::atomic::Ordering::Acquire), 0);
+        OSDClient::finish_notify_send(
+            &linger,
+            first,
+            Err(OSDClientError::Timeout(std::time::Duration::from_secs(30))),
+        );
+        assert!(done_rx.try_recv().is_err(), "still pending");
+
+        OSDClient::finish_notify_send(&linger, second, Ok(notify_reply(6)));
+        assert_eq!(notify_id.load(std::sync::atomic::Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn the_latest_notify_send_fails_the_notify() {
+        let (linger, mut done_rx) = test_notify(1001);
+        let seq = linger.begin_send();
+        OSDClient::finish_notify_send(
+            &linger,
+            seq,
+            Err(OSDClientError::OSDError {
+                code: crate::osdclient::error::ENOENT,
+                message: "notify".into(),
+            }),
+        );
+        assert_eq!(
+            done_rx.try_recv(),
+            Ok((crate::osdclient::error::ENOENT, Bytes::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notify_ends_with_its_completion_not_its_first_send() {
+        use crate::osdclient::watch::LingerKind;
+        use std::time::Duration;
+
+        let client = offline_client().await;
+        // Reads are paused: the first send waits out the Tracker's 30 s
+        // for a newer map that never comes, as a dropped op waits for its
+        // reply.
+        let mut map = map_with_pool(1, 8);
+        map.flags = 1 << 2; // CEPH_OSDMAP_PAUSERD
+        map.epoch = crate::Epoch::new(1);
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+
+        // A re-send's completion arrives while the first send is held.
+        let completer = Arc::clone(&client);
+        tokio::spawn(async move {
+            loop {
+                let linger = completer.lingers.iter().next().map(|l| Arc::clone(&l));
+                if let Some(linger) = linger
+                    && linger.lock_state().sending
+                {
+                    let LingerKind::Notify { completion, .. } = &linger.kind else {
+                        unreachable!()
+                    };
+                    let tx = completion.lock().unwrap().take().expect("pending");
+                    let _ = tx.send((0, Bytes::from_static(&[0; 8])));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.notify(ObjectId::new(1, "o"), Bytes::new(), 0),
+        )
+        .await
+        .expect("the notify did not wait on its first send")
+        .expect("completed");
+        assert!(result.acks.is_empty() && !result.timed_out);
+        assert!(client.lingers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_notify_leaves_its_first_send_running() {
+        use std::time::Duration;
+
+        let client = offline_client().await;
+        // Reads are paused: the first send is held before any session.
+        let mut map = map_with_pool(1, 8);
+        map.flags = 1 << 2; // CEPH_OSDMAP_PAUSERD
+        map.epoch = crate::Epoch::new(1);
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+
+        let watcher = Arc::clone(&client);
+        let linger = tokio::spawn(async move {
+            loop {
+                let linger = watcher.lingers.iter().next().map(|l| Arc::clone(&l));
+                if let Some(linger) = linger
+                    && linger.lock_state().sending
+                {
+                    return linger;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // The caller gives up while the send is held, dropping notify().
+        let caller = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.notify(ObjectId::new(1, "o"), Bytes::new(), 0),
+        )
+        .await;
+        assert!(caller.is_err(), "the notify was still waiting");
+        let linger = linger.await.expect("the send began");
+        assert!(client.lingers.is_empty(), "the caller's guard forgot it");
+
+        // Unpaused, the send runs on to its end, where send_linger_op
+        // settles it; dropped with the caller, it would stay mid-send, as
+        // it would inside submit_op with an op pending and untracked.
+        let mut map = map_with_pool(1, 8);
+        map.epoch = crate::Epoch::new(2);
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+        for _ in 0..200 {
+            if !linger.lock_state().sending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = linger.lock_state();
+        assert!(!state.sending, "the first send ran to its end");
+        assert_eq!(state.send_seq, 1);
+        assert_eq!(state.in_flight, None);
+    }
+
+    #[tokio::test]
+    async fn a_notify_send_that_cancels_itself_leaves_the_bound_alone() {
+        use crate::osdclient::types::OSDOp;
+        use std::time::Duration;
+
+        let client = offline_client().await;
+        let (linger, _done_rx) = test_notify(1001);
+        fake_linger_submit(&client, Some(Arc::clone(&linger))).await;
+        let seq = linger.begin_send();
+        let outcome = client
+            .send_linger_op(
+                &linger,
+                OSDOp::notify(1001, 10, Bytes::new()),
+                "notify",
+                seq,
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(OSDClientError::Cancelled)),
+            "{outcome:?}"
+        );
+        let restarted = tokio::time::timeout(Duration::ZERO, linger.resent.notified()).await;
+        assert!(
+            restarted.is_err(),
+            "the superseded send restarted the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_a_held_linger_send() {
+        use std::time::Duration;
+
+        let client = offline_client().await;
+        // Reads are paused: every send of the notify is held for the
+        // Tracker's 30 s before any session.
+        let mut map = map_with_pool(1, 8);
+        map.flags = 1 << 2; // CEPH_OSDMAP_PAUSERD
+        map.epoch = crate::Epoch::new(1);
+        client.osdmap_tx.send(Some(Arc::new(map))).ok();
+
+        let caller = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.notify(ObjectId::new(1, "o"), Bytes::new(), 0).await })
+        };
+        let linger = loop {
+            let linger = client.lingers.iter().next().map(|l| Arc::clone(&l));
+            if let Some(linger) = linger
+                && linger.lock_state().sending
+            {
+                break linger;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        // A re-send, held as the first send is.
+        client.spawn_relinger(Arc::clone(&linger));
+        while linger.lock_state().send_seq < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        client.shutdown().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .expect("the shutdown ended the notify")
+            .expect("the caller ran");
+        assert!(outcome.is_err(), "{outcome:?}");
+        // Each held send's task holds the linger until it ends.
+        for _ in 0..200 {
+            if Arc::strong_count(&linger) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&linger),
+            1,
+            "a send outlived the shutdown"
+        );
     }
 
     #[tokio::test]
