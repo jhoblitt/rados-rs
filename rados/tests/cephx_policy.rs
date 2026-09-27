@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::{build_test_client, test_pool_name};
 use futures::FutureExt;
-use rados::{Client, ClientError, IoCtx, MonClientError, Msgr2Error};
+use rados::{Client, ClientError, EntityType, IoCtx, MonClientError, Msgr2Error};
 
 static POLICY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -550,5 +550,77 @@ async fn key_type_not_allowed_is_refused() {
         );
     }
     remove_created(&admin, &created, &mut failures).await;
+    finish(body, failures);
+}
+
+async fn refresh_body(admin: &Client, created: &mut Created) {
+    let Created {
+        entities,
+        objects,
+        client,
+    } = created;
+    entities.push(cephx::create_entity(admin, "refresh", "aes256k").await);
+    let entity = &entities[0];
+    let oid = cephx::unique("refresh");
+    objects.push(oid.clone());
+
+    let c: &Client = client.insert(cephx::client_for(entity).await.expect("client C"));
+    let c_io = c.open_pool(&test_pool_name()).await.expect("C's pool");
+    write_read(&c_io, &oid, b"before")
+        .await
+        .expect("C writes and reads o");
+    let (key_before, blob_before) = cephx::ticket_bytes(c, EntityType::OSD).await;
+    let (key_before, blob_before) = (&key_before, &blob_before);
+    let epoch_before = c.mon_client().get_monmap().await.auth_epoch;
+
+    wipe(admin).await.expect("wipe");
+
+    // secret_id is not compared: a wipe restarts the rotating keys' numbering.
+    eventually(
+        "C sees the auth epoch rise and holds a new OSD ticket",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || async move {
+            let epoch = c.mon_client().get_monmap().await.auth_epoch;
+            let (key, blob) = cephx::ticket_bytes(c, EntityType::OSD).await;
+            let (new_key, new_blob) = (key != *key_before, blob != *blob_before);
+            if epoch > epoch_before && new_key && new_blob {
+                Ok(())
+            } else {
+                Err(format!(
+                    "auth_epoch {epoch_before} -> {epoch}, new session key {new_key}, \
+                     new blob {new_blob}"
+                ))
+            }
+        },
+    )
+    .await;
+    io_on_new_session(&c_io, &oid, b"after")
+        .await
+        .unwrap_or_else(|e| panic!("C's I/O with the refreshed OSD ticket: {e}"));
+}
+
+/// A wipe raises the monmap's auth epoch; a connected client fetches new
+/// service tickets and does I/O on a new OSD session with them.
+#[tokio::test]
+#[ignore]
+async fn tickets_refresh_when_auth_epoch_rises() {
+    let Some((_serial, admin)) = setup().await else {
+        return;
+    };
+    assert_rook_policy(&admin).await;
+
+    let mut created = Created::default();
+    let body = run_body(refresh_body(&admin, &mut created)).await;
+
+    let mut failures = Vec::new();
+    remove_created(&admin, &created, &mut failures).await;
+    match policy(&admin).await {
+        Ok(auth) => failures.extend(
+            off_rook_policy(Some(&auth))
+                .map(|problem| format!("off Rook's policy after a wipe: {problem}\n{RECOVERY}")),
+        ),
+        Err(e) => failures.push(e),
+    }
     finish(body, failures);
 }
