@@ -904,22 +904,34 @@ impl OSDSession {
         }
 
         // Encode the operation using shared helper (priority goes in message header)
-        let msg = Self::encode_operation(&op, tid, priority, self.negotiated_features)?;
+        let msg = match Self::encode_operation(&op, tid, priority, self.negotiated_features) {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.take_back_unsent(tid).await;
+                return Err(e);
+            }
+        };
 
         // Send to channel (non-blocking, like Linux kernel's list_add_tail + queue_con)
         debug!("Submitting operation tid={} to OSD {}", tid, self.osd_id);
 
         if self.send_tx.send(msg).await.is_err() {
-            // Nothing went out: the caller may place it again, under this
-            // tid, so this send's deadline must not outlive it.
-            self.pending_ops.remove(&tid);
-            if let Some(t) = &self.tracker {
-                t.untrack(tid, self.osd_id).await;
-            }
+            self.take_back_unsent(tid).await;
             return Err(OSDClientError::Connection("I/O task has exited".into()));
         }
 
         Ok(Some(rx))
+    }
+
+    /// Undo [`Self::submit_op`]'s claim on `tid` when its frame never went
+    /// out. Left pending, the op could be resent by a map rescan after its
+    /// caller had the error. The caller may place it again under this tid,
+    /// so this send's Tracker deadline must not outlive it.
+    async fn take_back_unsent(&self, tid: u64) {
+        self.pending_ops.remove(&tid);
+        if let Some(t) = &self.tracker {
+            t.untrack(tid, self.osd_id).await;
+        }
     }
 
     /// Take the op `reply` answers off `pending_ops`: a submitted one
