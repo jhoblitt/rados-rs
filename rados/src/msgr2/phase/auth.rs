@@ -1,10 +1,14 @@
 //! Authentication phase: AUTH_REQUEST / AUTH_DONE (and optional AUTH_REPLY_MORE).
 //!
-//! **Client** sends `AUTH_REQUEST`, handles server replies:
+//! **Client** sends `AUTH_REQUEST`, offering the connection modes configured
+//! for the peer as C++ `AuthRegistry::get_supported_modes` does, and handles
+//! server replies:
 //! - `AUTH_BAD_METHOD` → retry with a different auth method, using the
 //!   ordered-search semantics from Ceph `MonConnection::handle_auth_bad_method`
 //!   (anchor at the rejected method's position in our preference-ordered list,
-//!   search forward). Terminates naturally when no method is viable.
+//!   search forward). Terminates naturally when no method is viable. The
+//!   retry offers the configured modes for the new method, whatever modes
+//!   the server said it allows.
 //! - `AUTH_REPLY_MORE` → CephX challenge-response round-trip
 //! - `AUTH_DONE`       → authentication complete, phase finishes
 //!
@@ -61,6 +65,9 @@ impl std::fmt::Debug for AuthOutput {
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
+/// The `ConnectionConfig::service_id` of a monitor connection.
+const MON_SERVICE_ID: u32 = 0;
+
 /// Client-side authentication phase.
 ///
 /// Drives the full AUTH_REQUEST ↔ AUTH_DONE exchange, including method
@@ -69,7 +76,8 @@ impl std::fmt::Debug for AuthOutput {
 #[derive(Clone)]
 pub struct AuthClient {
     method: AuthMethod,
-    preferred_modes: Vec<ConnectionMode>,
+    /// The connection modes configured for this peer, in preference order.
+    modes: Vec<ConnectionMode>,
     supported_methods: Vec<AuthMethod>,
     tried_methods: Vec<AuthMethod>,
     auth_provider: Option<Box<dyn AuthProvider>>,
@@ -80,7 +88,7 @@ pub struct AuthClient {
 
 impl AuthClient {
     pub fn new(
-        preferred_modes: Vec<ConnectionMode>,
+        modes: Vec<ConnectionMode>,
         supported_methods: Vec<AuthMethod>,
         auth_provider: Option<Box<dyn AuthProvider>>,
         service_id: u32,
@@ -96,7 +104,7 @@ impl AuthClient {
         );
         Self {
             method,
-            preferred_modes,
+            modes,
             supported_methods,
             tried_methods: Vec::new(),
             auth_provider,
@@ -106,8 +114,39 @@ impl AuthClient {
         }
     }
 
+    /// The modes an `AUTH_REQUEST` with the current method offers: the
+    /// configured ones, in order, but only CRC under AUTH_NONE, which has
+    /// no connection secret to key SECURE with. C++
+    /// `AuthRegistry::get_supported_modes`
+    /// (v19.2.6:src/auth/AuthRegistry.cc:289-307).
+    fn offered_modes(&self) -> Vec<ConnectionMode> {
+        if self.method == AuthMethod::None {
+            self.modes
+                .iter()
+                .copied()
+                .filter(|&m| m == ConnectionMode::Crc)
+                .collect()
+        } else {
+            self.modes.clone()
+        }
+    }
+
     fn build_auth_request(&mut self) -> Result<Frame> {
-        let modes: Vec<u32> = self.preferred_modes.iter().map(|m| (*m).into()).collect();
+        let offered = self.offered_modes();
+        // With no mode to offer, a monitor connection fails before asking,
+        // as C++ `MonConnection::get_auth_request` does through
+        // `handle_auth_failure` (v19.2.6:src/mon/MonClient.cc:1814-1820).
+        // Any other peer is sent the empty list, as
+        // `MonClient::get_auth_request` does (1503-1507); the server then
+        // finds no mode to pick.
+        if offered.is_empty() && self.service_id == MON_SERVICE_ID {
+            return Err(Error::Auth(format!(
+                "no connection mode to offer the monitor with auth method {:?}: \
+                 configured modes {:?}",
+                self.method, self.modes
+            )));
+        }
+        let modes: Vec<u32> = offered.iter().map(|m| (*m).into()).collect();
         let (method_id, payload) = match self.method {
             AuthMethod::None => {
                 let is_service = self.service_id != 0 && self.global_id != 0;
@@ -138,28 +177,6 @@ impl AuthClient {
         };
         let req = AuthRequestFrame::new(method_id, modes, payload);
         Ok(create_frame_from_trait(&req, Tag::AuthRequest)?)
-    }
-
-    fn negotiate_modes(&self, allowed: &[u32]) -> Vec<ConnectionMode> {
-        let server: Vec<ConnectionMode> = allowed
-            .iter()
-            .filter_map(|&m| ConnectionMode::try_from(m).ok())
-            .collect();
-        let negotiated: Vec<_> = self
-            .preferred_modes
-            .iter()
-            .filter(|m| server.contains(m))
-            .cloned()
-            .collect();
-        if !negotiated.is_empty() {
-            negotiated
-        } else {
-            server
-                .first()
-                .cloned()
-                .map(|m| vec![m])
-                .unwrap_or_else(|| vec![ConnectionMode::Crc])
-        }
     }
 
     fn handle_auth_bad_method(self, frame: Frame) -> Result<Step<Self, AuthOutput>> {
@@ -232,14 +249,19 @@ impl AuthClient {
                 ))
             })?;
 
-        let new_modes = self.negotiate_modes(&allowed_modes);
-        tracing::info!("Retrying auth with method={new_method:?}, modes={new_modes:?}");
+        // The retry offers the configured modes for the new method, not the
+        // server's allowed_modes: C++ sends the request again through
+        // `get_auth_request` (v19.2.6:src/msg/async/ProtocolV2.cc:1837,
+        // src/mon/MonClient.cc:1814).
         let mut next = Self {
             method: new_method,
-            preferred_modes: new_modes,
             tried_methods: tried,
             ..self
         };
+        tracing::info!(
+            "Retrying auth with method={new_method:?}, modes={:?}",
+            next.offered_modes()
+        );
         let req = next.build_auth_request()?;
         Ok(Step::Next {
             state: next,
@@ -560,7 +582,7 @@ mod tests {
     ) -> AuthClient {
         AuthClient {
             method,
-            preferred_modes: vec![ConnectionMode::Crc],
+            modes: vec![ConnectionMode::Crc],
             supported_methods: supported,
             tried_methods: tried,
             auth_provider: None,
@@ -731,5 +753,177 @@ mod tests {
             err.contains("rejected method"),
             "error should mention the rejected method: {err}"
         );
+    }
+
+    /// Stands in for a CephX provider: a fixed payload out, a session key
+    /// and SECURE-sized connection secret back.
+    #[derive(Debug, Clone)]
+    struct StubProvider;
+
+    impl AuthProvider for StubProvider {
+        fn build_auth_payload(
+            &mut self,
+            _global_id: u64,
+            _service_id: u32,
+        ) -> crate::auth::error::Result<Bytes> {
+            Ok(Bytes::from_static(b"stub"))
+        }
+
+        fn handle_auth_response(
+            &mut self,
+            _payload: Bytes,
+            _global_id: u64,
+            _con_mode: u32,
+        ) -> crate::auth::error::Result<(Option<Bytes>, Option<Bytes>)> {
+            Ok((
+                Some(Bytes::from_static(&[1; 16])),
+                Some(Bytes::from_static(&[2; 64])),
+            ))
+        }
+
+        fn has_valid_ticket(&self, _service_id: u32) -> bool {
+            true
+        }
+
+        fn clone_box(&self) -> Box<dyn AuthProvider> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A client for `service_id` that allows `modes` and starts with the
+    /// first of `supported`.
+    fn moded_client(
+        modes: Vec<ConnectionMode>,
+        supported: Vec<AuthMethod>,
+        service_id: u32,
+    ) -> AuthClient {
+        let provider: Option<Box<dyn AuthProvider>> = supported
+            .contains(&AuthMethod::Cephx)
+            .then(|| Box::new(StubProvider) as Box<dyn AuthProvider>);
+        let global_id = if service_id == MON_SERVICE_ID { 0 } else { 42 };
+        AuthClient::new(
+            modes,
+            supported,
+            provider,
+            service_id,
+            crate::EntityName::client("admin"),
+            global_id,
+        )
+    }
+
+    /// The modes an `AUTH_REQUEST` frame offers.
+    fn offered(frame: &Frame) -> Vec<u32> {
+        assert_eq!(frame.preamble.tag, Tag::AuthRequest);
+        AuthRequestFrame::from_frame(frame).unwrap().preferred_modes
+    }
+
+    const CRC: u32 = ConnectionMode::Crc as u32;
+    const SECURE: u32 = ConnectionMode::Secure as u32;
+    const OSD: u32 = crate::EntityType::OSD.bits();
+
+    #[test]
+    fn auth_request_offers_the_configured_modes_in_order() {
+        for modes in [
+            vec![ConnectionMode::Secure, ConnectionMode::Crc],
+            vec![ConnectionMode::Crc, ConnectionMode::Secure],
+            vec![ConnectionMode::Secure],
+        ] {
+            for service_id in [MON_SERVICE_ID, OSD] {
+                let mut c = moded_client(modes.clone(), vec![AuthMethod::Cephx], service_id);
+                let want: Vec<u32> = modes.iter().map(|&m| m.into()).collect();
+                assert_eq!(offered(&c.enter().unwrap().unwrap()), want);
+            }
+        }
+    }
+
+    #[test]
+    fn auth_none_offers_crc_only() {
+        let mut c = moded_client(
+            vec![ConnectionMode::Secure, ConnectionMode::Crc],
+            vec![AuthMethod::None],
+            MON_SERVICE_ID,
+        );
+        assert_eq!(offered(&c.enter().unwrap().unwrap()), vec![CRC]);
+    }
+
+    #[test]
+    fn mon_request_with_no_mode_to_offer_fails() {
+        // SECURE alone under AUTH_NONE leaves nothing to offer.
+        let mut c = moded_client(
+            vec![ConnectionMode::Secure],
+            vec![AuthMethod::None],
+            MON_SERVICE_ID,
+        );
+        let err = c.enter().expect_err("no mode to offer a monitor");
+        assert!(matches!(err, Error::Auth(_)), "{err}");
+        assert!(err.to_string().contains("no connection mode"), "{err}");
+
+        let mut c = moded_client(vec![], vec![AuthMethod::Cephx], MON_SERVICE_ID);
+        assert!(c.enter().is_err());
+    }
+
+    #[test]
+    fn service_request_with_no_mode_to_offer_sends_an_empty_list() {
+        let mut c = moded_client(vec![ConnectionMode::Secure], vec![AuthMethod::None], OSD);
+        assert_eq!(offered(&c.enter().unwrap().unwrap()), Vec::<u32>::new());
+
+        let mut c = moded_client(vec![], vec![AuthMethod::Cephx], OSD);
+        assert_eq!(offered(&c.enter().unwrap().unwrap()), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn bad_method_retry_offers_the_configured_modes_for_the_new_method() {
+        // The server rejects AUTH_NONE and allows only CRC. The retry with
+        // CephX still offers SECURE alone, as configured; it neither
+        // narrows to the server's modes nor falls back to them.
+        let mut c = moded_client(
+            vec![ConnectionMode::Secure],
+            vec![AuthMethod::None, AuthMethod::Cephx],
+            MON_SERVICE_ID,
+        );
+        c.method = AuthMethod::None;
+        let payload = bad_method_payload(
+            AuthMethod::None.into(),
+            -95,
+            &[AuthMethod::Cephx.into()],
+            &[CRC],
+        );
+        match c.step(bad_method_frame(payload)).unwrap() {
+            Step::Next {
+                state,
+                send: Some(frame),
+            } => {
+                assert_eq!(state.method, AuthMethod::Cephx);
+                assert_eq!(offered(&frame), vec![SECURE]);
+            }
+            _ => panic!("expected a retry"),
+        }
+
+        // A retry to AUTH_NONE offers CRC only, whatever the server allows.
+        let c = moded_client(
+            vec![ConnectionMode::Secure, ConnectionMode::Crc],
+            vec![AuthMethod::Cephx, AuthMethod::None],
+            MON_SERVICE_ID,
+        );
+        let payload = bad_method_payload(
+            AuthMethod::Cephx.into(),
+            -13,
+            &[AuthMethod::None.into()],
+            &[SECURE, CRC],
+        );
+        match c.step(bad_method_frame(payload)).unwrap() {
+            Step::Next {
+                state,
+                send: Some(frame),
+            } => {
+                assert_eq!(state.method, AuthMethod::None);
+                assert_eq!(offered(&frame), vec![CRC]);
+            }
+            _ => panic!("expected a retry"),
+        }
     }
 }
