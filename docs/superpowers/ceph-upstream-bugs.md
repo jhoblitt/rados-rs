@@ -98,7 +98,8 @@ against v19.2.2.
   test pins it.
 - **Found:** rados-rs plan 14, PR #16, 2026-09-25. rgw-go found it
   independently.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80994
+  (rgw, Bug, New).
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The 2pc queue's
   self-heal is skipped when another write comes first".
 
@@ -134,7 +135,9 @@ against v19.2.2.
 - **rados-rs:** a doc note on `NO_ID` in `rados-cls/src/two_pc_queue.rs`
   (046b45f, PR #16).
 - **Found:** rados-rs, PR #16, 2026-09-25.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80996
+  (rgw, Bug, New). Per rgw-go, main's rollover-conflict retry fires only
+  when the id is already in the reservation map, so it does not cover id 0.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The 2pc queue hands
   out reservation id 0, which radosgw treats as none".
 
@@ -166,7 +169,10 @@ against v19.2.2.
   in its `docs/exclusions.md`.
 - **Upstream:** filed and fixed. Both fix commits cite tracker #73812 in a
   `Fixes:` line. The fix is ceph/ceph PR #66246 (main) and its backport
-  #66491 (tentacle). There is no squid backport.
+  #66491 (tentacle). No squid backport has merged.
+  As of 2026-09-28 tracker #73812 is Backporting; per rgw-go the squid
+  backport #73893 is under review and the tentacle backport #73894 is
+  resolved.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "radosgw's notification
   queue listing never pages past 1024 queues".
 
@@ -211,8 +217,10 @@ against v19.2.2.
     The test inverts on an image that carries 674d42d9023.
   - The `trim` doc names the fix release (fork PR #25, 7fb2a13).
 - **Found:** rados-rs plan 09, 2026-09-25.
-- **Upstream:** not filed as such. ceph/ceph PR #65329 fixed it in passing,
-  on main only.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80999
+  (rgw, Bug, New), a squid and tentacle backport request for
+  ceph/ceph#65329 (per rgw-go, both branches' `usage_log_trim_cb` still use
+  `entry.owner` only).
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw usage trim
   never removes a payer-keyed record".
 
@@ -249,7 +257,8 @@ against v19.2.2.
   - No test pins it.
 - **Found:** the rados-rs plan 09 review, 2026-09-25. The radosgw-admin hang
   was traced on 2026-09-27.
-- **Upstream:** not filed.
+- **Upstream:** tracked upstream as #58136 (rgw, Bug, Fix Under Review);
+  per rgw-go the fix, ceph/ceph#49168, has been under review since 2022-12.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw usage trim
   with a bucket filter stalls behind 1000 other records".
 
@@ -350,7 +359,9 @@ against v19.2.2.
 - **rados-rs:** mirrors the behaviour for byte identity, with a unit test
   (`rados-cls/src/rgw/packed.rs`, 8b83b69, PR #9).
 - **Found:** rados-rs plan 06, 2026-09-25.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80995
+  (rgw, Bug, New). Per rgw-go, the `<= 0x1000000` branch writes a full
+  `uint32`, so only 65536 itself is affected.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_rgw encodes a
   packed value of exactly 65536 as 0".
 
@@ -380,8 +391,8 @@ against v19.2.2.
   `rados-cls/src/rgw/index.rs` module doc (e3f85c3, PR #21).
 - **Found:** the rgw-go phase 0 final review, 2026-09-26. rados-rs plan 16
   (PR #21) documented it the same day.
-- **Upstream:** fixed by ceph/ceph PR #59609 (main). No tracker is cited,
-  and the fix is not on squid.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #81000
+  (rgw, Bug, New), a squid backport request for 461be1cd3d5.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "Squid does not guard
   listing-time index suggestions against resharding".
 
@@ -414,7 +425,10 @@ against v19.2.2.
 - **rados-rs:** documented in `rados-cls/src/lock.rs` (6eaeab3, PR #15) and
   pinned by `expired_ephemeral_read_is_eio` (e137d2d, PR #15).
 - **Found:** rados-rs cls_lock research, 2026-09-25.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80993
+  (RADOS, Bug, New). Per rgw-go, upstream QA hit this in 2022 as #56575,
+  closed by d3457c64b1b, which only lengthened the lock duration in
+  `test_cls_lock.cc`; the class was not fixed.
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "cls_lock get_info and
   assert_locked fail with EIO on an expired ephemeral lock".
 
@@ -552,7 +566,8 @@ against v19.2.2.
   - Plan 18 Part B (deferred) retries for up to 15 s, but it keys the retry
     on `EPERM`, which the client never receives.
 - **Found:** the rados-rs plan 18 review, 2026-09-26.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80997
+  (RADOS, Bug, New).
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The monitor's default
   for insecure key creation lags auth_allowed_ciphers".
 
@@ -584,7 +599,8 @@ against v19.2.2.
 - **rados-rs:** nothing on main. Plan 18 Part B must match `EINVAL` together
   with the status text.
 - **Found:** plan 18 Part B drafting, 2026-09-27.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80998
+  (RADOS, Bug, New).
 - **See also:** rgw-go registry, jhoblitt/rgw-go#36, "The monitor reports a
   refused cephx key type as EINVAL".
 
@@ -761,8 +777,8 @@ against v19.2.2.
     production code a build failure (section 11).
 - **Found:** rgw-rs design planning, 2026-09-27, as an unverified
   candidate. It was confirmed from source the same day.
-- **Upstream:** not filed. The abort came with the fix for tracker #70422
-  (tracker not checked).
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80992
+  (rgw, Bug, New), flagged as a regression.
 
 ## CEPH-BUG-019: radosgw accepts 0 for its GC, lifecycle and usage shard counts, then faults on first use
 
@@ -843,7 +859,8 @@ against v19.2.2.
   16).
 - **Found:** rgw-rs design planning, 2026-09-27, as an unverified
   candidate. It was confirmed from source the same day.
-- **Upstream:** not filed.
+- **Upstream:** filed 2026-09-28 by the rgw-go session as tracker #80991
+  (rgw, Bug, New); related, with a different trigger: #75958 (Resolved).
 
 ## CEPH-BUG-020: crimson-osd fails a paged user-stats reset with EOVERFLOW when a page ends on a bucket name of 24 bytes or more
 
