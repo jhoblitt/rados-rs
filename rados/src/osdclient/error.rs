@@ -28,12 +28,19 @@ pub const ETIMEDOUT: i32 = -110; // Connection timed out (a notify's timeout; a 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum OSDClientError {
+    /// The OSD may already have applied a write that fails with this.
+    /// Re-check the state the write would change rather than issue it
+    /// again: an op issued again is a new op, with a new tid, which the
+    /// OSD does not deduplicate against the first.
     #[error("Connection error: {0}")]
     Connection(String),
 
     #[error("OSD error {code}: {message}")]
     OSDError { code: i32, message: String },
 
+    /// The OSD may already have applied a write that times out. Re-check
+    /// the state the write would change rather than issue it again, as
+    /// for [`Connection`](Self::Connection).
     #[error("Operation timeout after {0:?}")]
     Timeout(Duration),
 
@@ -104,7 +111,11 @@ impl From<OSDClientError> for crate::RadosError {
 /// Error category for retry decision making
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
-    /// Can retry immediately
+    /// May succeed if tried again, but not by re-issuing a write blindly:
+    /// after a [`Connection`](OSDClientError::Connection) or
+    /// [`Timeout`](OSDClientError::Timeout) the OSD may already have
+    /// applied it, and a re-issued op is a new op, with a new tid, which
+    /// the OSD does not deduplicate. Re-check the state first.
     Transient,
     /// Should not retry
     Permanent,
