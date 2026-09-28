@@ -845,6 +845,138 @@ against v19.2.2.
   candidate. It was confirmed from source the same day.
 - **Upstream:** not filed.
 
+## CEPH-BUG-020: crimson-osd fails a paged user-stats reset with EOVERFLOW when a page ends on a bucket name of 24 bytes or more
+
+- **Component:** crimson-osd's class-call path (`OpsExecuter::do_op_call`),
+  as met by cls_user `reset_user_stats2` and radosgw's
+  `rgwrados::buckets::reset_stats`.
+- **Status:** confirmed, by source reading. The candidate's classic
+  ceph-osd form does not hold; see the last Symptom item.
+- **Symptom:**
+  - `reset_user_stats2` sums at most 1000 bucket entries per call.
+    - A call that stops short (`truncated`) writes nothing, and replies with
+      the last bucket name it read as the marker.
+    - Only the final call writes the header. Since 5400aab8d92 its reply
+      carries an empty marker.
+  - The reply is 41 bytes plus the marker: a 6-byte struct header, a 4-byte
+    length and the marker, 30 bytes of stats, and a 1-byte flag.
+    `osd_max_write_op_reply_len` defaults to 64, so a marker of 24 bytes or
+    more is over the cap.
+  - crimson-osd applies the cap to every call of a method registered as
+    writing, when the request carries RETURNVEC, whether or not the call
+    changed the object. It fails the whole request with `EOVERFLOW`.
+  - radosgw sends every page with RETURNVEC and stops at the first error.
+    - `radosgw-admin user stats --reset-stats` and
+      `radosgw-admin account stats --reset-stats` fail with "(75) Value too
+      large for defined data type".
+    - No page has written anything, so the header keeps its stale stats.
+      A retry fails at the same key.
+  - Reaching it takes two things:
+    - more than 1000 buckets under one owner. The default limit is 1000 for
+      users (`rgw_user_max_buckets`) and for accounts, so an administrator
+      must have raised it;
+    - a bucket name of 24 bytes or more at position 1000, 2000, … in byte
+      order. S3 bucket names run to 63 bytes, or 255 with relaxed names.
+  - classic ceph-osd is not affected.
+    - It applies the cap only when the request's transaction is non-empty.
+    - A truncated page writes nothing, so ceph-osd returns its reply whole.
+    - The page that writes the header carries an empty marker, 41 bytes.
+    - crimson's code says it mirrors ceph-osd's `execute_ctx`, but it drops
+      the non-empty-transaction condition.
+- **Affected:**
+  - crimson-osd at every tag checked: v19.2.2, v19.2.6, v20.2.4, v21.1.1
+    and main.
+  - The crimson check has had this form since 3bea0ffec1e (v16.1.0).
+  - Crimson is a tech preview. Its RGW QA suite
+    (`qa/suites/crimson-rados/rgw`) is on v21.1.1 and main, not on v20.2.4.
+- **Fixed in:** none, for crimson-osd.
+  - An earlier form hit both OSDs: before 5400aab8d92 the final page also
+    carried the marker. The reset then failed for any owner whose last
+    bucket name in byte order was 24 bytes or more (tracker #51786, tracker
+    not checked).
+  - That form is fixed in v20.0.0 (5400aab8d92), Squid v19.2.1
+    (8bf6a70b0b7) and Reef v18.2.5 (791e29d1185). v16.2.15, v18.2.4 and
+    v19.2.0 lack the fix.
+  - The fix's message expects truncated listings to be rare: "in general,
+    users will have less than MAX_ENTRIES=1000 buckets".
+- **Evidence:** source reading. It has not been run on a crimson cluster.
+  - The class:
+    - `v19.2.6:src/cls/user/cls_user.cc:309` sets `MAX_ENTRIES` to 1000;
+      `:462-463` read one page;
+    - `:485-496`: only a page that is not truncated writes the header, and
+      it replies with the marker still empty;
+    - `:499-505`: a truncated page sets the marker to its last key and
+      replies without writing;
+    - `:45-48`: the key is the bucket name as given, and radosgw passes the
+      bare name (`v19.2.6:src/rgw/rgw_basic_types.cc:52-54`);
+    - `:747` registers `reset_user_stats2` as RD|WR.
+  - The reply size:
+    - `v19.2.6:src/cls/user/cls_user_ops.h:200-206` encodes marker, stats
+      and `truncated` in one versioned struct;
+    - `v19.2.6:src/cls/user/cls_user_types.h:171-177` encodes the stats as
+      three `u64` in their own struct;
+    - `v19.2.6:src/include/encoding.h:1454-1459` reserves 6 bytes for each
+      struct header, and `:226-231` encodes a string as a `u32` length and
+      its bytes.
+  - The cap: `v19.2.6:src/common/options/global.yaml.in:3768-3774` gives
+    `osd_max_write_op_reply_len` its default of 64.
+  - crimson-osd:
+    - `v19.2.6:src/crimson/osd/ops_executer.cc:112-123` fails the call
+      when `allows_returnvec()`, `may_write()` and `ret >= 0` hold and the
+      output is over the cap;
+    - `v19.2.6:src/osd/osd_op_util.cc:23-25,198-204`: `may_write()` is set
+      from the method's WR flag, not from what the call did;
+    - the same check is at `v19.2.2:…:112-123`, `v20.2.4:…:124-135`,
+      `v21.1.1:…:119-130` and main at `:119-130`;
+    - `v19.2.6:src/crimson/osd/pg_backend.cc:1585-1587` reports
+      `truncated` only when another key follows.
+  - ceph-osd:
+    - `v19.2.6:src/osd/PrimaryLogPG.cc:4211-4230` enforces the cap only
+      under `!ctx->op_t->empty()`;
+    - `:8895-8904` return a write that changed nothing with an empty
+      transaction, marked `update_log_only`;
+    - `:4233` builds the reply with its output data kept, and `:4275-4296`
+      send it;
+    - the same gate is at `v20.2.4:…:4288`, `v21.1.1:…:4382` and main at
+      `:4396`.
+  - radosgw:
+    - `v19.2.6:src/rgw/driver/rados/buckets.cc:245-246` sends each page with
+      `OPERATION_RETURNVEC`, `:247-249` return its error, and `:256` loops
+      while truncated;
+    - the same is at v19.2.2, v20.2.4, v21.1.1 and main, on the same lines;
+    - the callers are `v19.2.6:src/rgw/rgw_admin.cc:9061-9065` and
+      `v19.2.6:src/rgw/rgw_account.cc:539`.
+  - Reachability:
+    - `v19.2.6:src/common/options/rgw.yaml.in:2394-2401` sets
+      `rgw_user_max_buckets` to 1000;
+    - `v19.2.6:src/rgw/rgw_common.h:802-803` gives accounts the same
+      default;
+    - `v19.2.6:src/rgw/rgw_rest_s3.h:842-843` allows names of 63 bytes, or
+      255 when relaxed.
+- **rados-rs:**
+  - It has the same exposure. `user::reset_stats2`
+    (`rados-cls/src/user.rs:665-667`) sends every page with RETURNVEC
+    through `call::exec_returnvec` (`rados-cls/src/call.rs:53-66`), both
+    from 3ef7fd5 (PR #7). Against crimson-osd a paged reset fails the same
+    way; against ceph-osd it does not.
+  - There is no workaround, doc note or test. The cluster test
+    `user_reset_stats` (`rados-cls/tests/cls_user.rs:184`) uses two
+    buckets, so it never pages.
+  - The RETURNVEC docs say that any reply over the cap fails the request
+    (`rados-cls/src/call.rs:46-51`,
+    `rados/src/osdclient/operation.rs:256-261`,
+    `rados/src/osdclient/types.rs:173-177`). That holds for crimson-osd.
+    ceph-osd applies the cap only to a write that changed the object.
+  - A possible fallback is the one-shot `reset_stats`
+    (`rados-cls/src/user.rs:652`), which replies with no data. It sums every
+    bucket in one call, which is the run time `reset_user_stats2` was added
+    to avoid.
+- **Found:** a design review, 2026-09-27, as an unverified candidate against
+  ceph-osd. Source reading the same day refuted that form and confirmed the
+  crimson-osd form.
+- **Upstream:** not filed. The earlier form was tracker #51786, fixed by
+  ceph/ceph PR #59884 (main), #60164 (squid) and #60165 (reef).
+
 ## Considered and excluded
 
 - **Map decode with duplicate keys** (candidate 4).
