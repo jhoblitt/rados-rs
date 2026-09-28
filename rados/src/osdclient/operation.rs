@@ -256,9 +256,11 @@ impl OpBuilder {
     /// Ask for each op's result and output data even though the operation
     /// writes; without it the OSD returns only the overall result. A class
     /// method that writes and replies (`cls_user`'s `reset_user_stats2`)
-    /// needs this. The OSD caps each op's returned data at
-    /// `osd_max_write_op_reply_len`, 64 bytes by default, and answers a
-    /// larger reply with `EOVERFLOW`.
+    /// needs this. An op's data over `osd_max_write_op_reply_len`, 64
+    /// bytes by default, can fail the request with `EOVERFLOW`: ceph-osd
+    /// applies that cap to every op, but only when the request changed
+    /// the object; crimson-osd applies it to every class call of a
+    /// request that may write, whether or not the call changed anything.
     pub fn returnvec(mut self) -> Self {
         self.flags |= OsdOpFlags::RETURNVEC;
         self

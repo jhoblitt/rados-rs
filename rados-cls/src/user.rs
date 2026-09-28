@@ -502,7 +502,14 @@ pub fn reset_stats_op(time: UTime) -> Result<OSDOp> {
 /// while the reply is truncated. Run every page with
 /// `OpBuilder::returnvec`: the method writes (the final page rewrites the
 /// header), and the OSD clears a writing request's replies unless that
-/// flag is set. Decode the reply with [`decode_reset_stats2`].
+/// flag is set. A truncated page writes nothing and replies with the last
+/// bucket name it read as the marker, and a marker of 24 bytes or more
+/// puts the reply over `osd_max_write_op_reply_len` at its default of 64.
+/// ceph-osd returns such a reply whole, but crimson-osd fails the page
+/// with `EOVERFLOW`, so there a reset that pages past such a name cannot
+/// finish: CEPH-BUG-020 in the fork's upstream Ceph bug registry
+/// (`docs/superpowers/ceph-upstream-bugs.md` on the `design/rgw-mvp`
+/// branch). Decode the reply with [`decode_reset_stats2`].
 pub fn reset_stats2_op(op: &ResetStats2Op) -> Result<OSDOp> {
     call::op(CLASS, "reset_user_stats2", op)
 }

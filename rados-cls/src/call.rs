@@ -43,12 +43,14 @@ pub(crate) async fn exec_raw(
     ioctx.exec(oid, class, method, indata).await
 }
 
-/// Send one class call on `oid` as a write whose reply is wanted:
-/// `OpBuilder::returnvec` keeps the method's output data, which the OSD
-/// otherwise clears on a successful write, up to
-/// `osd_max_write_op_reply_len` (64 bytes by default; more is
-/// `EOVERFLOW`). The `user` class's `reset_user_stats2` and the
-/// `2pc_queue` class's `2pc_queue_reserve` are such methods.
+/// Send one class call on `oid` as a write whose reply is wanted, such as
+/// the `user` class's `reset_user_stats2` or the `2pc_queue` class's
+/// `2pc_queue_reserve`: `OpBuilder::returnvec` keeps the method's output
+/// data, which the OSD otherwise clears on a successful write.
+/// crimson-osd fails any call of a method registered as writing whose
+/// reply is over `osd_max_write_op_reply_len` (64 bytes by default) with
+/// `EOVERFLOW`. ceph-osd applies that cap only to a call that changed the
+/// object, so there a call that wrote nothing returns its whole reply.
 #[cfg(any(feature = "user", feature = "two_pc_queue"))]
 pub(crate) async fn exec_returnvec<R: Denc>(
     ioctx: &IoCtx,
