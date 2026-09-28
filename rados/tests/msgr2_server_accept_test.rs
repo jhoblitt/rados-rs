@@ -140,3 +140,38 @@ async fn test_secure_only_client_without_auth_fails() {
         .unwrap();
     assert!(served.is_err(), "the server must not reach a session");
 }
+
+/// A client that allows only SECURE offers an OSD no mode without
+/// authentication. The rados-rs server, unlike a C++ one, answers with
+/// CRC, which the client refuses because it did not offer it.
+#[tokio::test]
+async fn test_service_client_refuses_a_mode_it_did_not_offer() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_one(listener));
+
+    let client_config = ConnectionConfig {
+        preferred_modes: vec![ConnectionMode::Secure],
+        service_id: rados::EntityType::OSD.bits(),
+        global_id: 4242,
+        ..ConnectionConfig::with_no_auth()
+    };
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_one(server_addr, client_config),
+    )
+    .await
+    .expect("client timed out");
+    let err = client.expect_err("the client must refuse a mode it did not offer");
+    assert!(err.contains("did not offer"), "{err}");
+
+    let served = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server timed out")
+        .unwrap();
+    assert!(served.is_err(), "the server must not reach a session");
+}

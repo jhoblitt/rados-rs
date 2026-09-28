@@ -10,7 +10,8 @@
 //!   retry offers the configured modes for the new method, whatever modes
 //!   the server said it allows.
 //! - `AUTH_REPLY_MORE` → CephX challenge-response round-trip
-//! - `AUTH_DONE`       → authentication complete, phase finishes
+//! - `AUTH_DONE`       → authentication complete, phase finishes, unless it
+//!   names a connection mode the client did not offer
 //!
 //! **Server** waits for `AUTH_REQUEST`, performs authentication (optionally
 //! sending `AUTH_REPLY_MORE` for CephX), then replies with `AUTH_DONE`.
@@ -299,6 +300,22 @@ impl AuthClient {
         let auth_payload = Bytes::decode(&mut p, 0)?;
 
         tracing::info!("AUTH_DONE: global_id={global_id}, connection_mode={con_mode}");
+
+        // C++ does not check this: its client keeps whatever mode AUTH_DONE
+        // names (v19.2.6:src/msg/async/ProtocolV2.cc:1874-1918,
+        // src/mon/MonClient.cc:1545-1600). rados-rs refuses a mode it did
+        // not offer, so that offering only SECURE guarantees SECURE. It
+        // cannot refuse a conforming server, whose `AuthRegistry::pick_mode`
+        // picks from the offered list (src/auth/AuthRegistry.cc:309-325), and
+        // under CephX an AUTH_DONE rewritten in transit already fails
+        // AUTH_SIGNATURE; what it refuses is a server that ignores the list.
+        let offered = self.offered_modes();
+        if !offered.iter().any(|&m| u32::from(m) == con_mode) {
+            return Err(Error::Protocol(format!(
+                "server chose connection mode {con_mode}, which the client did not offer \
+                 (offered {offered:?})"
+            )));
+        }
 
         let (session_key, connection_secret) = if self.method == AuthMethod::None {
             (None, None)
@@ -924,6 +941,53 @@ mod tests {
                 assert_eq!(offered(&frame), vec![CRC]);
             }
             _ => panic!("expected a retry"),
+        }
+    }
+
+    /// An AUTH_DONE frame naming `con_mode`.
+    fn auth_done_frame(con_mode: u32) -> Frame {
+        let done = AuthDoneFrame::new(4242, con_mode, Bytes::new());
+        create_frame_from_trait(&done, Tag::AuthDone).unwrap()
+    }
+
+    /// Run `c` through AUTH_REQUEST and an AUTH_DONE naming `con_mode`.
+    fn finish_with(mut c: AuthClient, con_mode: u32) -> Result<AuthOutput> {
+        c.enter()?;
+        match c.step(auth_done_frame(con_mode))? {
+            Step::Done(out, None) => Ok(out),
+            _ => panic!("AUTH_DONE must finish the phase"),
+        }
+    }
+
+    #[test]
+    fn auth_done_with_a_mode_not_offered_is_refused() {
+        let secure_only =
+            || moded_client(vec![ConnectionMode::Secure], vec![AuthMethod::Cephx], OSD);
+        for mode in [CRC, ConnectionMode::Unknown as u32, 7] {
+            let err = finish_with(secure_only(), mode)
+                .err()
+                .unwrap_or_else(|| panic!("mode {mode} was not offered"));
+            assert!(err.to_string().contains("did not offer"), "{err}");
+        }
+        let out = finish_with(secure_only(), SECURE).unwrap();
+        assert_eq!(out.connection_mode, SECURE);
+        assert!(out.connection_secret.is_some());
+
+        // AUTH_NONE offers CRC alone, so SECURE is refused under it.
+        let none = || {
+            moded_client(
+                vec![ConnectionMode::Secure, ConnectionMode::Crc],
+                vec![AuthMethod::None],
+                MON_SERVICE_ID,
+            )
+        };
+        assert!(finish_with(none(), SECURE).is_err());
+        assert_eq!(finish_with(none(), CRC).unwrap().connection_mode, CRC);
+
+        // A request that offered no mode accepts none, UNKNOWN included.
+        for mode in [ConnectionMode::Unknown as u32, CRC, SECURE] {
+            let c = moded_client(vec![ConnectionMode::Secure], vec![AuthMethod::None], OSD);
+            assert!(finish_with(c, mode).is_err(), "mode {mode}");
         }
     }
 }
