@@ -3,7 +3,8 @@
 Design for a fork of tchaikov/rados-rs (jhoblitt/rados-rs) that adds what a
 single-site RGW port needs from a RADOS client, in a form upstream can take
 one pull request at a time. Written 2026-09-24 against rados-rs at its
-2026-05-19 head and ceph/ceph `main` at `e234256339f`. Ceph floor: Squid.
+2026-05-19 head and ceph/ceph `main` at `e234256339f`. Ceph floor: 19.2.6
+on Squid and 20.2.4 on Tentacle (owner, 2026-09-28).
 
 ## Goal
 
@@ -111,13 +112,21 @@ maintain a list of its own.
 The fork follows rados-rs's own `.claude/CLAUDE.md`, so that every branch
 is an upstream candidate:
 
-- Upstream's minimum Ceph is Quincy; this fork's new code sets its floor
-  at Squid (v19). Every new `decode_content` calls `check_min_version!` at
-  the version Squid emits, no `decode_if_version!` branches are written
-  for formats older than that, and the only cluster the tests run against
-  is v19. Supporting Quincy or Reef is deliberately not invested in; if an
-  upstream review asks for it on a package, that is the owner's call at
-  that time.
+- Upstream's minimum Ceph is Quincy; this fork's new code supports
+  clusters whose every daemon runs Squid 19.2.6 or later, or Tentacle
+  20.2.4 or later (owner decision, 2026-09-28, the floor rgw-go's
+  `docs/exclusions.md` states for both projects). Those releases issue
+  AES256KRB5 cephx keys, which already set the client floor, and under
+  Rook every daemon runs the cluster's image, so no running cluster sits
+  between Squid's first release and that point. Behaviour of Squid point
+  releases below it, such as v19.2.2's `link_olh` ENOENT for a delete
+  marker (registry CEPH-BUG-007), needs no handling. The encoding floor is
+  unchanged: every new `decode_content` calls `check_min_version!` at the
+  version Squid emits, and no `decode_if_version!` branches are written
+  for formats older than that. The CI compose cluster still runs v19.2.2,
+  below the floor; moving it is a follow-up. Supporting Quincy or Reef is
+  deliberately not invested in; if an upstream review asks for it on a
+  package, that is the owner's call at that time.
 - Encoding goes through `Denc`; raw buffer reads and writes appear only
   inside `Denc` impls. Duplicate constants across modules are a smell.
 - No `unwrap` or `expect` on production paths; errors propagate with `?`.
