@@ -150,6 +150,8 @@ pub struct OSDSession {
     auth_provider: Option<Box<dyn crate::auth::AuthProvider>>,
     /// Global ID from monitor authentication (for AUTH_NONE authorizers)
     global_id: u64,
+    /// Connection modes to offer the OSD, in order of preference
+    connection_modes: Vec<crate::msgr2::ConnectionMode>,
     /// Per-PG backoff tracker using efficient data structures.
     backoff_tracker: Arc<tokio::sync::RwLock<BackoffTracker>>,
     /// Fast-path gate: true when the tracker has entries.  Checked with a
@@ -255,6 +257,7 @@ impl OSDSession {
         osd_id: i32,
         auth_provider: Option<Box<dyn crate::auth::AuthProvider>>,
         global_id: u64,
+        connection_modes: Vec<crate::msgr2::ConnectionMode>,
         osdmap_tx: MapSender<MOSDMap>,
         client: std::sync::Weak<crate::osdclient::client::OSDClient>,
         next_tid: Arc<AtomicU64>,
@@ -272,6 +275,7 @@ impl OSDSession {
             next_tid,
             auth_provider,
             global_id,
+            connection_modes,
             backoff_tracker: Arc::new(tokio::sync::RwLock::new(BackoffTracker::new())),
             has_backoffs: Arc::new(AtomicBool::new(false)),
             osdmap_tx,
@@ -303,6 +307,24 @@ impl OSDSession {
     /// and are discarded if incarnation doesn't match current value.
     pub fn current_incarnation(&self) -> u32 {
         self.incarnation.load(Ordering::Acquire)
+    }
+
+    fn connection_config(&self) -> crate::msgr2::ConnectionConfig {
+        let mut config = if let Some(auth_provider) = &self.auth_provider {
+            crate::msgr2::ConnectionConfig::with_auth_provider_and_service(
+                auth_provider.clone_box(),
+                EntityType::OSD.bits(),
+            )
+        } else {
+            crate::msgr2::ConnectionConfig::with_no_auth()
+        };
+        config.service_id = EntityType::OSD.bits();
+        config.global_id = self.global_id;
+        config.preferred_modes = self.connection_modes.clone();
+        // OSD connections are lossy (mirrors librados Policy::lossy_client):
+        // no reconnect, no replay queue, CEPH_MSG_CONNECT_LOSSY set in CLIENT_IDENT.
+        config.is_lossy = true;
+        config
     }
 
     /// Connect to the OSD and start I/O task
@@ -337,26 +359,14 @@ impl OSDSession {
             self.osd_id, addr, entity_addr.nonce
         );
 
-        // Create connection config with authentication provider and global_id
-        let mut config = if let Some(auth_provider) = &self.auth_provider {
-            crate::msgr2::ConnectionConfig::with_auth_provider_and_service(
-                auth_provider.clone_box(),
-                EntityType::OSD.bits(),
-            )
-        } else {
-            crate::msgr2::ConnectionConfig::with_no_auth()
-        };
-        config.service_id = EntityType::OSD.bits();
-        config.global_id = self.global_id;
-        // OSD connections are lossy (mirrors librados Policy::lossy_client):
-        // no reconnect, no replay queue, CEPH_MSG_CONNECT_LOSSY set in CLIENT_IDENT.
-        config.is_lossy = true;
-
         // Connect using msgr2
-        let mut connection =
-            crate::msgr2::protocol::Connection::connect_with_target(addr, entity_addr, config)
-                .await
-                .map_err(|e| OSDClientError::Connection(format!("Failed to connect: {e}")))?;
+        let mut connection = crate::msgr2::protocol::Connection::connect_with_target(
+            addr,
+            entity_addr,
+            self.connection_config(),
+        )
+        .await
+        .map_err(|e| OSDClientError::Connection(format!("Failed to connect: {e}")))?;
 
         info!(
             "Banner exchange complete, establishing session with OSD {}",
@@ -1339,12 +1349,39 @@ mod tests {
             0,
             None,
             0, // global_id
+            crate::msgr2::ClientModes::default().client_modes,
             osdmap_tx,
             std::sync::Weak::new(),
             Arc::new(AtomicU64::new(1)),
         );
 
         assert_eq!(session.current_incarnation(), 0);
+    }
+
+    #[test]
+    fn connection_config_offers_the_configured_modes() {
+        use crate::msgr2::ConnectionMode::{Crc, Secure};
+        let service_auth = || -> Box<dyn crate::auth::AuthProvider> {
+            let mon_auth = crate::auth::MonitorAuthProvider::new("client.admin").unwrap();
+            Box::new(crate::auth::ServiceAuthProvider::from_shared_handler(
+                Arc::clone(mon_auth.handler()),
+            ))
+        };
+        for with_auth in [false, true] {
+            for modes in [vec![Secure], vec![Secure, Crc]] {
+                let (osdmap_tx, _osdmap_rx) = crate::msgr2::map_channel::map_channel::<MOSDMap>(1);
+                let session = OSDSession::new(
+                    0,
+                    with_auth.then(service_auth),
+                    0, // global_id
+                    modes.clone(),
+                    osdmap_tx,
+                    std::sync::Weak::new(),
+                    Arc::new(AtomicU64::new(1)),
+                );
+                assert_eq!(session.connection_config().preferred_modes, modes);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1354,6 +1391,7 @@ mod tests {
             0,
             None,
             0, // global_id
+            crate::msgr2::ClientModes::default().client_modes,
             osdmap_tx,
             std::sync::Weak::new(),
             Arc::new(AtomicU64::new(1)),

@@ -13,6 +13,7 @@ pub mod header;
 pub(crate) mod io_loop;
 pub mod map_channel;
 pub mod message;
+pub mod modes;
 pub(crate) mod phase;
 pub(crate) mod priority_queue;
 pub(crate) mod protocol;
@@ -30,6 +31,7 @@ pub use frames::{
 pub use header::MsgHeader;
 pub use map_channel::{MapMessage, MapReceiver, MapSender, map_channel};
 pub use message::{Message, MessagePriority, MessageType, MsgFooter};
+pub use modes::{ClientModes, parse_mode_list};
 pub use priority_queue::PriorityQueue;
 pub use protocol::Connection;
 pub use state_machine::StateKind;
@@ -257,7 +259,10 @@ pub struct ConnectionConfig {
 
     /// Connection modes to offer the peer, in order of preference; the
     /// server chooses one of them. Under AUTH_NONE only CRC is offered.
-    /// Default: `[Crc, Secure]`, the default of C++'s `ms_client_mode`.
+    /// Default: `[Crc, Secure]`, the default of C++'s `ms_client_mode`,
+    /// the list for a peer other than a monitor or a manager; MonClient
+    /// sets the monitor list, `ms_mon_client_mode`'s, on its connections.
+    /// [`ClientModes::for_peer`] gives the modes configured for a peer.
     pub preferred_modes: Vec<ConnectionMode>,
 
     /// Authentication methods supported by the client (in order of preference)
