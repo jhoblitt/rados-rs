@@ -1874,6 +1874,13 @@ impl OSDClient {
     ///
     /// # Returns
     /// Returns the OpResult after handling all redirects
+    ///
+    /// # Errors
+    /// On [`OSDClientError::Connection`] or [`OSDClientError::Timeout`] the
+    /// OSD may already have applied a write. A caller must re-check the
+    /// state the op would change rather than issue it again: an op issued
+    /// again is a new op, with a new tid, which the OSD does not
+    /// deduplicate against this one.
     async fn execute_op(
         &self,
         object: ObjectId,
@@ -1907,7 +1914,8 @@ impl OSDClient {
         // Cap connection-error retries so a persistently broken OSD can't spin
         // the caller forever.  Mirrors librados Objecter's reopen-on-reset
         // pattern: when a lossy connection drops mid-op, re-route to a fresh
-        // session and resubmit, but only a bounded number of times.
+        // session and resubmit under the op's tid, but only a bounded number
+        // of times.
         const MAX_CONNECTION_RETRIES: u32 = 4;
         let mut connection_retries = 0u32;
 
@@ -1923,7 +1931,7 @@ impl OSDClient {
                     // Session died between get_or_create_session and submit_op
                     // (io_loop exited, drain fired).  Reopen on the next
                     // iteration — get_or_create_session will build a fresh
-                    // session and we'll re-encode and resubmit.
+                    // session and we'll re-encode and resubmit under the tid.
                     connection_retries += 1;
                     if connection_retries > MAX_CONNECTION_RETRIES {
                         return Err(OSDClientError::Connection(format!(
@@ -1934,7 +1942,6 @@ impl OSDClient {
                         "Op submit failed on OSD {} (attempt {}/{}): {}; retrying on fresh session",
                         primary_osd, connection_retries, MAX_CONNECTION_RETRIES, msg_str
                     );
-                    // Don't bump retry_attempt — the OSD never saw this send.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1958,12 +1965,13 @@ impl OSDClient {
                         "Op lost connection to OSD {} mid-flight (attempt {}/{}): {}; retrying",
                         primary_osd, connection_retries, MAX_CONNECTION_RETRIES, msg_str
                     );
-                    // Don't bump retry_attempt: the next loop iteration
-                    // allocates a fresh tid and submit_op builds a new
-                    // PendingOp with attempts=1, so the OSD's echoed
-                    // retry_attempt must stay at 0 to satisfy
-                    // validate_reply_freshness.
-                    Arc::make_mut(&mut op.msg).retry_attempt = 0;
+                    // The OSD may have run the op before the connection
+                    // dropped. route_and_submit sends it again under its
+                    // tid, as Objecter's _kick_requests resends a reset
+                    // session's ops (v19.2.6:src/osdc/Objecter.cc:
+                    // 2082-2113), so the OSD answers a write it already
+                    // ran from its log (v19.2.6:src/osd/PrimaryLogPG.cc:
+                    // 2218-2244) rather than running it again.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1982,7 +1990,6 @@ impl OSDClient {
                      fetching newer OSDMap and retrying",
                     primary_osd
                 );
-                Arc::make_mut(&mut op.msg).retry_attempt += 1;
                 op.osdmap = self.wait_for_newer_osdmap(&op.osdmap, remaining).await?;
                 op.osdmap
                     .prune_snap_context(op.msg.object.pool, &mut Arc::make_mut(&mut op.msg).snaps);
@@ -2163,8 +2170,29 @@ impl OSDClient {
                 continue;
             }
 
-            // Build request ID with fresh TID and stamp pgid
-            let tid = session.next_tid();
+            // An op keeps the tid it is first given, as Objecter's
+            // _op_submit gives one only to an op without one
+            // (v19.2.6:src/osdc/Objecter.cc:2472-2473): the OSD knows a
+            // resent write by its reqid and, if it already ran it, answers
+            // from its log. Each send under a tid already given carries the
+            // next retry_attempt, as _prepare_osd_op numbers every send
+            // (3236), so a reply to an earlier send is ignored.
+            //
+            // This counts the sends of this copy of the op, not a rescan's
+            // resends of it (insert_migrated_op numbers the session's
+            // copy), so a send after a drain may repeat an attempt number
+            // already sent. No reply to that earlier send can be taken for
+            // this one's: a drain runs only after the I/O loop has returned
+            // with its send channel dropped, and a rescan that moved the op
+            // to another OSD closed the session it left before sending it
+            // on, so no connection that carried an earlier send can still
+            // answer.
+            let resend = msg.reqid.tid != 0;
+            let tid = if resend {
+                msg.reqid.tid
+            } else {
+                session.next_tid()
+            };
             let placed_epoch = op.osdmap.epoch.as_u32();
             {
                 let m = Arc::make_mut(msg);
@@ -2176,6 +2204,9 @@ impl OSDClient {
                     tid,
                     self.config.client_inc as i32,
                 );
+                if resend {
+                    m.retry_attempt += 1;
+                }
             }
             let pg_num = op
                 .osdmap
@@ -4989,7 +5020,7 @@ mod tests {
         let object = object_in_pg(8, 5);
 
         // The UNBLOCK lands with the op pending and its map unchecked;
-        // the check then takes it back to place it again under a new tid.
+        // the check then takes it back to place it again.
         let sent_in_window = std::cell::Cell::new(None);
         let placed = submit_write(&session, &object, || {
             unblock_pg_of(&session, &object);
@@ -5049,6 +5080,7 @@ mod tests {
         let object = object_in_pg(16, 13);
         // The pool splits after the op is placed and before it is
         // pending: the rescan of epoch 11 finds nothing to resend.
+        let first_tid = client.next_tid.load(std::sync::atomic::Ordering::Relaxed);
         let publisher = Arc::clone(&client);
         let mut published = false;
         *client.before_submit.lock().unwrap() = Some(Box::new(move || {
@@ -5070,6 +5102,7 @@ mod tests {
         assert_eq!(sent.op.osdmap_epoch, 11, "placed again in the new map");
         assert_eq!(sent.op.pgid.seed, 13);
         assert_eq!(sent.target.pg_num, 16);
+        assert_eq!(sent.tid, first_tid, "under the tid of its first placement");
         assert!(
             sends.try_recv().is_err(),
             "the first placement never went out"
@@ -5118,6 +5151,333 @@ mod tests {
             assert!(session.get_pending_ops_metadata().is_empty());
             client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
         }
+    }
+
+    /// A successful `MOSDOpReply` at object version `version`, echoing
+    /// `retry_attempt`.
+    fn op_reply(retry_attempt: i32, version: u64) -> crate::osdclient::messages::MOSDOpReply {
+        crate::osdclient::messages::MOSDOpReply {
+            _object: ObjectId::new(2, ""),
+            _pgid: crate::osdclient::types::StripedPgId::from_pg(2, 0),
+            _flags: 0,
+            result: 0,
+            _epoch: 10,
+            _version: version,
+            user_version: version,
+            retry_attempt,
+            redirect: None,
+            ops: vec![OpReply {
+                return_code: 0,
+                outdata: Bytes::new(),
+            }],
+        }
+    }
+
+    /// The retry_attempt of op `tid` if it is pending on `session`.
+    fn pending_attempt(session: &crate::osdclient::session::OSDSession, tid: u64) -> Option<i32> {
+        session
+            .get_pending_ops_metadata()
+            .into_iter()
+            .find(|(pending, ..)| *pending == tid)
+            .map(|(_, op, ..)| op.retry_attempt)
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_earlier_send_leaves_the_op_waiting() {
+        let client = offline_client().await;
+        let (session, mut sends) = fake_osd(&client).await;
+        let mut rx = submit_write(&session, &object_in_pg(8, 5), || true)
+            .await
+            .expect("submitted")
+            .expect("sent");
+        // Skipped epochs resend it through the same session, as
+        // collect_resend_ops and insert_migrated_op do.
+        let op = session.remove_pending_op(77).expect("pending");
+        session.insert_migrated_op(op, 11).await.expect("resent");
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+        assert_eq!(sends.try_recv().expect("resent").tid(), 77);
+
+        // As Objecter ignores it (v19.2.6:src/osdc/Objecter.cc:3448-3459).
+        assert!(
+            session
+                .handle_osd_op_reply(77, op_reply(0, 6))
+                .await
+                .is_none()
+        );
+        assert_eq!(pending_attempt(&session, 77), Some(1), "still waiting");
+        assert!(rx.try_recv().is_err(), "not answered");
+
+        assert!(
+            session
+                .handle_osd_op_reply(77, op_reply(1, 7))
+                .await
+                .is_none()
+        );
+        let result = rx.try_recv().expect("answered").expect("written");
+        assert_eq!(result.version, 7, "by the reply to its latest send");
+    }
+
+    /// Take the next frame `session` sends.
+    async fn next_frame(
+        sends: &mut tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) -> crate::msgr2::message::Message {
+        tokio::time::timeout(std::time::Duration::from_secs(5), sends.recv())
+            .await
+            .expect("an op went out")
+            .expect("sends open")
+    }
+
+    /// Start an append through `execute_op` to a fake OSD 0, and end the
+    /// session's connection once the append is out. Returns the session,
+    /// its sends, the append's task and the tid the append went out under.
+    async fn append_across_a_reset(
+        client: &Arc<OSDClient>,
+    ) -> (
+        Arc<crate::osdclient::session::OSDSession>,
+        tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+        tokio::task::JoinHandle<super::Result<OpResult>>,
+        u64,
+    ) {
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(client).await;
+        let append = {
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                client
+                    .execute_op(
+                        object_in_pg(8, 5),
+                        vec![crate::osdclient::types::OSDOp::append(Bytes::from_static(
+                            b"x",
+                        ))],
+                        None,
+                        crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                        crate::osdclient::types::OsdOpFlags::empty(),
+                    )
+                    .await
+            })
+        };
+        let tid = next_frame(&mut sends).await.tid();
+        assert_eq!(pending_attempt(&session, tid), Some(0), "a first send");
+        assert_eq!(session.lose_connection_for_test().await, 1);
+        (session, sends, append, tid)
+    }
+
+    #[tokio::test]
+    async fn an_op_whose_connection_drops_is_resent_under_its_tid() {
+        let client = offline_client().await;
+        let (session, mut sends, append, tid) = append_across_a_reset(&client).await;
+
+        assert_eq!(next_frame(&mut sends).await.tid(), tid, "the same reqid");
+        assert_eq!(pending_attempt(&session, tid), Some(1), "the next attempt");
+        assert_eq!(
+            client.next_tid.load(std::sync::atomic::Ordering::Relaxed),
+            tid + 1,
+            "no tid taken for the resend"
+        );
+        assert!(sends.try_recv().is_err(), "sent once more");
+
+        assert!(
+            session
+                .handle_osd_op_reply(tid, op_reply(1, 7))
+                .await
+                .is_none()
+        );
+        let result = append.await.expect("ran").expect("appended");
+        assert_eq!(result.version, 7);
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_the_send_before_a_reset_is_ignored() {
+        let client = offline_client().await;
+        let (session, mut sends, append, tid) = append_across_a_reset(&client).await;
+        next_frame(&mut sends).await;
+
+        // As Objecter ignores it (v19.2.6:src/osdc/Objecter.cc:3448-3459),
+        // the op waiting for the reply to its own attempt.
+        assert!(
+            session
+                .handle_osd_op_reply(tid, op_reply(0, 6))
+                .await
+                .is_none()
+        );
+        assert_eq!(pending_attempt(&session, tid), Some(1), "still waiting");
+        tokio::task::yield_now().await;
+        assert!(!append.is_finished());
+
+        assert!(
+            session
+                .handle_osd_op_reply(tid, op_reply(1, 7))
+                .await
+                .is_none()
+        );
+        let result = append.await.expect("ran").expect("appended");
+        assert_eq!(result.version, 7, "the reply to the latest attempt");
+    }
+
+    /// [`fake_osd`], but in the client's map with the client's Tracker, so
+    /// its ops are tracked and the Tracker's timeout callback finds them.
+    async fn tracked_fake_osd(
+        client: &Arc<OSDClient>,
+    ) -> (
+        Arc<crate::osdclient::session::OSDSession>,
+        tokio::sync::mpsc::Receiver<crate::msgr2::message::Message>,
+    ) {
+        let (tx, _rx) = crate::msgr2::map_channel(1);
+        let mut session = crate::osdclient::session::OSDSession::new(
+            0,
+            None,
+            0,
+            tx,
+            Arc::downgrade(client),
+            Arc::clone(&client.next_tid),
+        );
+        let sends = session.sends_for_test();
+        let session = Arc::new(session);
+        *client.fake_osd.lock().unwrap() = Some(Arc::clone(&session));
+        client
+            .sessions
+            .write()
+            .await
+            .insert(0, Arc::clone(&session));
+        (session, sends)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_to_the_same_osd_outlives_the_deadline_of_the_send_before() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = tracked_fake_osd(&client).await;
+        let per_send = client.tracker.operation_timeout();
+        let append = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .execute_op(
+                        object_in_pg(8, 5),
+                        vec![crate::osdclient::types::OSDOp::append(Bytes::from_static(
+                            b"x",
+                        ))],
+                        Some(per_send * 4),
+                        crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                        crate::osdclient::types::OsdOpFlags::empty(),
+                    )
+                    .await
+            })
+        };
+        let tid = next_frame(&mut sends).await.tid();
+        tokio::time::sleep(per_send / 2).await;
+        assert_eq!(session.lose_connection_for_test().await, 1);
+        next_frame(&mut sends).await;
+
+        // Past the first send's Tracker deadline, short of the resend's.
+        tokio::time::sleep(per_send / 2 + std::time::Duration::from_secs(1)).await;
+        assert_eq!(pending_attempt(&session, tid), Some(1), "not timed out");
+        assert!(
+            session
+                .handle_osd_op_reply(tid, op_reply(1, 7))
+                .await
+                .is_none()
+        );
+        assert_eq!(append.await.expect("ran").expect("appended").version, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_outlives_the_deadline_of_a_send_that_never_went_out() {
+        let client = offline_client().await;
+        let (session, mut sends) = tracked_fake_osd(&client).await;
+        let per_send = client.tracker.operation_timeout();
+        let object = object_in_pg(8, 5);
+
+        // A session to the same OSD whose I/O task has exited: its send
+        // channel is closed.
+        let (tx, _rx) = crate::msgr2::map_channel(1);
+        let exited = crate::osdclient::session::OSDSession::new(
+            0,
+            None,
+            0,
+            tx,
+            Arc::downgrade(&client),
+            Arc::clone(&client.next_tid),
+        );
+        assert!(matches!(
+            submit_write(&exited, &object, || true).await,
+            Err(OSDClientError::Connection(_))
+        ));
+        assert!(exited.get_pending_ops_metadata().is_empty());
+
+        tokio::time::sleep(per_send / 2).await;
+        let _reply = submit_write(&session, &object, || true)
+            .await
+            .expect("submitted")
+            .expect("sent");
+        assert_eq!(sends.try_recv().expect("sent").tid(), 77);
+
+        // Past the failed send's Tracker deadline, short of the resend's.
+        tokio::time::sleep(per_send / 2 + std::time::Duration::from_secs(1)).await;
+        assert!(pending_attempt(&session, 77).is_some(), "not timed out");
+    }
+
+    #[tokio::test]
+    async fn a_linger_send_is_cancelled_not_resent_when_its_connection_drops() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        for kind in [super::SubmitKind::Linger, super::SubmitKind::Ping] {
+            let (_, tid, _, rx, _) = client
+                .submit_once_in_map(
+                    &object_in_pg(8, 5),
+                    vec![crate::osdclient::types::OSDOp::watch_ping(1, 1)],
+                    crate::osdclient::messages::CEPH_MSG_PRIO_DEFAULT,
+                    crate::osdclient::types::OsdOpFlags::READ,
+                    kind,
+                )
+                .await
+                .expect("sent");
+            assert_eq!(next_frame(&mut sends).await.tid(), tid);
+            assert_eq!(session.lose_connection_for_test().await, 1);
+            assert!(
+                matches!(rx.await, Ok(Err(OSDClientError::Cancelled))),
+                "no answer"
+            );
+            tokio::task::yield_now().await;
+            assert!(sends.try_recv().is_err(), "not resent");
+            assert!(session.get_pending_ops_metadata().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_page_whose_connection_drops_keeps_its_tid_and_cursor() {
+        let client = offline_client().await;
+        client.osdmap_tx.send(Some(one_osd_map(8, 10))).ok();
+        let (session, mut sends) = fake_osd(&client).await;
+        let listing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .list_in_namespace(2, "", Some("13".into()), 100)
+                    .await
+            })
+        };
+
+        // The page at cursor hash 0xd goes to PG 5 of 8. The pool then
+        // splits to 16 PGs, and the connection drops.
+        let tid = next_frame(&mut sends).await.tid();
+        client.osdmap_tx.send(Some(one_osd_map(16, 11))).ok();
+        assert_eq!(session.lose_connection_for_test().await, 1);
+
+        let resent = next_send(&session, &mut sends).await;
+        assert_eq!(resent.tid, tid, "the same reqid");
+        assert_eq!(resent.op.retry_attempt, 1);
+        assert_eq!(resent.op.object.hash, 0xd, "still placed by the cursor");
+        assert_eq!(resent.op.pgid.seed, 13, "PG 13 of the 16 now");
+        assert_eq!(resent.op.osdmap_epoch, 11);
+        let mut end = crate::HObject::empty_cursor(2);
+        end.max = true;
+        let _ = resent.result_tx.send(Ok(pgnls_reply(1, end, "a")));
+
+        let listed = listing.await.expect("ran").expect("listed");
+        let names: Vec<_> = listed.entries.iter().map(|e| e.oid.as_str()).collect();
+        assert_eq!(names, ["a"]);
     }
 
     #[test]

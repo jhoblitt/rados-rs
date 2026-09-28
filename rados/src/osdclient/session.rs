@@ -124,6 +124,8 @@ struct IoTaskContext {
     shutdown_token: tokio_util::sync::CancellationToken,
     /// Set once the session is in `OSDClient::sessions`.
     published: Arc<AtomicBool>,
+    /// The session's, to untrack the ops the drain ends.
+    tracker: Option<Arc<crate::osdclient::tracker::Tracker>>,
 }
 
 /// Per-OSD connection and request tracking
@@ -241,9 +243,9 @@ pub(crate) struct PendingOp {
     /// False while `submit_op` has the op pending but has not yet checked
     /// that its map is still current and claimed it to send. Until then
     /// no frame of it may go out but the submitter's: the check may take
-    /// it back and place it again under a new tid, and a send under the
-    /// old one would let the OSD run it twice. A rescan may still take
-    /// such an op; the submitter then sends nothing.
+    /// it back and place it again in the newer map, and a frame sent from
+    /// the placement it took back would carry the older epoch and PG. A
+    /// rescan may still take such an op; the submitter then sends nothing.
     pub submitted: bool,
 }
 
@@ -402,6 +404,7 @@ impl OSDSession {
             conn_state: Arc::clone(&self.conn_state),
             shutdown_token: self.io_loop_token.clone(),
             published: Arc::clone(&self.published),
+            tracker: self.tracker.clone(),
         };
         // IMPORTANT: Keep a clone of send_tx alive in the io_task to prevent premature channel closure.
         // The mpsc channel closes when all Senders are dropped. By keeping this clone alive for the
@@ -531,34 +534,21 @@ impl OSDSession {
         };
         ctx.conn_state.store(final_state);
 
-        // Drain pending ops on io_loop exit.
-        //
-        // Mirrors librados AsyncMessenger `ms_handle_reset` behaviour for lossy
-        // connections: when the underlying socket fails (recv error, send error,
-        // protocol decode error) or the session is closed, the Objecter finishes
-        // every in-flight op on that connection with an EPIPE-equivalent so
-        // callers see a prompt error instead of blocking on a reply that can
-        // never arrive.
+        // Drain pending ops on io_loop exit. Objecter's ms_handle_reset
+        // reopens the session and resends its ops under their tids
+        // (v19.2.6:src/osdc/Objecter.cc:4530-4560); this session is gone
+        // instead, so each op goes back to its sender (`end_pending_ops`),
+        // and `execute_op` places it again under its tid.
         //
         // Cancellation path (scan_requests closing a migrated session) is the
         // happy case: collect_resend_ops has already removed each op from
         // pending_ops and handed it to a new session via `need_resend`, so this
         // drain is typically a no-op.  Any stragglers here are ops that raced
         // the collect-then-cancel window — submitted after the scan but before
-        // the token fired.  They have no new home, so failing them prompts the
-        // caller to reissue against a fresh session instead of waiting 30 s for
-        // a reply that will never arrive.
-        let drained: Vec<_> = ctx.pending_ops.iter().map(|entry| *entry.key()).collect();
-        let n = drained.len();
-        for tid in drained {
-            if let Some((_, pending_op)) = ctx.pending_ops.remove(&tid) {
-                let _ = pending_op
-                    .result_tx
-                    .send(Err(OSDClientError::Connection(format!(
-                        "OSD {osd_id} connection lost"
-                    ))));
-            }
-        }
+        // the token fired.  They have no new home, so ending them has their
+        // senders place them again on a fresh session instead of waiting 30 s
+        // for a reply that will never arrive.
+        let n = Self::end_pending_ops(osd_id, &ctx.pending_ops, ctx.tracker.as_deref()).await;
         if n > 0 {
             let reason = if cancelled {
                 "after cancel"
@@ -566,7 +556,7 @@ impl OSDSession {
                 "unexpectedly"
             };
             warn!(
-                "OSD {} I/O task exited {}; drained {} in-flight op(s) with connection error",
+                "OSD {} I/O task exited {}; ended {} in-flight op(s)",
                 ctx.osd_id, reason, n
             );
         }
@@ -574,6 +564,39 @@ impl OSDSession {
         // Every end of a session, a deliberate close included, passes here
         // exactly once, so this is the one place that reports the reset.
         report_reset(&ctx.published, &ctx.client, osd_id);
+    }
+
+    /// End every op pending on a session whose I/O task has exited. As
+    /// Objecter's `_kick_requests` does with a reset session's ops
+    /// (v19.2.6:src/osdc/Objecter.cc:2082-2101), a linger send or watch
+    /// ping is cancelled, the linger layer sending a fresh op for it, and
+    /// any other op is sent again under its tid: it fails here with a
+    /// connection error, which `execute_op` answers with that resend. Each
+    /// is untracked first, so this send's Tracker deadline cannot time out
+    /// a resend to the same OSD. Returns how many ops it ended.
+    async fn end_pending_ops(
+        osd_id: i32,
+        pending_ops: &DashMap<u64, PendingOp>,
+        tracker: Option<&crate::osdclient::tracker::Tracker>,
+    ) -> usize {
+        let tids: Vec<u64> = pending_ops.iter().map(|entry| *entry.key()).collect();
+        let mut ended = 0;
+        for tid in tids {
+            let Some((_, op)) = pending_ops.remove(&tid) else {
+                continue;
+            };
+            if let Some(tracker) = tracker {
+                tracker.untrack(tid, osd_id).await;
+            }
+            let error = if op.should_resend {
+                OSDClientError::Connection(format!("OSD {osd_id} connection lost"))
+            } else {
+                OSDClientError::Cancelled
+            };
+            let _ = op.result_tx.send(Err(error));
+            ended += 1;
+        }
+        ended
     }
 
     /// Record that the client published this session in its map.
@@ -614,7 +637,10 @@ impl OSDSession {
         // Get current session incarnation for stale operation detection
         let current_incarnation = self.incarnation.load(Ordering::Acquire);
 
-        let result = Self::handle_reply(tid, reply, &self.pending_ops, current_incarnation).await;
+        // A stray or stale reply leaves the op, if any, waiting and tracked.
+        let pending_op =
+            Self::take_answered_op(tid, &reply, &self.pending_ops, current_incarnation)?;
+        let result = Self::handle_reply(tid, reply, pending_op);
 
         // If operation completed (not retrying), untrack it
         if result.is_none()
@@ -756,7 +782,10 @@ impl OSDSession {
             PendingOp {
                 tid,
                 result_tx: tx,
-                attempts: 1, // First attempt (matches Linux kernel: r_attempts starts at 1)
+                // The frame carries attempts - 1: 0 on a first send (the
+                // Linux kernel's r_attempts starts at 1), more on a resend
+                // under a tid the op already had.
+                attempts: op.retry_attempt.max(0) + 1,
                 osdmap_epoch: op.osdmap_epoch,
                 op,
                 state: crate::osdclient::types::OpState::Queued,
@@ -793,6 +822,13 @@ impl OSDSession {
             pending.submitted = true;
         }
         rx
+    }
+
+    /// End the ops pending here as the I/O task does when the connection
+    /// drops.
+    #[cfg(test)]
+    pub(crate) async fn lose_connection_for_test(&self) -> usize {
+        Self::end_pending_ops(self.osd_id, &self.pending_ops, self.tracker.as_deref()).await
     }
 
     /// Whether the session's I/O loop was told to stop.
@@ -874,33 +910,46 @@ impl OSDSession {
         debug!("Submitting operation tid={} to OSD {}", tid, self.osd_id);
 
         if self.send_tx.send(msg).await.is_err() {
-            // Nothing went out: the caller may place it again.
+            // Nothing went out: the caller may place it again, under this
+            // tid, so this send's deadline must not outlive it.
             self.pending_ops.remove(&tid);
+            if let Some(t) = &self.tracker {
+                t.untrack(tid, self.osd_id).await;
+            }
             return Err(OSDClientError::Connection("I/O task has exited".into()));
         }
 
         Ok(Some(rx))
     }
 
-    /// Handle an operation reply
+    /// Take the op `reply` answers off `pending_ops`: a submitted one
+    /// whose latest send the reply is to. A reply to an earlier send, or
+    /// from an earlier incarnation of the connection, is ignored and the
+    /// op left to wait for its own, as Objecter's `handle_osd_op_reply`
+    /// ignores it (v19.2.6:src/osdc/Objecter.cc:3448-3459).
+    fn take_answered_op(
+        tid: u64,
+        reply: &MOSDOpReply,
+        pending_ops: &DashMap<u64, PendingOp>,
+        current_incarnation: u32,
+    ) -> Option<PendingOp> {
+        // An op not yet submitted has no frame of its latest send out.
+        pending_ops
+            .remove_if(&tid, |_, op| {
+                op.submitted && Self::validate_reply_freshness(tid, reply, op, current_incarnation)
+            })
+            .map(|(_, op)| op)
+    }
+
+    /// Act on `reply` to `pending_op`, taken off the session by
+    /// [`Self::take_answered_op`].
     ///
     /// Returns Some((pending_op, modified_flags)) if the operation should be retried with modified flags
-    async fn handle_reply(
+    fn handle_reply(
         tid: u64,
         reply: MOSDOpReply,
-        pending_ops: &Arc<DashMap<u64, PendingOp>>,
-        current_incarnation: u32,
+        pending_op: PendingOp,
     ) -> Option<(PendingOp, u32)> {
-        // An op not yet submitted has had no frame out under this tid.
-        let pending_op = pending_ops
-            .remove_if(&tid, |_, op| op.submitted)
-            .map(|(_, v)| v)?;
-
-        // Validate operation staleness
-        if !Self::validate_reply_freshness(tid, &reply, &pending_op, current_incarnation) {
-            return None;
-        }
-
         // Handle redirect if present
         if let Some(redirect) = &reply.redirect {
             return Self::handle_redirect(tid, pending_op, redirect);
