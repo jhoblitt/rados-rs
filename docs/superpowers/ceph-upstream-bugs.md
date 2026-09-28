@@ -671,13 +671,13 @@ against v19.2.2.
     - main: `svc_notify.cc:75-78`, `svc_sys_obj_cache.cc:505-506`.
   - `NOTIFY` is still read-mode on main (`src/include/rados.h:260`).
 - **rados-rs:** unaffected; this is radosgw's cache. For rgw-rs:
-  - Its design keeps the gateway's cephx caps as narrow as radosgw needs,
-    because every gateway in the zone trusts the notify channel
-    (jhoblitt/rgw-rs design spec draft, section 17).
+  - Its design keeps the gateway's cephx caps as narrow as radosgw's need
+    (jhoblitt/rgw-rs design spec, branch design/rgw-rs at 231cdd3, section
+    17).
   - Its cache is to drop the entry an `UPDATE_OBJ` names and re-read it,
     rather than store the payload, so a notify can cost it a read but
-    cannot plant a record (owner-agreed design, to be added to the rgw-rs
-    spec in its review edits).
+    cannot plant a record (rgw-rs design spec at 231cdd3, sections 7, 16
+    and 17).
   - It still sends the full record on its own metadata writes, because
     radosgw applies it (section 8).
 - **Found:** rgw-rs design planning, 2026-09-27, as an unverified
@@ -839,8 +839,8 @@ against v19.2.2.
     - main: `rgw_gc.cc:129,133`, `rgw_lc.cc:2490`, `rgw_rados.cc:1817`.
 - **rados-rs:** unaffected; these are radosgw's options. rgw-rs is to
   refuse a shard count below 1 when it loads its configuration, rather
-  than fault on first use (to be added to the rgw-rs spec in its review
-  edits).
+  than fault on first use (rgw-rs design spec at 231cdd3, sections 5 and
+  16).
 - **Found:** rgw-rs design planning, 2026-09-27, as an unverified
   candidate. It was confirmed from source the same day.
 - **Upstream:** not filed.
