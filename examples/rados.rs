@@ -121,6 +121,12 @@ async fn main() -> Result<()> {
         .map(|c| c.mon_dns_srv_name_for(&cli.name))
         .unwrap_or_else(|| "ceph-mon".to_string());
 
+    let modes = ceph_config
+        .as_ref()
+        .map_or_else(rados::msgr2::ClientModes::default, |config| {
+            rados::msgr2::ClientModes::from_ceph_config(config, &cli.name)
+        });
+
     info!("Connecting to monitors: {:?}", mon_addrs);
 
     let keyring_path = if let Some(keyring) = cli.keyring {
@@ -145,6 +151,7 @@ async fn main() -> Result<()> {
         mon_addrs,
         auth: Some(auth),
         dns_srv_name,
+        connection_modes: modes.for_peer(rados::EntityType::MON).to_vec(),
         ..Default::default()
     };
 
@@ -167,6 +174,7 @@ async fn main() -> Result<()> {
 
     let osd_config = rados::OSDClientConfig {
         client_inc,
+        connection_modes: modes.for_peer(rados::EntityType::OSD).to_vec(),
         ..Default::default()
     };
 

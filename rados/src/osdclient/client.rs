@@ -62,6 +62,9 @@ pub struct OSDClientConfig {
     /// release a caller selects request shapes by. The stored map is
     /// never changed.
     pub assume_osd_release: Option<CephRelease>,
+    /// Connection modes to offer OSDs, in order of preference: C++'s
+    /// `ms_client_mode`. Default: `[Crc, Secure]`, its default.
+    pub connection_modes: Vec<crate::msgr2::ConnectionMode>,
 }
 
 /// Derive a `client_inc` value suitable for `OSDClientConfig::client_inc`.
@@ -86,6 +89,9 @@ impl Default for OSDClientConfig {
             max_inflight_bytes: crate::osdclient::throttle::DEFAULT_MAX_BYTES,
             ms_crc_data: true,
             assume_osd_release: None,
+            connection_modes: crate::msgr2::ClientModes::default()
+                .for_peer(crate::EntityType::OSD)
+                .to_vec(),
         }
     }
 }
@@ -1543,6 +1549,7 @@ impl OSDClient {
             osd_id,
             auth_provider,
             self.global_id,
+            self.config.connection_modes.clone(),
             self.map_tx.clone(),
             self.self_weak.clone(),
             Arc::clone(&self.next_tid),
@@ -4358,6 +4365,7 @@ mod tests {
             0,
             None,
             0,
+            crate::msgr2::ClientModes::default().client_modes,
             tx,
             std::sync::Weak::new(),
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -4796,6 +4804,7 @@ mod tests {
             0,
             None,
             0,
+            crate::msgr2::ClientModes::default().client_modes,
             tx,
             std::sync::Weak::new(),
             Arc::clone(&client.next_tid),
@@ -5327,6 +5336,7 @@ mod tests {
             0,
             None,
             0,
+            crate::msgr2::ClientModes::default().client_modes,
             tx,
             Arc::downgrade(client),
             Arc::clone(&client.next_tid),
@@ -5395,6 +5405,7 @@ mod tests {
             0,
             None,
             0,
+            crate::msgr2::ClientModes::default().client_modes,
             tx,
             Arc::downgrade(&client),
             Arc::clone(&client.next_tid),

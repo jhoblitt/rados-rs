@@ -13,6 +13,7 @@ pub mod header;
 pub(crate) mod io_loop;
 pub mod map_channel;
 pub mod message;
+pub mod modes;
 pub(crate) mod phase;
 pub(crate) mod priority_queue;
 pub(crate) mod protocol;
@@ -30,6 +31,7 @@ pub use frames::{
 pub use header::MsgHeader;
 pub use map_channel::{MapMessage, MapReceiver, MapSender, map_channel};
 pub use message::{Message, MessagePriority, MessageType, MsgFooter};
+pub use modes::{ClientModes, parse_mode_list};
 pub use priority_queue::PriorityQueue;
 pub use protocol::Connection;
 pub use state_machine::StateKind;
@@ -255,9 +257,12 @@ pub struct ConnectionConfig {
     /// Default: 0 (no required features)
     pub required_features: u64,
 
-    /// Preferred connection modes for authentication (in order of preference)
-    /// Default: vec![ConnectionMode::Crc, ConnectionMode::Secure] (prefer CRC, matching librados)
-    /// The server will choose the final mode from this list
+    /// Connection modes to offer the peer, in order of preference; the
+    /// server chooses one of them. Under AUTH_NONE only CRC is offered.
+    /// Default: `[Crc, Secure]`, the default of C++'s `ms_client_mode`,
+    /// the list for a peer other than a monitor or a manager; MonClient
+    /// sets the monitor list, `ms_mon_client_mode`'s, on its connections.
+    /// [`ClientModes::for_peer`] gives the modes configured for a peer.
     pub preferred_modes: Vec<ConnectionMode>,
 
     /// Authentication methods supported by the client (in order of preference)
@@ -429,7 +434,7 @@ impl ConnectionConfig {
     /// # Errors
     ///
     /// Returns an error if any of these conditions are violated:
-    /// - Empty auth methods or connection modes
+    /// - Empty auth methods
     /// - Unknown/invalid auth methods or modes
     /// - Auth provider inconsistencies
     /// - Required features not supported
@@ -449,11 +454,9 @@ impl ConnectionConfig {
             return Err("AuthMethod::Gss not yet implemented".to_string());
         }
 
-        // Validate connection modes
-        if self.preferred_modes.is_empty() {
-            return Err("preferred_modes cannot be empty".to_string());
-        }
-
+        // An empty preferred_modes is valid, as an empty mode list is in
+        // C++: the auth phase fails a monitor connection and offers other
+        // peers no mode.
         if self.preferred_modes.contains(&ConnectionMode::Unknown) {
             return Err("preferred_modes contains ConnectionMode::Unknown".to_string());
         }
@@ -737,13 +740,7 @@ mod tests {
             preferred_modes: vec![],
             ..Default::default()
         };
-        assert!(config.validate().is_err());
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("preferred_modes cannot be empty")
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

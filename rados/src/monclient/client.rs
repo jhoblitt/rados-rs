@@ -111,6 +111,10 @@ pub struct MonClientConfig {
     /// May include a domain suffix separated by `_`,
     /// e.g., `"ceph-mon_example.com"` queries `_ceph-mon._tcp.example.com`.
     pub dns_srv_name: String,
+
+    /// Connection modes to offer monitors, in order of preference: C++'s
+    /// `ms_mon_client_mode`. Default: `[Secure, Crc]`, its default.
+    pub connection_modes: Vec<crate::msgr2::ConnectionMode>,
 }
 
 impl Default for MonClientConfig {
@@ -128,6 +132,9 @@ impl Default for MonClientConfig {
             hunt_interval_min_multiple: defaults::HUNT_INTERVAL_MIN_MULTIPLE,
             hunt_interval_max_multiple: defaults::HUNT_INTERVAL_MAX_MULTIPLE,
             dns_srv_name: crate::monclient::dns_srv::DEFAULT_MON_DNS_SRV_NAME.to_string(),
+            connection_modes: crate::msgr2::ClientModes::default()
+                .for_peer(crate::EntityType::MON)
+                .to_vec(),
         }
     }
 }
@@ -701,6 +708,7 @@ impl MonClient {
                 keepalive_policy,
                 osdmap_tx: self.osdmap_tx.clone(),
                 mon_msg_tx: self.mon_msg_tx.clone(),
+                connection_modes: self.config.connection_modes.clone(),
             })
             .await?,
         );

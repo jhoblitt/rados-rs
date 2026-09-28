@@ -13,6 +13,7 @@
 //! - Monitor addresses (mon_host or mon_addr)
 //! - Keyring path
 //! - Entity name
+//! - Connection modes (ms_mon_client_mode, ms_client_mode), if not the defaults
 //!
 //! Environment variables:
 //! - `CEPH_CONF`: Path to ceph.conf file (default: /etc/ceph/ceph.conf)
@@ -34,6 +35,7 @@ struct TestConfig {
     keyring_path: Option<String>,
     entity_name: String,
     pool: String,
+    modes: rados::msgr2::ClientModes,
 }
 
 impl TestConfig {
@@ -69,11 +71,14 @@ impl TestConfig {
         // Get test pool (name or ID)
         let pool = env::var("CEPH_TEST_POOL").unwrap_or_else(|_| "test-pool".to_string());
 
+        let modes = rados::msgr2::ClientModes::from_ceph_config(&config, &entity_name);
+
         Ok(Self {
             mon_addrs,
             keyring_path,
             entity_name,
             pool,
+            modes,
         })
     }
 }
@@ -149,6 +154,7 @@ async fn setup() -> (
     let mon_config = rados::monclient::MonClientConfig {
         mon_addrs: config.mon_addrs.clone(),
         auth: Some(auth),
+        connection_modes: config.modes.for_peer(rados::EntityType::MON).to_vec(),
         ..Default::default()
     };
 
@@ -180,6 +186,7 @@ async fn setup() -> (
         .unwrap_or(true);
     let osd_config = rados::osdclient::OSDClientConfig {
         ms_crc_data,
+        connection_modes: config.modes.for_peer(rados::EntityType::OSD).to_vec(),
         ..Default::default()
     };
 
